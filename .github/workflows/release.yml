@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TMDB_BEARER_TOKEN: ${{ secrets.TMDB_BEARER_TOKEN }}
+  TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+  FANART_API_KEY: ${{ secrets.FANART_API_KEY }}
+  MYANIMELIST_CLIENT_ID: ${{ secrets.MYANIMELIST_CLIENT_ID }}
+  MYANIMELIST_CLIENT_SECRET: ${{ secrets.MYANIMELIST_CLIENT_SECRET }}
+  SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build APK
+        run: |
+          sh scripts/build_android.sh
+
+      - name: Package APK
+        run: |
+          version="$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n 1)"
+          version_name="${version%%+*}"
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/tanuki-android-v${version_name}.apk"
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanuki-android
+          path: dist/*.apk
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            libepoxy-dev \
+            libgtk-3-dev \
+            liblzma-dev \
+            libmpv-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Linux
+        run: |
+          sh scripts/build_linux.sh
+
+      - name: Package Linux bundle
+        run: |
+          version="$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n 1)"
+          version_name="${version%%+*}"
+          mkdir -p dist
+          tar -C build/linux/x64/release -czf "dist/tanuki-linux-x64-v${version_name}.tar.gz" bundle
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanuki-linux-x64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Windows
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+
+      - name: Package Windows bundle
+        shell: pwsh
+        run: |
+          $Version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$').Matches[0].Groups[1].Value
+          $VersionName = $Version.Split('+')[0]
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath "dist\tanuki-windows-x64-v$VersionName.zip" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanuki-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - android
+      - linux
+      - windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          version="$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n 1)"
+          version_name="${version%%+*}"
+          echo "version_name=${version_name}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v${version_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || steps.version.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: Tanuki Flutter ${{ steps.version.outputs.tag_name }}
+          files: release-assets/*
+          generate_release_notes: true
