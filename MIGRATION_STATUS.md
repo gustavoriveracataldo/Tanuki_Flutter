@@ -62,7 +62,7 @@ El port Flutter replica la estructura visual principal y los flujos de uso que n
 - Player Linux con autodeteccion de backend: usa video embebido si el build tiene `mpv`/`epoxy`, o fallback externo si no estan disponibles.
 - Build Android, Windows y Linux con carpetas nativas incluidas.
 - Empaquetado release simple en `dist/` con `scripts/build_release.sh` para Android/Linux y `scripts/build_release_windows.ps1` para Windows.
-- Versionado Flutter en `pubspec.yaml`; version actual `0.8.7+87`.
+- Versionado Flutter en `pubspec.yaml`; version actual `0.8.9+89`.
 - GitHub Actions de release: compila Android, Linux y Windows en jobs paralelos y junta APK/TAR.GZ/ZIP en un unico GitHub Release.
 - GitHub Actions valida secrets obligatorios antes del release: TMDB (`TMDB_API_KEY` o `TMDB_BEARER_TOKEN`), Fanart, MAL Client ID y SIMKL Client ID.
 - Scroll global con mouse/trackpad en desktop para filas horizontales y scrollables, usando `MaterialScrollBehavior` con `PointerDeviceKind.mouse`.
@@ -125,7 +125,7 @@ Esta lista queda como guia de trabajo. No se deben seguir agregando casos pequen
 
 ## Verificacion reciente
 
-Ultima actualizacion: se reforzo el release `0.8.7` con secrets obligatorios en GitHub Actions, scroll desktop con mouse/trackpad, poster en detalle, paginacion del buscador y recuperacion generica de seek remoto fuera de buffer.
+Ultima actualizacion: se actualizo el versionado de release a `0.8.9+89`.
 
 Verificacion puntual de cambios visuales recientes:
 
@@ -158,7 +158,7 @@ Verificacion puntual de cambios visuales recientes:
 - Revision estatica de `app_controller.dart` para prefijo `visual-v2` en cache de candidatos.
 - `dart format lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart`
 - `dart analyze lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart` (sin issues).
-- Revision estatica de `pubspec.yaml`, `.github/workflows/release.yml`, `.gitignore`, `README.md` y servicios de configuracion para version `0.8.7` y release CI sin secretos locales.
+- Revision estatica de `pubspec.yaml`, `README.md` y `MIGRATION_STATUS.md` para version `0.8.9`.
 - Revision estatica de `toonami_app.dart` para drag de scroll con mouse/trackpad.
 - Revision estatica de `home_screen.dart` para poster en detalle y carga incremental de resultados.
 - Revision estatica de `app_controller.dart`/`remote_catalog_service.dart` para paginacion Jikan.

@@ -77,6 +77,7 @@ jobs:
           name: tanuki-android
           path: dist/*.apk
           if-no-files-found: error
+          retention-days: 1
 
   linux:
     name: Linux x64
@@ -123,6 +124,7 @@ jobs:
           name: tanuki-linux-x64
           path: dist/*.tar.gz
           if-no-files-found: error
+          retention-days: 1
 
   windows:
     name: Windows x64
@@ -158,6 +160,7 @@ jobs:
           name: tanuki-windows-x64
           path: dist/*.zip
           if-no-files-found: error
+          retention-days: 1
 
   release:
     name: GitHub Release
