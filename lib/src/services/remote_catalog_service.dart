@@ -617,7 +617,7 @@ class RemoteCatalogService {
         ? _cleanRemoteUrl(candidate.imageUrl)
         : _extractAnimeAv1SeriesImageUrl(html);
     final episodeDetails = _episodeMetadataByNumber(candidate.episodeDetails);
-    final episodes = episodeNumbers.asMap().entries.map((entry) {
+    final parsedEpisodes = episodeNumbers.asMap().entries.map((entry) {
       final index = entry.key;
       final episodeNumber = entry.value;
       final episode = EpisodeItem(
@@ -641,6 +641,16 @@ class RemoteCatalogService {
         fallbackImageUrl: imageUrl,
       );
     }).toList();
+    final episodes = _completeImportedEpisodes(
+      parsedEpisodes,
+      candidate: candidate,
+      seriesName: name,
+      seriesStateKey: stateKey,
+      fallbackImageUrl: imageUrl,
+      fallbackWatchUrl: seriesUrl,
+      releaseYear: candidate.releaseYear,
+      episodeDetails: episodeDetails,
+    );
 
     return SeriesItem(
       name: name,
@@ -708,7 +718,7 @@ class RemoteCatalogService {
     final movieLike = _candidateLooksMovie(candidate) ||
         candidate.watchUrl.toLowerCase().contains('/pelicula/');
     final episodeDetails = _episodeMetadataByNumber(candidate.episodeDetails);
-    final episodes = List.generate(episodeCount, (index) {
+    final parsedEpisodes = List.generate(episodeCount, (index) {
       final episodeNumber = index + 1;
       final episode = EpisodeItem(
         seriesName: name,
@@ -735,6 +745,16 @@ class RemoteCatalogService {
         fallbackImageUrl: imageUrl,
       );
     });
+    final episodes = _completeImportedEpisodes(
+      parsedEpisodes,
+      candidate: candidate,
+      seriesName: name,
+      seriesStateKey: stateKey,
+      fallbackImageUrl: imageUrl,
+      fallbackWatchUrl: seriesUrl,
+      releaseYear: candidate.releaseYear,
+      episodeDetails: episodeDetails,
+    );
 
     return SeriesItem(
       name: name,
@@ -803,7 +823,7 @@ class RemoteCatalogService {
         ? candidate.releaseYear
         : _extractYearFromText(html);
     final episodeDetails = _episodeMetadataByNumber(candidate.episodeDetails);
-    final episodes = episodeLinks.asMap().entries.map((entry) {
+    final parsedEpisodes = episodeLinks.asMap().entries.map((entry) {
       final index = entry.key;
       final episode = entry.value;
       final item = EpisodeItem(
@@ -827,6 +847,16 @@ class RemoteCatalogService {
         fallbackImageUrl: imageUrl,
       );
     }).toList();
+    final episodes = _completeImportedEpisodes(
+      parsedEpisodes,
+      candidate: candidate,
+      seriesName: name,
+      seriesStateKey: stateKey,
+      fallbackImageUrl: imageUrl,
+      fallbackWatchUrl: seriesUrl,
+      releaseYear: releaseYear,
+      episodeDetails: episodeDetails,
+    );
 
     return SeriesItem(
       name: name,
@@ -895,7 +925,7 @@ class RemoteCatalogService {
         ? candidate.format
         : _extractAnimeFlvSeriesFormat(html);
     final episodeDetails = _episodeMetadataByNumber(candidate.episodeDetails);
-    final episodes = episodeNumbers.asMap().entries.map((entry) {
+    final parsedEpisodes = episodeNumbers.asMap().entries.map((entry) {
       final index = entry.key;
       final episodeNumber = entry.value;
       final episode = EpisodeItem(
@@ -919,6 +949,16 @@ class RemoteCatalogService {
         fallbackImageUrl: imageUrl,
       );
     }).toList();
+    final episodes = _completeImportedEpisodes(
+      parsedEpisodes,
+      candidate: candidate,
+      seriesName: name,
+      seriesStateKey: stateKey,
+      fallbackImageUrl: imageUrl,
+      fallbackWatchUrl: seriesUrl,
+      releaseYear: candidate.releaseYear,
+      episodeDetails: episodeDetails,
+    );
 
     return SeriesItem(
       name: name,
@@ -942,6 +982,62 @@ class RemoteCatalogService {
       aliases: candidate.aliases,
       cast: candidate.cast,
     );
+  }
+
+  List<EpisodeItem> _completeImportedEpisodes(
+    List<EpisodeItem> parsedEpisodes, {
+    required RemoteSearchCandidate candidate,
+    required String seriesName,
+    required String seriesStateKey,
+    required String fallbackImageUrl,
+    required String fallbackWatchUrl,
+    required int releaseYear,
+    required Map<int, SeriesEpisodeMetadata> episodeDetails,
+  }) {
+    final targetCount = max(candidate.episodeCount, parsedEpisodes.length);
+    if (targetCount <= parsedEpisodes.length) {
+      return [
+        for (var index = 0; index < parsedEpisodes.length; index += 1)
+          parsedEpisodes[index].copyWith(episodeIndex: index),
+      ];
+    }
+    final byNumber = <int, EpisodeItem>{
+      for (final episode in parsedEpisodes)
+        if (episode.episodeNumber > 0) episode.episodeNumber: episode,
+    };
+    final completed = <EpisodeItem>[];
+    for (var episodeNumber = 1;
+        episodeNumber <= targetCount;
+        episodeNumber += 1) {
+      final existing = byNumber[episodeNumber];
+      if (existing != null) {
+        completed.add(existing.copyWith(episodeIndex: completed.length));
+        continue;
+      }
+      final detail = episodeDetails[episodeNumber];
+      final episode = EpisodeItem(
+        seriesName: seriesName,
+        seriesStateKey: seriesStateKey,
+        episodeIndex: completed.length,
+        episodeNumber: episodeNumber,
+        displayName: '$seriesName - Capitulo $episodeNumber',
+        relativePath: 'Catalogo / Capitulo $episodeNumber',
+        filePath: fallbackWatchUrl,
+        sourceType: SourceType.remote,
+        provider: RemoteProvider.catalog,
+        slug:
+            candidate.catalogId > 0 ? '${candidate.catalogId}' : candidate.slug,
+        watchUrl: fallbackWatchUrl,
+        releaseYear: releaseYear,
+        imageUrl: fallbackImageUrl,
+      );
+      completed.add(_applyEpisodeMetadata(
+        episode,
+        detail,
+        fallbackImageUrl: fallbackImageUrl,
+      ));
+    }
+    return completed;
   }
 
   Future<RemoteDirectStream?> resolveDirectStream(
@@ -1595,29 +1691,94 @@ class RemoteCatalogService {
       return candidate;
     }
     try {
-      final results = await Future.wait<Object>([
+      final results = await Future.wait<Object?>([
+        _fetchJikanCandidateDetail(candidate.catalogId),
         _fetchJikanEpisodeMetadata(candidate.catalogId),
         _fetchJikanCast(candidate.catalogId),
       ]);
-      final episodes = results[0] as List<SeriesEpisodeMetadata>;
-      final cast = results[1] as List<String>;
-      if (episodes.isEmpty && cast.isEmpty) {
+      final detail = results[0] as RemoteSearchCandidate?;
+      final episodes = results[1] as List<SeriesEpisodeMetadata>;
+      final cast = results[2] as List<String>;
+      if (detail == null && episodes.isEmpty && cast.isEmpty) {
         return candidate;
       }
+      final episodeCount = max(
+        max(candidate.episodeCount, detail?.episodeCount ?? 0),
+        episodes.length,
+      );
       return _copyCandidate(
         candidate,
-        episodeCount: candidate.episodeCount > 0
-            ? candidate.episodeCount
-            : episodes.length,
+        watchUrl: _firstNonEmpty([candidate.watchUrl, detail?.watchUrl ?? '']),
+        seriesUrl:
+            _firstNonEmpty([candidate.seriesUrl, detail?.seriesUrl ?? '']),
+        imageUrl: _firstNonEmpty([candidate.imageUrl, detail?.imageUrl ?? '']),
+        backgroundUrl: _firstNonEmpty([
+          candidate.backgroundUrl,
+          detail?.backgroundUrl ?? '',
+        ]),
+        trailerUrl:
+            _firstNonEmpty([candidate.trailerUrl, detail?.trailerUrl ?? '']),
+        description: _firstNonEmpty([
+          candidate.description,
+          detail?.description ?? '',
+        ]),
+        rating: _firstNonEmpty([candidate.rating, detail?.rating ?? '']),
+        episodeCount: episodeCount,
+        format: _firstNonEmpty([candidate.format, detail?.format ?? '']),
+        japaneseTitle: _firstNonEmpty([
+          candidate.japaneseTitle,
+          detail?.japaneseTitle ?? '',
+        ]),
+        aliases: _mergeAliases(
+          candidate.aliases,
+          [
+            detail?.title ?? '',
+            detail?.japaneseTitle ?? '',
+            ...?detail?.aliases,
+          ],
+          title: candidate.title,
+        ),
+        releaseYear: candidate.releaseYear > 0
+            ? candidate.releaseYear
+            : detail?.releaseYear ?? 0,
+        airDateIso:
+            _firstNonEmpty([candidate.airDateIso, detail?.airDateIso ?? '']),
         episodeDetails: _mergeEpisodeMetadata(
           candidate.episodeDetails,
           episodes,
         ),
-        cast: _mergeCast(candidate.cast, cast),
+        cast: _mergeCast(candidate.cast, [
+          ...?detail?.cast,
+          ...cast,
+        ]),
       );
     } catch (_) {
       return candidate;
     }
+  }
+
+  Future<RemoteSearchCandidate?> _fetchJikanCandidateDetail(
+    int catalogId,
+  ) async {
+    if (catalogId <= 0) {
+      return null;
+    }
+    for (final path in [
+      '/v4/anime/$catalogId/full',
+      '/v4/anime/$catalogId',
+    ]) {
+      final response = await _get(Uri.https('api.jikan.moe', path));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        continue;
+      }
+      final decoded = jsonDecode(response.body);
+      final root = decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+      final data = root?['data'];
+      if (data is Map) {
+        return _candidateFromJikan(Map<String, dynamic>.from(data));
+      }
+    }
+    return null;
   }
 
   Future<List<SeriesEpisodeMetadata>> _fetchJikanEpisodeMetadata(

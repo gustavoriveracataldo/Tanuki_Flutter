@@ -1414,9 +1414,11 @@ class AppController extends ChangeNotifier {
   ) async {
     final existing = findRemoteSeriesForCandidate(candidate);
     if (existing != null) {
-      _statusMessage = '${existing.name} ya esta en la biblioteca.';
+      final refreshedExisting =
+          await _expandExistingRemoteSeriesFromCandidate(existing, candidate);
+      _statusMessage = '${refreshedExisting.name} ya esta en la biblioteca.';
       notifyListeners();
-      return existing;
+      return refreshedExisting;
     }
     if (_isDisabledRemoteProvider(candidate.provider)) {
       _statusMessage =
@@ -1439,6 +1441,38 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     unawaited(refreshFillerMetadata());
     return importedWithFiller;
+  }
+
+  Future<SeriesItem> _expandExistingRemoteSeriesFromCandidate(
+    SeriesItem existing,
+    RemoteSearchCandidate candidate,
+  ) async {
+    final knownCandidateEpisodes = max(
+      candidate.episodeCount,
+      candidate.episodeDetails.length,
+    );
+    if (knownCandidateEpisodes <= existing.episodeCount) {
+      return existing;
+    }
+    try {
+      final refreshed = await _remoteCatalog.buildImportSeries(
+        candidate,
+        existingNames: const [],
+      );
+      final merged = _applyFillerCacheToSeries(
+        _mergeSeriesVisuals(existing, refreshed),
+      );
+      _state = _state.copyWith(
+        remoteLibrary: [
+          for (final entry in _state.remoteLibrary)
+            entry.stableKey == existing.stableKey ? merged : entry,
+        ],
+      );
+      await _save();
+      return merged;
+    } catch (_) {
+      return existing;
+    }
   }
 
   Future<SeriesItem> refreshRemoteSeriesVisuals(SeriesItem series) async {
@@ -3500,7 +3534,35 @@ class AppController extends ChangeNotifier {
             : visual.durationLabel,
       );
     }).toList(growable: false);
+    final existingEpisodeNumbers = {
+      for (final episode in episodes)
+        if (episode.episodeNumber > 0) episode.episodeNumber,
+    };
+    final expandedEpisodes = [...episodes];
+    final extraEpisodes = refreshed.episodes
+        .where((episode) =>
+            episode.episodeNumber > 0 &&
+            !existingEpisodeNumbers.contains(episode.episodeNumber))
+        .toList()
+      ..sort(
+          (left, right) => left.episodeNumber.compareTo(right.episodeNumber));
+    for (final episode in extraEpisodes) {
+      expandedEpisodes.add(episode.copyWith(
+        seriesName: current.name,
+        seriesStateKey: current.seriesStateKey,
+        episodeIndex: expandedEpisodes.length,
+      ));
+    }
+    for (var index = 0; index < expandedEpisodes.length; index += 1) {
+      expandedEpisodes[index] =
+          expandedEpisodes[index].copyWith(episodeIndex: index);
+    }
+    final episodeCount = max(
+      max(current.episodeCount, refreshed.episodeCount),
+      expandedEpisodes.length,
+    );
     return current.copyWith(
+      episodeCount: episodeCount,
       imageUrl: mergedVisual(current.imageUrl, refreshed.imageUrl),
       backgroundUrl:
           mergedVisual(current.backgroundUrl, refreshed.backgroundUrl),
@@ -3522,7 +3584,7 @@ class AppController extends ChangeNotifier {
           : refreshed.japaneseTitle,
       aliases: {...current.aliases, ...refreshed.aliases}.toList(),
       cast: current.cast.isNotEmpty ? current.cast : refreshed.cast,
-      episodes: episodes,
+      episodes: expandedEpisodes,
     );
   }
 

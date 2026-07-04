@@ -1,9 +1,12 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
 
 import '../services/playback_backend.dart';
@@ -39,9 +42,11 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   String _error = '';
   Player? _player;
   VideoController? _videoController;
+  WebViewController? _webViewController;
   yt.YoutubeExplode? _youtube;
   bool _openedInApp = false;
   bool _opening = false;
+  bool _usingWebView = false;
   int _openTicket = 0;
 
   TrailerQueueEntry? get _current {
@@ -51,6 +56,14 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       return null;
     }
     return widget.entries[_index];
+  }
+
+  bool get _canUseWebTrailer {
+    if (kIsWeb) {
+      return false;
+    }
+    return defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS;
   }
 
   @override
@@ -93,10 +106,15 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     }
     final player = _player;
     final videoController = _videoController;
+    if (_canUseWebTrailer) {
+      await _openCurrentTrailerInWebView(entry, ticket);
+      return;
+    }
     if (player == null || videoController == null) {
       setState(() {
         _openedInApp = false;
         _opening = false;
+        _usingWebView = false;
         _status = 'Reproductor embebido no disponible.';
         _error = PlaybackBackend.initializationError.isNotEmpty
             ? PlaybackBackend.initializationError
@@ -107,6 +125,8 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     setState(() {
       _openedInApp = false;
       _opening = true;
+      _usingWebView = false;
+      _webViewController = null;
       _error = '';
       _status = 'Cargando trailer en la app...';
     });
@@ -116,17 +136,21 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       if (!mounted || ticket != _openTicket) {
         return;
       }
-      final playableUrl = await _resolvePlayableTrailerUrl(entry.trailerUrl);
+      final playableUrl = await _resolvePlayableTrailerUrl(entry.trailerUrl)
+          .timeout(const Duration(seconds: 16));
       if (!mounted || ticket != _openTicket) {
         return;
       }
-      await player.open(Media(playableUrl), play: true);
+      await player
+          .open(Media(playableUrl), play: true)
+          .timeout(const Duration(seconds: 12));
       if (!mounted || ticket != _openTicket) {
         return;
       }
       setState(() {
         _openedInApp = true;
         _opening = false;
+        _usingWebView = false;
         _status = 'Trailer en app';
       });
     } catch (error) {
@@ -142,6 +166,99 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       setState(() {
         _openedInApp = false;
         _opening = false;
+        _usingWebView = false;
+        _status = 'No se pudo reproducir en app.';
+        _error = error.toString();
+      });
+    }
+  }
+
+  Future<void> _openCurrentTrailerInWebView(
+    TrailerQueueEntry entry,
+    int ticket,
+  ) async {
+    final uri = Uri.parse(entry.trailerUrl);
+    final controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.black)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageStarted: (_) {
+            if (!mounted || ticket != _openTicket) {
+              return;
+            }
+            setState(() {
+              _openedInApp = true;
+              _opening = true;
+              _usingWebView = true;
+              _status = 'Cargando trailer web...';
+            });
+          },
+          onPageFinished: (_) {
+            if (!mounted || ticket != _openTicket) {
+              return;
+            }
+            setState(() {
+              _openedInApp = true;
+              _opening = false;
+              _usingWebView = true;
+              _status = 'Trailer web en app';
+            });
+          },
+          onWebResourceError: (error) {
+            final isMainFrame = error.isForMainFrame ?? true;
+            if (!isMainFrame || !mounted || ticket != _openTicket) {
+              return;
+            }
+            setState(() {
+              _openedInApp = false;
+              _opening = false;
+              _usingWebView = false;
+              _status = 'No se pudo reproducir en app.';
+              _error = error.description;
+            });
+          },
+        ),
+      );
+    final androidController = controller.platform;
+    if (androidController is AndroidWebViewController) {
+      await androidController.setMediaPlaybackRequiresUserGesture(false);
+    }
+    if (!mounted || ticket != _openTicket) {
+      return;
+    }
+    setState(() {
+      _webViewController = controller;
+      _usingWebView = true;
+      _openedInApp = true;
+      _opening = true;
+      _error = '';
+      _status = 'Cargando trailer web...';
+    });
+    final youtubeId = _extractYouTubeVideoId(entry.trailerUrl);
+    final vimeoId = _extractVimeoVideoId(uri);
+    try {
+      if (youtubeId.isNotEmpty) {
+        await controller.loadHtmlString(
+          _buildYouTubeEmbedHtml(youtubeId),
+          baseUrl: 'https://www.youtube-nocookie.com',
+        );
+      } else if (vimeoId.isNotEmpty) {
+        await controller.loadHtmlString(
+          _buildVimeoEmbedHtml(vimeoId),
+          baseUrl: 'https://player.vimeo.com',
+        );
+      } else {
+        await controller.loadRequest(uri);
+      }
+    } catch (error) {
+      if (!mounted || ticket != _openTicket) {
+        return;
+      }
+      setState(() {
+        _openedInApp = false;
+        _opening = false;
+        _usingWebView = false;
         _status = 'No se pudo reproducir en app.';
         _error = error.toString();
       });
@@ -216,6 +333,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     final youtube = _youtube;
     _player = null;
     _videoController = null;
+    _webViewController = null;
     _youtube = null;
     if (player != null) {
       unawaited(player.dispose());
@@ -235,7 +353,10 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_videoController != null)
+          if (_usingWebView && _webViewController != null)
+            Positioned.fill(
+                child: WebViewWidget(controller: _webViewController!))
+          else if (_videoController != null)
             Positioned.fill(
               child: Video(
                 controller: _videoController!,
@@ -388,6 +509,71 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       ),
     );
   }
+}
+
+String _extractYouTubeVideoId(String trailerUrl) {
+  return yt.VideoId.parseVideoId(trailerUrl) ?? '';
+}
+
+String _extractVimeoVideoId(Uri uri) {
+  final host = uri.host.toLowerCase();
+  if (!host.contains('vimeo.com')) {
+    return '';
+  }
+  for (final segment in uri.pathSegments.reversed) {
+    if (RegExp(r'^\d+$').hasMatch(segment)) {
+      return segment;
+    }
+  }
+  return '';
+}
+
+String _buildYouTubeEmbedHtml(String videoId) {
+  final safeId = _escapeHtmlAttribute(videoId);
+  return _buildTrailerEmbedHtml(
+    'https://www.youtube-nocookie.com/embed/$safeId'
+    '?autoplay=1&controls=1&rel=0&modestbranding=1&playsinline=1',
+  );
+}
+
+String _buildVimeoEmbedHtml(String videoId) {
+  final safeId = _escapeHtmlAttribute(videoId);
+  return _buildTrailerEmbedHtml(
+    'https://player.vimeo.com/video/$safeId'
+    '?autoplay=1&title=0&byline=0&portrait=0&playsinline=1',
+  );
+}
+
+String _buildTrailerEmbedHtml(String src) {
+  final safeSrc = _escapeHtmlAttribute(src);
+  return '''
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+    iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+  </style>
+</head>
+<body>
+  <iframe
+    src="$safeSrc"
+    allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+    allowfullscreen>
+  </iframe>
+</body>
+</html>
+''';
+}
+
+String _escapeHtmlAttribute(String value) {
+  return value
+      .replaceAll('&', '&amp;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
 }
 
 class _TrailerIconButton extends StatelessWidget {

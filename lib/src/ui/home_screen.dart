@@ -36,15 +36,20 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _searchController = TextEditingController();
   _Section _section = _Section.anime;
   SeriesItem? _selectedSeries;
+  _Section? _detailReturnSection;
   SeriesItem? _heroPreviewSeries;
   SeriesItem? _similarSeries;
   List<RemoteSearchCandidate> _similarResults = const [];
+  List<RemoteSearchCandidate> _detailSimilarResults = const [];
   List<RemoteSearchCandidate> _homeTrendingResults = const [];
   bool _similarLoading = false;
+  bool _detailSimilarLoading = false;
   bool _homeTrendingLoading = false;
   bool _randomLoading = false;
+  int _detailSimilarRequest = 0;
   int _homeTrendingVisualRequest = 0;
   String _similarStatus = '';
+  String _detailSimilarStatus = '';
   bool _profilePickerVisible = false;
 
   @override
@@ -189,6 +194,10 @@ class _HomeScreenState extends State<HomeScreen> {
       controller: controller,
       selectedSeries: _selectedSeries,
       heroPreviewSeries: _heroPreviewSeries,
+      detailBackLabel: _detailBackLabel,
+      detailSimilarCandidates: _detailSimilarResults,
+      detailSimilarStatus: _detailSimilarStatus,
+      detailSimilarLoading: _detailSimilarLoading,
       trendingCandidates: _homeTrendingResults,
       trendingLoading: _homeTrendingLoading,
       onSeriesCleared: _clearSelectedSeries,
@@ -240,13 +249,17 @@ class _HomeScreenState extends State<HomeScreen> {
     };
   }
 
-  void _selectSeries(SeriesItem series) {
+  void _selectSeries(SeriesItem series, {_Section? returnSection}) {
+    final origin = returnSection ?? _section;
     setState(() {
       _selectedSeries = series;
+      _detailReturnSection =
+          origin == _Section.anime || origin == _Section.random ? null : origin;
       _heroPreviewSeries = series;
       _section = _Section.anime;
     });
     unawaited(_refreshSelectedSeriesVisuals(series));
+    unawaited(_loadDetailSimilar(series));
   }
 
   void _previewSeries(SeriesItem series) {
@@ -279,12 +292,18 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _selectedSeries = refreshed;
       });
+      unawaited(_loadDetailSimilar(refreshed));
     }
   }
 
   void _clearSelectedSeries() {
+    final returnSection = _detailReturnSection;
     setState(() {
       _selectedSeries = null;
+      _detailReturnSection = null;
+      if (returnSection != null) {
+        _section = returnSection;
+      }
     });
   }
 
@@ -367,11 +386,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openRemoteCandidate(RemoteSearchCandidate candidate) async {
+    final origin = _section;
     final series = await widget.controller.importRemoteCandidate(candidate);
     if (!mounted) {
       return;
     }
-    _selectSeries(series);
+    _selectSeries(series, returnSection: origin);
   }
 
   Future<void> _loadHomeTrending() async {
@@ -449,7 +469,39 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _randomLoading = false;
     });
-    _selectSeries(series);
+    _selectSeries(series, returnSection: _Section.anime);
+  }
+
+  Future<void> _loadDetailSimilar(SeriesItem series) async {
+    final request = ++_detailSimilarRequest;
+    final seriesKey = series.stableKey;
+    setState(() {
+      _detailSimilarLoading = true;
+      _detailSimilarStatus = 'Buscando similares...';
+      _detailSimilarResults = const [];
+    });
+    final result = await widget.controller.loadSimilarCandidates(series);
+    if (!mounted ||
+        request != _detailSimilarRequest ||
+        _selectedSeries?.stableKey != seriesKey) {
+      return;
+    }
+    setState(() {
+      _detailSimilarResults = result.candidates.take(12).toList();
+      _detailSimilarStatus = result.status;
+      _detailSimilarLoading = false;
+    });
+  }
+
+  String get _detailBackLabel {
+    return switch (_detailReturnSection) {
+      _Section.search => 'Buscar',
+      _Section.favorites => 'Mi espacio',
+      _Section.playlist => 'Playlist',
+      _Section.similar => 'Similares',
+      _Section.settings => 'Ajustes',
+      _ => 'Inicio',
+    };
   }
 
   Future<void> _openSimilarForSeries(SeriesItem series) async {
@@ -1752,6 +1804,10 @@ class _AnimePanel extends StatelessWidget {
     required this.controller,
     required this.selectedSeries,
     required this.heroPreviewSeries,
+    required this.detailBackLabel,
+    required this.detailSimilarCandidates,
+    required this.detailSimilarStatus,
+    required this.detailSimilarLoading,
     required this.trendingCandidates,
     required this.trendingLoading,
     required this.onSeriesCleared,
@@ -1769,6 +1825,10 @@ class _AnimePanel extends StatelessWidget {
   final AppController controller;
   final SeriesItem? selectedSeries;
   final SeriesItem? heroPreviewSeries;
+  final String detailBackLabel;
+  final List<RemoteSearchCandidate> detailSimilarCandidates;
+  final String detailSimilarStatus;
+  final bool detailSimilarLoading;
   final List<RemoteSearchCandidate> trendingCandidates;
   final bool trendingLoading;
   final VoidCallback onSeriesCleared;
@@ -1797,7 +1857,12 @@ class _AnimePanel extends StatelessWidget {
         child: _SeriesDetailPanel(
           controller: controller,
           series: selectedSeries!,
+          backLabel: detailBackLabel,
+          similarCandidates: detailSimilarCandidates,
+          similarStatus: detailSimilarStatus,
+          similarLoading: detailSimilarLoading,
           onBack: onSeriesCleared,
+          onRemoteCandidateSelected: onRemoteCandidateSelected,
           onSimilarSeriesRequested: onSimilarSeriesRequested,
           onPlayEpisode: onPlayEpisode,
           onOpenTrailer: onOpenSeriesTrailer,
@@ -2216,7 +2281,12 @@ class _SeriesDetailPanel extends StatelessWidget {
   const _SeriesDetailPanel({
     required this.controller,
     required this.series,
+    required this.backLabel,
+    required this.similarCandidates,
+    required this.similarStatus,
+    required this.similarLoading,
     required this.onBack,
+    required this.onRemoteCandidateSelected,
     required this.onSimilarSeriesRequested,
     required this.onPlayEpisode,
     required this.onOpenTrailer,
@@ -2224,7 +2294,12 @@ class _SeriesDetailPanel extends StatelessWidget {
 
   final AppController controller;
   final SeriesItem series;
+  final String backLabel;
+  final List<RemoteSearchCandidate> similarCandidates;
+  final String similarStatus;
+  final bool similarLoading;
   final VoidCallback onBack;
+  final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final ValueChanged<SeriesItem> onSimilarSeriesRequested;
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final ValueChanged<SeriesItem> onOpenTrailer;
@@ -2245,10 +2320,18 @@ class _SeriesDetailPanel extends StatelessWidget {
           meta: meta,
           description: description,
           nextEpisode: nextEpisode,
+          backLabel: backLabel,
           onBack: onBack,
           onSimilarSeriesRequested: onSimilarSeriesRequested,
           onPlayEpisode: onPlayEpisode,
           onOpenTrailer: onOpenTrailer,
+        );
+        final similar = _DetailSimilarCarousel(
+          controller: controller,
+          candidates: similarCandidates,
+          status: similarStatus,
+          loading: similarLoading,
+          onCandidateSelected: onRemoteCandidateSelected,
         );
         final episodes = _DetailEpisodesColumn(
           controller: controller,
@@ -2262,6 +2345,8 @@ class _SeriesDetailPanel extends StatelessWidget {
               children: [
                 info,
                 const SizedBox(height: 18),
+                similar,
+                const SizedBox(height: 18),
                 SizedBox(height: 560, child: episodes),
               ],
             ),
@@ -2272,7 +2357,18 @@ class _SeriesDetailPanel extends StatelessWidget {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Expanded(child: SingleChildScrollView(child: info)),
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      info,
+                      const SizedBox(height: 18),
+                      similar,
+                    ],
+                  ),
+                ),
+              ),
               const SizedBox(width: 18),
               SizedBox(width: 420, child: episodes),
             ],
@@ -2303,6 +2399,7 @@ class _SeriesDetailInfo extends StatelessWidget {
     required this.meta,
     required this.description,
     required this.nextEpisode,
+    required this.backLabel,
     required this.onBack,
     required this.onSimilarSeriesRequested,
     required this.onPlayEpisode,
@@ -2314,6 +2411,7 @@ class _SeriesDetailInfo extends StatelessWidget {
   final String meta;
   final String description;
   final EpisodeItem? nextEpisode;
+  final String backLabel;
   final VoidCallback onBack;
   final ValueChanged<SeriesItem> onSimilarSeriesRequested;
   final ValueChanged<EpisodeItem> onPlayEpisode;
@@ -2328,7 +2426,12 @@ class _SeriesDetailInfo extends StatelessWidget {
         .where((entry) => entry.isNotEmpty)
         .toList();
     final posterUrl = series.imageUrl.trim();
-    Widget buildInfoColumn({required bool wide}) {
+    final castBlock =
+        cast.isEmpty ? null : _DetailCastBlock(cast: cast.take(10).toList());
+    Widget buildInfoColumn({
+      required bool wide,
+      bool alignCastBottom = false,
+    }) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2410,6 +2513,10 @@ class _SeriesDetailInfo extends StatelessWidget {
               ),
             ],
           ),
+          if (castBlock != null) ...[
+            if (alignCastBottom) const Spacer() else const SizedBox(height: 18),
+            castBlock,
+          ],
         ],
       );
     }
@@ -2437,7 +2544,7 @@ class _SeriesDetailInfo extends StatelessWidget {
             child: TextButton.icon(
               onPressed: onBack,
               icon: const Icon(Icons.arrow_back),
-              label: const Text('Biblioteca'),
+              label: Text(backLabel),
             ),
           ),
           const SizedBox(height: 6),
@@ -2489,39 +2596,126 @@ class _SeriesDetailInfo extends StatelessWidget {
                 );
               }
               final posterWidth = constraints.maxWidth >= 1100 ? 250.0 : 210.0;
+              final posterHeight = posterWidth * 1.5;
               return Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   buildPoster(posterWidth),
                   const SizedBox(width: 24),
-                  Expanded(child: buildInfoColumn(wide: true)),
+                  Expanded(
+                    child: SizedBox(
+                      height: posterHeight,
+                      child: buildInfoColumn(
+                        wide: true,
+                        alignCastBottom: true,
+                      ),
+                    ),
+                  ),
                 ],
               );
             },
           ),
-          if (cast.isNotEmpty) ...[
-            const SizedBox(height: 28),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(18),
-              decoration: glassDecoration(),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Cast', style: Theme.of(context).textTheme.titleMedium),
-                  const SizedBox(height: 8),
-                  Text(
-                    cast.take(10).join('   '),
-                    maxLines: 8,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Color(0xFFC5D3E0)),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ],
       ),
+    );
+  }
+}
+
+class _DetailCastBlock extends StatelessWidget {
+  const _DetailCastBlock({required this.cast});
+
+  final List<String> cast;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: glassDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('Cast', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          Text(
+            cast.join('   '),
+            maxLines: 5,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Color(0xFFC5D3E0), height: 1.25),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DetailSimilarCarousel extends StatelessWidget {
+  const _DetailSimilarCarousel({
+    required this.controller,
+    required this.candidates,
+    required this.status,
+    required this.loading,
+    required this.onCandidateSelected,
+  });
+
+  final AppController controller;
+  final List<RemoteSearchCandidate> candidates;
+  final String status;
+  final bool loading;
+  final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleStatus = status.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Similares', style: Theme.of(context).textTheme.titleLarge),
+        if (visibleStatus.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text(
+            visibleStatus,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: TanukiColors.muted, fontSize: 12),
+          ),
+        ],
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 228,
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : candidates.isEmpty
+                  ? const _EmptyState(
+                      icon: Icons.travel_explore,
+                      title: 'Sin similares',
+                      message:
+                          'No encontre series relacionadas para esta ficha.',
+                    )
+                  : ListView.separated(
+                      clipBehavior: Clip.none,
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                      itemBuilder: (context, index) {
+                        final candidate = candidates[index];
+                        return SizedBox(
+                          width: 148,
+                          child: _SearchResultPosterCard(
+                            candidate: candidate,
+                            imported: controller.findRemoteSeriesForCandidate(
+                                  candidate,
+                                ) !=
+                                null,
+                            onTap: () => onCandidateSelected(candidate),
+                          ),
+                        );
+                      },
+                      separatorBuilder: (_, __) => const SizedBox(width: 8),
+                      itemCount: candidates.length,
+                    ),
+        ),
+      ],
     );
   }
 }
@@ -4116,10 +4310,37 @@ class _FavoritesPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final profile = controller.state.profile;
     List<SeriesItem> seriesFor(Set<String> keys) {
-      return controller.library
-          .where((series) => keys.contains(series.stableKey))
-          .toList()
-        ..sort((a, b) => a.stableKey.compareTo(b.stableKey));
+      final byIdentity = <String, SeriesItem>{};
+      for (final series in controller.library
+          .where((series) => keys.contains(series.stableKey))) {
+        final identities = _spaceSeriesIdentityKeys(series);
+        if (identities.isEmpty) {
+          continue;
+        }
+        final identity = identities.firstWhere(
+          byIdentity.containsKey,
+          orElse: () => identities.first,
+        );
+        final current = byIdentity[identity];
+        if (current == null ||
+            _spaceSeriesCompletenessScore(series) >
+                _spaceSeriesCompletenessScore(current)) {
+          if (current != null) {
+            for (final key in byIdentity.entries
+                .where((entry) => identical(entry.value, current))
+                .map((entry) => entry.key)
+                .toList(growable: false)) {
+              byIdentity[key] = series;
+            }
+          }
+          for (final key in identities) {
+            byIdentity[key] = series;
+          }
+        }
+      }
+      return byIdentity.values.toSet().toList()
+        ..sort((a, b) => _seriesTitleDedupeKey(a.name)
+            .compareTo(_seriesTitleDedupeKey(b.name)));
     }
 
     final favorites = seriesFor(profile.favoriteSeries);
@@ -4692,137 +4913,6 @@ class _SettingsStatusText extends StatelessWidget {
   }
 }
 
-class _SeriesCard extends StatelessWidget {
-  const _SeriesCard({
-    required this.controller,
-    required this.series,
-    required this.onTap,
-    required this.onPlay,
-  });
-
-  final AppController controller;
-  final SeriesItem series;
-  final VoidCallback onTap;
-  final VoidCallback onPlay;
-
-  @override
-  Widget build(BuildContext context) {
-    final watched = controller.watchedCountFor(series);
-    final remaining =
-        (series.episodeCount - watched).clamp(0, series.episodeCount).toInt();
-    final status = controller.spaceStatusFor(series);
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.all(12),
-        decoration: glassDecoration(color: TanukiColors.panelSolid),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SizedBox(
-                width: 82,
-                height: 118,
-                child: _Poster(imageUrl: series.imageUrl, title: series.name)),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          series.name,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                      ),
-                      IconButton(
-                        onPressed: () => controller.toggleFavorite(series),
-                        icon: Icon(controller.isFavorite(series)
-                            ? Icons.favorite
-                            : Icons.favorite_border),
-                        color: controller.isFavorite(series)
-                            ? TanukiColors.danger
-                            : TanukiColors.muted,
-                        tooltip: 'Favorito',
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    remaining > 0
-                        ? '${series.episodeCount} episodios | pendientes $remaining | siguiente ${watched + 1}'
-                        : '${series.episodeCount} episodios | completada',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      if (series.releaseYear > 0)
-                        _SourceChip(text: '${series.releaseYear}'),
-                      if (series.format.isNotEmpty)
-                        _SourceChip(text: series.format),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: () =>
-                            controller.toggleSeriesSelection(series),
-                        icon: Icon(controller.isSelected(series)
-                            ? Icons.check
-                            : Icons.add),
-                        label: Text(controller.isSelected(series)
-                            ? 'Agregada'
-                            : 'Agregar'),
-                      ),
-                      const SizedBox(width: 8),
-                      FilledButton.icon(
-                        onPressed: series.episodes.isEmpty ? null : onPlay,
-                        icon: const Icon(Icons.play_arrow),
-                        label: const Text('Play'),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  DropdownButton<String>(
-                    value: status.isEmpty ? 'none' : status,
-                    isDense: true,
-                    dropdownColor: TanukiColors.panelSolid,
-                    items: const [
-                      DropdownMenuItem(
-                          value: 'none', child: Text('Sin estado')),
-                      DropdownMenuItem(
-                          value: 'want_to_watch', child: Text('Quiero ver')),
-                      DropdownMenuItem(
-                          value: 'watching', child: Text('Viendo')),
-                      DropdownMenuItem(
-                          value: 'abandoned', child: Text('Abandonada')),
-                      DropdownMenuItem(
-                          value: 'completed', child: Text('Completada')),
-                    ],
-                    onChanged: (value) => controller.setSpaceStatus(
-                        series, value == 'none' ? '' : value ?? ''),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _ContinueWatchingEntry {
   const _ContinueWatchingEntry({
     required this.series,
@@ -4960,6 +5050,41 @@ String _seriesTitleDedupeKey(String value) {
     '',
   );
   return normalizeSeriesKey(stripped);
+}
+
+List<String> _spaceSeriesIdentityKeys(SeriesItem series) {
+  if (series.catalogId > 0) {
+    return ['catalog:${series.catalogId}'];
+  }
+  final titleKeys = <String>{
+    _seriesTitleDedupeKey(series.name),
+    _seriesTitleDedupeKey(series.japaneseTitle),
+    ...series.aliases.map(_seriesTitleDedupeKey),
+  }..removeWhere((entry) => entry.isEmpty);
+  if (titleKeys.isNotEmpty) {
+    return titleKeys.toList(growable: false);
+  }
+  return [series.stableKey];
+}
+
+int _spaceSeriesCompletenessScore(SeriesItem series) {
+  var score = series.episodeCount;
+  if (series.imageUrl.isNotEmpty) {
+    score += 10000;
+  }
+  if (series.backgroundUrl.isNotEmpty) {
+    score += 8000;
+  }
+  if (series.logoUrl.isNotEmpty) {
+    score += 6000;
+  }
+  if (series.description.isNotEmpty) {
+    score += 3000;
+  }
+  if (series.cast.isNotEmpty) {
+    score += 1000 + series.cast.length;
+  }
+  return score;
 }
 
 EpisodeItem? _partialPlaybackEpisode(
@@ -5712,32 +5837,6 @@ class _PosterFallback extends StatelessWidget {
           ),
         ),
       ],
-    );
-  }
-}
-
-class _SourceChip extends StatelessWidget {
-  const _SourceChip({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-      decoration: BoxDecoration(
-        color: const Color(0xFF332915),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(
-        text,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(
-            color: TanukiColors.amber,
-            fontSize: 11,
-            fontWeight: FontWeight.w800),
-      ),
     );
   }
 }
