@@ -1054,6 +1054,20 @@ class CandidateVisualCacheEntry {
   }
 }
 
+class PlaylistPlaybackOrder {
+  const PlaylistPlaybackOrder._();
+
+  static const tv = 'tv';
+  static const series = 'series';
+
+  static String normalize(Object? value) {
+    return switch ('$value'.trim().toLowerCase()) {
+      'series' => series,
+      _ => tv,
+    };
+  }
+}
+
 class PlaylistState {
   const PlaylistState({
     required this.id,
@@ -1061,6 +1075,7 @@ class PlaylistState {
     this.selectedSeries = const {},
     this.progress = const {},
     this.lastPlayedSeriesName = '',
+    this.playbackOrder = PlaylistPlaybackOrder.tv,
   });
 
   final String id;
@@ -1068,6 +1083,7 @@ class PlaylistState {
   final Set<String> selectedSeries;
   final Map<String, int> progress;
   final String lastPlayedSeriesName;
+  final String playbackOrder;
 
   factory PlaylistState.defaultPlaylist() {
     return const PlaylistState(id: 'default', name: 'Playlist principal');
@@ -1083,6 +1099,7 @@ class PlaylistState {
       progress:
           rawProgress.map((key, value) => MapEntry('$key', _readInt(value))),
       lastPlayedSeriesName: _readString(json['lastPlayedSeriesName']),
+      playbackOrder: PlaylistPlaybackOrder.normalize(json['playbackOrder']),
     );
   }
 
@@ -1092,6 +1109,7 @@ class PlaylistState {
     Set<String>? selectedSeries,
     Map<String, int>? progress,
     String? lastPlayedSeriesName,
+    String? playbackOrder,
   }) {
     return PlaylistState(
       id: id ?? this.id,
@@ -1099,6 +1117,9 @@ class PlaylistState {
       selectedSeries: selectedSeries ?? this.selectedSeries,
       progress: progress ?? this.progress,
       lastPlayedSeriesName: lastPlayedSeriesName ?? this.lastPlayedSeriesName,
+      playbackOrder: playbackOrder == null
+          ? this.playbackOrder
+          : PlaylistPlaybackOrder.normalize(playbackOrder),
     );
   }
 
@@ -1109,6 +1130,7 @@ class PlaylistState {
       'selectedSeries': selectedSeries.toList()..sort(),
       'progress': progress,
       'lastPlayedSeriesName': lastPlayedSeriesName,
+      'playbackOrder': PlaylistPlaybackOrder.normalize(playbackOrder),
     };
   }
 }

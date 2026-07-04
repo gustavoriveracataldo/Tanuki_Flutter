@@ -2167,7 +2167,7 @@ class AppController extends ChangeNotifier {
   }
 
   String _visualCacheKeyForCandidate(RemoteSearchCandidate candidate) {
-    const cachePrefix = 'visual-v3';
+    const cachePrefix = 'visual-v4';
     if (candidate.catalogId > 0) {
       final yearSuffix =
           candidate.releaseYear > 0 ? ':${candidate.releaseYear}' : '';
@@ -2280,6 +2280,14 @@ class AppController extends ChangeNotifier {
       selected.add(series.stableKey);
     }
     final playlist = activePlaylist.copyWith(selectedSeries: selected);
+    _state = _state.copyWith(profile: _replaceActivePlaylist(playlist));
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setActivePlaylistPlaybackOrder(String playbackOrder) async {
+    final normalized = PlaylistPlaybackOrder.normalize(playbackOrder);
+    final playlist = activePlaylist.copyWith(playbackOrder: normalized);
     _state = _state.copyWith(profile: _replaceActivePlaylist(playlist));
     await _save();
     notifyListeners();
@@ -2422,6 +2430,98 @@ class AppController extends ChangeNotifier {
       duration: Duration(milliseconds: existing?.durationMs ?? 0),
       completed: true,
     );
+  }
+
+  Future<void> markSeriesPlayedThrough(
+    SeriesItem series,
+    EpisodeItem targetEpisode,
+  ) async {
+    if (series.episodes.isEmpty) {
+      return;
+    }
+    final targetIndex =
+        targetEpisode.episodeIndex.clamp(0, series.episodes.length - 1).toInt();
+    final completedEpisodes = series.episodes
+        .where((episode) => episode.episodeIndex <= targetIndex)
+        .toList(growable: false);
+    if (completedEpisodes.isEmpty) {
+      return;
+    }
+
+    final nextPlayback = Map<String, EpisodePlaybackRecord>.from(
+      _state.profile.episodePlayback,
+    );
+    for (final episode in completedEpisodes) {
+      final aliases = _expandedEpisodePlaybackAliases(episode);
+      if (aliases.isEmpty) {
+        continue;
+      }
+      final existing = _firstPlaybackRecord(aliases);
+      final durationMs = existing?.durationMs ?? 0;
+      final positionMs = durationMs > 0
+          ? durationMs
+          : [
+              existing?.positionMs ?? 0,
+              1,
+            ].reduce((left, right) => left > right ? left : right);
+      final record = EpisodePlaybackRecord.normalized(
+        positionMs: positionMs,
+        durationMs: durationMs,
+        completed: true,
+      );
+      for (final key in aliases) {
+        nextPlayback[key] = record;
+      }
+    }
+
+    final key = series.stableKey;
+    final nextProgress = {..._state.profile.activePlaylist.progress};
+    final current = nextProgress[key] ?? 0;
+    final watchedCount = targetIndex + 1;
+    if (watchedCount > current) {
+      nextProgress[key] = watchedCount;
+    }
+    final completedSeries = watchedCount >= series.episodes.length;
+    var playlist = _state.profile.activePlaylist.copyWith(
+      progress: nextProgress,
+      lastPlayedSeriesName: key,
+    );
+    final matchingKeys = completedSeries
+        ? _matchingSeriesKeysForState(series)
+        : <String>{key};
+    if (completedSeries) {
+      playlist = playlist.copyWith(
+        selectedSeries: {...playlist.selectedSeries}..removeAll(matchingKeys),
+      );
+    }
+
+    var profile = _replaceActivePlaylistForProfile(_state.profile, playlist);
+    final nextWatchlist = {...profile.watchlistSeries}..removeAll(matchingKeys);
+    final nextWatching = {...profile.watchingSeries};
+    final nextCompleted = {...profile.completedSeries};
+    final nextAbandoned = {...profile.abandonedSeries};
+    if (completedSeries) {
+      nextWatching.removeAll(matchingKeys);
+      nextAbandoned.removeAll(matchingKeys);
+      nextCompleted.addAll(matchingKeys);
+    } else if (!nextCompleted.contains(key) && !nextAbandoned.contains(key)) {
+      nextWatching.add(key);
+    }
+    profile = profile.copyWith(
+      watchlistSeries: nextWatchlist,
+      watchingSeries: nextWatching,
+      abandonedSeries: nextAbandoned,
+      completedSeries: nextCompleted,
+      episodePlayback: nextPlayback,
+      currentEntry: targetEpisode,
+    );
+
+    _state = _state.copyWith(profile: profile);
+    await _save();
+    notifyListeners();
+    for (final episode in completedEpisodes) {
+      unawaited(_syncCompletedEpisodeExternal(episode));
+    }
   }
 
   Future<void> saveEpisodePlayback(
@@ -2903,6 +3003,29 @@ class AppController extends ChangeNotifier {
       }
     }
     return null;
+  }
+
+  Set<String> _matchingSeriesKeysForState(SeriesItem target) {
+    final targetIdentities = _seriesStateIdentityKeys(target).toSet();
+    final keys = <String>{target.stableKey};
+    for (final series in library) {
+      if (_seriesStateIdentityKeys(series).any(targetIdentities.contains)) {
+        keys.add(series.stableKey);
+      }
+    }
+    return keys;
+  }
+
+  List<String> _seriesStateIdentityKeys(SeriesItem series) {
+    if (series.catalogId > 0) {
+      return ['catalog:${series.catalogId}'];
+    }
+    final keys = <String>{
+      normalizeSeriesKey(series.name),
+      normalizeSeriesKey(series.japaneseTitle),
+      ...series.aliases.map(normalizeSeriesKey),
+    }..removeWhere((entry) => entry.isEmpty);
+    return keys.isEmpty ? [series.stableKey] : keys.toList(growable: false);
   }
 
   int _watchedEpisodesForSeriesKey(
@@ -3896,20 +4019,40 @@ class AppController extends ChangeNotifier {
     EpisodeItem episode,
   ) {
     final key = _seriesStateKeyForEpisode(episode);
+    final series = findSeriesForEpisode(episode);
     final nextProgress = {...profile.activePlaylist.progress};
     final current = nextProgress[key] ?? 0;
-    if (episode.episodeIndex + 1 > current) {
-      nextProgress[key] = episode.episodeIndex + 1;
+    final watchedCount = episode.episodeIndex + 1;
+    if (watchedCount > current) {
+      nextProgress[key] = watchedCount;
     }
-    final playlist = profile.activePlaylist.copyWith(
+    final completedSeries = key.isNotEmpty &&
+        series != null &&
+        series.episodes.isNotEmpty &&
+        watchedCount >= series.episodes.length;
+    var playlist = profile.activePlaylist.copyWith(
       progress: nextProgress,
       lastPlayedSeriesName: key,
     );
-    final nextWatchlist = {...profile.watchlistSeries}..remove(key);
+    if (completedSeries) {
+      playlist = playlist.copyWith(
+        selectedSeries: {...playlist.selectedSeries}
+          ..removeAll(_matchingSeriesKeysForState(series!)),
+      );
+    }
+    final matchingKeys =
+        completedSeries ? _matchingSeriesKeysForState(series!) : <String>{key};
+    final nextWatchlist = {...profile.watchlistSeries}..removeAll(matchingKeys);
     final nextWatching = {...profile.watchingSeries};
-    if (key.isNotEmpty &&
-        !profile.completedSeries.contains(key) &&
-        !profile.abandonedSeries.contains(key)) {
+    final nextCompleted = {...profile.completedSeries};
+    final nextAbandoned = {...profile.abandonedSeries};
+    if (completedSeries) {
+      nextWatching.removeAll(matchingKeys);
+      nextAbandoned.removeAll(matchingKeys);
+      nextCompleted.addAll(matchingKeys);
+    } else if (key.isNotEmpty &&
+        !nextCompleted.contains(key) &&
+        !nextAbandoned.contains(key)) {
       nextWatching.add(key);
     } else {
       nextWatching.remove(key);
@@ -3917,6 +4060,8 @@ class AppController extends ChangeNotifier {
     return _replaceActivePlaylistForProfile(profile, playlist).copyWith(
       watchlistSeries: nextWatchlist,
       watchingSeries: nextWatching,
+      abandonedSeries: nextAbandoned,
+      completedSeries: nextCompleted,
       currentEntry: episode,
     );
   }

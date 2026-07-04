@@ -21,6 +21,12 @@ const _playerOverlayAutoHideDelay = Duration(seconds: 5);
 const _remoteSeekJumpThreshold = Duration(seconds: 45);
 const _remoteSeekStallDelay = Duration(seconds: 11);
 
+enum _UpcomingCardPhase {
+  none,
+  next,
+  later,
+}
+
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({
     super.key,
@@ -63,6 +69,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Timer? _deferredAnimeAv1PlaybackErrorTimer;
   Timer? _playerOverlayHideTimer;
   Timer? _animeAv1SeekRecoveryTimer;
+  Timer? _upcomingCardStartTimer;
+  Timer? _upcomingCardSequenceTimer;
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<Duration>? _durationSubscription;
   StreamSubscription<bool>? _completedSubscription;
@@ -77,6 +85,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int? _remoteVideoHeight;
   String _deferredAnimeAv1PlaybackError = '';
   String _currentPlaybackPath = '';
+  _UpcomingCardPhase _upcomingCardPhase = _UpcomingCardPhase.none;
+  bool _startUpcomingCardsShown = false;
+  bool _endUpcomingCardsShown = false;
+  int _upcomingCardTicket = 0;
 
   @override
   void initState() {
@@ -97,6 +109,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _simklScrobbleTimer?.cancel();
     _playerOverlayHideTimer?.cancel();
     _animeAv1SeekRecoveryTimer?.cancel();
+    _upcomingCardStartTimer?.cancel();
+    _upcomingCardSequenceTimer?.cancel();
     _cancelRemoteVideoFrameWatchdog();
     _cancelDeferredAnimeAv1PlaybackError();
     final positionSubscription = _positionSubscription;
@@ -122,6 +136,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _openEpisode() async {
     await widget.controller.setCurrentEntry(widget.episode);
     _cancelRemoteVideoFrameWatchdog();
+    _resetUpcomingCards();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
     _remotePlaybackAccepted = false;
@@ -256,6 +271,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 : 'Reproduccion local'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
       });
+      _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
     } catch (error) {
       if (!mounted) {
@@ -745,10 +761,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _durationDistance(previous, position) >= _remoteSeekJumpThreshold) {
         _scheduleRemoteSeekRecovery(position);
       }
+      _maybeScheduleUpcomingCards(position);
       _persistPlaybackThrottled();
     });
     _durationSubscription = player.stream.duration.listen((duration) {
       _lastDuration = duration;
+      _maybeScheduleUpcomingCards(_lastPosition);
       _persistPlaybackThrottled();
     });
     _completedSubscription = player.stream.completed.listen((completed) {
@@ -936,10 +954,145 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return detail.isEmpty ? provider.label : '${provider.label} / $detail';
   }
 
+  void _resetUpcomingCards() {
+    _upcomingCardTicket += 1;
+    _upcomingCardStartTimer?.cancel();
+    _upcomingCardStartTimer = null;
+    _upcomingCardSequenceTimer?.cancel();
+    _upcomingCardSequenceTimer = null;
+    _upcomingCardPhase = _UpcomingCardPhase.none;
+    _startUpcomingCardsShown = false;
+    _endUpcomingCardsShown = false;
+  }
+
+  void _scheduleOpeningUpcomingCards() {
+    if (_startUpcomingCardsShown ||
+        !widget.controller.state.showPlaylistUpcomingCards ||
+        _nextEntriesAfterCurrent().isEmpty) {
+      return;
+    }
+    final ticket = _upcomingCardTicket;
+    _upcomingCardStartTimer?.cancel();
+    _upcomingCardStartTimer = Timer(const Duration(seconds: 30), () {
+      _upcomingCardStartTimer = null;
+      if (!mounted ||
+          ticket != _upcomingCardTicket ||
+          _startUpcomingCardsShown ||
+          !widget.controller.state.showPlaylistUpcomingCards ||
+          _nextEntriesAfterCurrent().isEmpty) {
+        return;
+      }
+      _startUpcomingCardsShown = true;
+      _runUpcomingCardSequence();
+    });
+  }
+
+  void _maybeScheduleUpcomingCards(Duration position) {
+    if (!widget.controller.state.showPlaylistUpcomingCards ||
+        position < Duration.zero ||
+        _upcomingCardPhase != _UpcomingCardPhase.none ||
+        _upcomingCardSequenceTimer != null) {
+      return;
+    }
+    if (_nextEntriesAfterCurrent().isEmpty) {
+      return;
+    }
+    if (!_endUpcomingCardsShown &&
+        _lastDuration > Duration.zero &&
+        position >= const Duration(seconds: 30) &&
+        _lastDuration - position <= const Duration(seconds: 30)) {
+      _endUpcomingCardsShown = true;
+      _runUpcomingCardSequence();
+    }
+  }
+
+  void _runUpcomingCardSequence() {
+    final ticket = ++_upcomingCardTicket;
+    _upcomingCardStartTimer?.cancel();
+    _upcomingCardStartTimer = null;
+    _upcomingCardSequenceTimer?.cancel();
+    _setUpcomingCardPhase(_UpcomingCardPhase.next);
+    _upcomingCardSequenceTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted || ticket != _upcomingCardTicket) {
+        return;
+      }
+      if (_nextEntriesAfterCurrent().length < 2) {
+        _upcomingCardSequenceTimer = null;
+        _setUpcomingCardPhase(_UpcomingCardPhase.none);
+        return;
+      }
+      _setUpcomingCardPhase(_UpcomingCardPhase.later);
+      _upcomingCardSequenceTimer = Timer(const Duration(seconds: 5), () {
+        if (!mounted || ticket != _upcomingCardTicket) {
+          return;
+        }
+        _upcomingCardSequenceTimer = null;
+        _setUpcomingCardPhase(_UpcomingCardPhase.none);
+      });
+    });
+  }
+
+  void _setUpcomingCardPhase(_UpcomingCardPhase phase) {
+    if (!mounted) {
+      _upcomingCardPhase = phase;
+      return;
+    }
+    if (_upcomingCardPhase == phase) {
+      return;
+    }
+    setState(() {
+      _upcomingCardPhase = phase;
+    });
+  }
+
+  EpisodeItem? _visibleUpcomingCardEpisode(List<EpisodeItem> nextEntries) {
+    return switch (_upcomingCardPhase) {
+      _UpcomingCardPhase.next =>
+        nextEntries.isEmpty ? null : nextEntries.first,
+      _UpcomingCardPhase.later =>
+        nextEntries.length < 2 ? null : nextEntries[1],
+      _ => null,
+    };
+  }
+
+  List<EpisodeItem> _nextEntriesAfterCurrent() {
+    return widget.controller
+        .buildNextEntries(limit: 4)
+        .where((entry) => !_isSameEpisode(entry, widget.episode))
+        .take(2)
+        .toList(growable: false);
+  }
+
+  bool _isSameEpisode(EpisodeItem left, EpisodeItem right) {
+    final leftSeries = left.seriesStateKey.isNotEmpty
+        ? left.seriesStateKey
+        : normalizeSeriesKey(left.seriesName);
+    final rightSeries = right.seriesStateKey.isNotEmpty
+        ? right.seriesStateKey
+        : normalizeSeriesKey(right.seriesName);
+    return leftSeries == rightSeries &&
+        left.episodeNumber == right.episodeNumber;
+  }
+
+  String _visibleUpcomingCardLabel() {
+    return switch (_upcomingCardPhase) {
+      _UpcomingCardPhase.later => 'Mas tarde',
+      _ => 'A continuacion',
+    };
+  }
+
+  Color _visibleUpcomingCardColor() {
+    return switch (_upcomingCardPhase) {
+      _UpcomingCardPhase.later => TanukiColors.cyan,
+      _ => TanukiColors.amber,
+    };
+  }
+
   @override
   Widget build(BuildContext context) {
     final episode = widget.episode;
-    final nextEntries = widget.controller.buildNextEntries(limit: 2);
+    final nextEntries = _nextEntriesAfterCurrent();
+    final visibleUpcomingCard = _visibleUpcomingCardEpisode(nextEntries);
     final sourceStatus = _sourceStatus();
     return Scaffold(
       backgroundColor: Colors.black,
@@ -993,33 +1146,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
             ),
             if (widget.controller.state.showPlaylistUpcomingCards &&
-                nextEntries.isNotEmpty)
+                visibleUpcomingCard != null)
               Positioned(
                 right: 18,
                 bottom: 24,
                 child: IgnorePointer(
-                  ignoring: _openedMedia && !_playerOverlaysVisible,
+                  ignoring: true,
                   child: AnimatedOpacity(
-                    opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
+                    opacity: 1,
                     duration: const Duration(milliseconds: 220),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        if (nextEntries.isNotEmpty)
-                          _UpcomingCard(
-                            label: 'A continuacion',
-                            labelColor: TanukiColors.amber,
-                            episode: nextEntries.first,
-                          ),
-                        if (nextEntries.length > 1) ...[
-                          const SizedBox(height: 10),
-                          _UpcomingCard(
-                            label: 'Mas tarde',
-                            labelColor: TanukiColors.cyan,
-                            episode: nextEntries[1],
-                          ),
-                        ],
-                      ],
+                    child: _UpcomingCard(
+                      label: _visibleUpcomingCardLabel(),
+                      labelColor: _visibleUpcomingCardColor(),
+                      episode: visibleUpcomingCard,
                     ),
                   ),
                 ),

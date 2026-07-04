@@ -104,13 +104,18 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       });
       return;
     }
+    final youtubeId = _extractYouTubeVideoId(entry.trailerUrl);
     final player = _player;
     final videoController = _videoController;
-    if (_canUseWebTrailer) {
+    if (_canUseWebTrailer && youtubeId.isEmpty) {
       await _openCurrentTrailerInWebView(entry, ticket);
       return;
     }
     if (player == null || videoController == null) {
+      if (_canUseWebTrailer) {
+        await _openCurrentTrailerInWebView(entry, ticket);
+        return;
+      }
       setState(() {
         _openedInApp = false;
         _opening = false;
@@ -161,6 +166,13 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         await player.stop();
       } catch (_) {}
       if (!mounted || ticket != _openTicket) {
+        return;
+      }
+      setState(() {
+        _status = 'Probando trailer web...';
+      });
+      if (_canUseWebTrailer) {
+        await _openCurrentTrailerInWebView(entry, ticket);
         return;
       }
       setState(() {

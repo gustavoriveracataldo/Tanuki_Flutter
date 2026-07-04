@@ -10,6 +10,8 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
+const _appVersionLabel = '0.9.0';
+
 enum _Section {
   anime,
   playlist,
@@ -678,16 +680,6 @@ class _SideRail extends StatelessWidget {
                 ),
               ),
             const Spacer(),
-            const Padding(
-              padding: EdgeInsets.only(bottom: 16),
-              child: Text(
-                'by Guzz.',
-                style: TextStyle(
-                    color: TanukiColors.subtle,
-                    fontWeight: FontWeight.w900,
-                    fontSize: 12),
-              ),
-            ),
           ],
         ),
       ),
@@ -1850,6 +1842,7 @@ class _AnimePanel extends StatelessWidget {
         (library.isEmpty ? null : library.first);
     final continueWatching = _continueWatchingEntries(controller);
     final upcoming = _upcomingCandidates(trendingCandidates);
+    final latestMovies = _latestMovieCandidates(trendingCandidates);
 
     if (selectedSeries != null) {
       return Padding(
@@ -1905,6 +1898,17 @@ class _AnimePanel extends StatelessWidget {
                     const SizedBox(height: 24),
                     _UpcomingPosterShelf(
                       candidates: upcoming,
+                      controller: controller,
+                      onCandidateSelected: onRemoteCandidateSelected,
+                      onCandidateFocused: onPreviewRemoteCandidate,
+                    ),
+                  ],
+                  if (latestMovies.isNotEmpty) ...[
+                    const SizedBox(height: 24),
+                    _UpcomingPosterShelf(
+                      title: 'Ultimas peliculas',
+                      trailing: '${latestMovies.length} peliculas',
+                      candidates: latestMovies,
                       controller: controller,
                       onCandidateSelected: onRemoteCandidateSelected,
                       onCandidateFocused: onPreviewRemoteCandidate,
@@ -2489,19 +2493,11 @@ class _SeriesDetailInfo extends StatelessWidget {
                   active: true,
                   onPressed: () => onOpenTrailer(series),
                 ),
-              SizedBox(
-                height: 36,
-                child: OutlinedButton(
-                  onPressed: () => onSimilarSeriesRequested(series),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    textStyle: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  child: const Text('Similares'),
-                ),
+              _DetailIconButton(
+                icon: Icons.travel_explore,
+                tooltip: 'Similares',
+                active: false,
+                onPressed: () => onSimilarSeriesRequested(series),
               ),
               _DetailIconButton(
                 icon: Icons.play_arrow,
@@ -2817,6 +2813,11 @@ class _SimilarPanel extends StatelessWidget {
   }
 }
 
+enum _DetailEpisodeAction {
+  markCompleted,
+  completeThrough,
+}
+
 class _DetailEpisodesColumn extends StatelessWidget {
   const _DetailEpisodesColumn({
     required this.controller,
@@ -2858,6 +2859,7 @@ class _DetailEpisodesColumn extends StatelessWidget {
                     series: series,
                     episode: episode,
                     onPlay: () => onPlayEpisode(episode),
+                    onOptions: () => _showEpisodeActions(context, episode),
                   ),
                 );
               },
@@ -2867,6 +2869,50 @@ class _DetailEpisodesColumn extends StatelessWidget {
       ),
     );
   }
+
+  Future<void> _showEpisodeActions(
+    BuildContext context,
+    EpisodeItem episode,
+  ) async {
+    final action = await showModalBottomSheet<_DetailEpisodeAction>(
+      context: context,
+      backgroundColor: TanukiColors.panelSolid,
+      showDragHandle: true,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.check_circle_outline),
+                title: const Text('Marcar capitulo como completado'),
+                onTap: () => Navigator.of(context)
+                    .pop(_DetailEpisodeAction.markCompleted),
+              ),
+              ListTile(
+                leading: const Icon(Icons.done_all),
+                title: const Text('Completar capitulos hasta este'),
+                onTap: () => Navigator.of(context)
+                    .pop(_DetailEpisodeAction.completeThrough),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+    if (action == null || !context.mounted) {
+      return;
+    }
+    switch (action) {
+      case _DetailEpisodeAction.markCompleted:
+        await controller.markEpisodePlayed(episode);
+        break;
+      case _DetailEpisodeAction.completeThrough:
+        await controller.markSeriesPlayedThrough(series, episode);
+        break;
+    }
+  }
 }
 
 class _DetailEpisodeRow extends StatelessWidget {
@@ -2875,12 +2921,14 @@ class _DetailEpisodeRow extends StatelessWidget {
     required this.series,
     required this.episode,
     required this.onPlay,
+    required this.onOptions,
   });
 
   final AppController controller;
   final SeriesItem series;
   final EpisodeItem episode;
   final VoidCallback onPlay;
+  final VoidCallback onOptions;
 
   @override
   Widget build(BuildContext context) {
@@ -2893,6 +2941,7 @@ class _DetailEpisodeRow extends StatelessWidget {
         : episode.relativePath;
     return _FocusableEpisodeSurface(
       onTap: onPlay,
+      onLongPress: onOptions,
       child: Padding(
         padding: const EdgeInsets.all(8),
         child: Row(
@@ -3105,13 +3154,13 @@ class _DetailSpaceButton extends StatelessWidget {
       message: _spaceStatusTooltip(normalized),
       child: IconButton(
         onPressed: () => _showSpaceDialog(context),
-        icon: const Icon(Icons.assignment_ind),
+        icon: Icon(_spaceStatusIcon(normalized)),
         style: IconButton.styleFrom(
           fixedSize: const Size(42, 42),
           backgroundColor: colors.background,
           foregroundColor: colors.foreground,
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(21)),
         ),
       ),
     );
@@ -3182,6 +3231,16 @@ class _DetailSpaceButton extends StatelessWidget {
       'abandoned' => 'Mi espacio: Abandonada',
       'completed' => 'Mi espacio: Completada',
       _ => 'Mi espacio',
+    };
+  }
+
+  IconData _spaceStatusIcon(String status) {
+    return switch (status) {
+      'want_to_watch' => Icons.bookmark_add,
+      'watching' => Icons.visibility,
+      'abandoned' => Icons.visibility_off,
+      'completed' => Icons.check_circle,
+      _ => Icons.assignment_ind,
     };
   }
 
@@ -3382,12 +3441,16 @@ class _RemotePosterCard extends StatelessWidget {
 
 class _UpcomingPosterShelf extends StatelessWidget {
   const _UpcomingPosterShelf({
+    this.title = 'Proximos estrenos',
+    this.trailing,
     required this.candidates,
     required this.controller,
     required this.onCandidateSelected,
     required this.onCandidateFocused,
   });
 
+  final String title;
+  final String? trailing;
   final List<RemoteSearchCandidate> candidates;
   final AppController controller;
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
@@ -3404,8 +3467,8 @@ class _UpcomingPosterShelf extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SectionHeader(
-          title: 'Proximos estrenos',
-          trailing: '${candidates.length} fechas',
+          title: title,
+          trailing: trailing ?? '${candidates.length} fechas',
         ),
         const SizedBox(height: 4),
         SizedBox(
@@ -3809,9 +3872,12 @@ class _PlaylistPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final entries = controller.buildNextEntries(limit: 12);
-    final selected = controller.library.where(controller.isSelected).toList();
+    final selected =
+        _dedupeSeriesForDisplay(controller.library.where(controller.isSelected));
     final current =
         controller.currentEntry ?? (entries.isEmpty ? null : entries.first);
+    final playlistOrder =
+        PlaylistPlaybackOrder.normalize(controller.activePlaylist.playbackOrder);
     return Padding(
       padding: const EdgeInsets.only(left: 20, bottom: 16),
       child: Column(
@@ -3835,7 +3901,10 @@ class _PlaylistPanel extends StatelessWidget {
                 ),
           ),
           const SizedBox(height: 14),
-          Row(
+          Wrap(
+            spacing: 10,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               IconButton(
                 onPressed:
@@ -3851,16 +3920,28 @@ class _PlaylistPanel extends StatelessWidget {
                 ),
                 tooltip: 'Reproducir actual',
               ),
-              const SizedBox(width: 10),
               FilledButton(
                 onPressed:
                     entries.isEmpty ? null : () => onPlayEpisode(entries.first),
                 child: const Text('Reproducir siguiente'),
               ),
-              const SizedBox(width: 10),
               OutlinedButton(
                 onPressed: () {},
                 child: const Text('Listas'),
+              ),
+              _PlaylistOrderChip(
+                label: 'TV',
+                selected: playlistOrder == PlaylistPlaybackOrder.tv,
+                onPressed: () => controller.setActivePlaylistPlaybackOrder(
+                  PlaylistPlaybackOrder.tv,
+                ),
+              ),
+              _PlaylistOrderChip(
+                label: 'Por serie',
+                selected: playlistOrder == PlaylistPlaybackOrder.series,
+                onPressed: () => controller.setActivePlaylistPlaybackOrder(
+                  PlaylistPlaybackOrder.series,
+                ),
               ),
             ],
           ),
@@ -3925,6 +4006,37 @@ class _PlaylistPanel extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _PlaylistOrderChip extends StatelessWidget {
+  const _PlaylistOrderChip({
+    required this.label,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 40,
+      child: OutlinedButton(
+        onPressed: selected ? null : onPressed,
+        style: OutlinedButton.styleFrom(
+          backgroundColor: selected ? TanukiColors.orange : null,
+          foregroundColor: selected ? Colors.black : TanukiColors.text,
+          disabledBackgroundColor: TanukiColors.orange,
+          disabledForegroundColor: Colors.black,
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w900),
+        ),
+        child: Text(label),
       ),
     );
   }
@@ -4573,6 +4685,10 @@ class _SettingsPanel extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Ajustes', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 10),
+            const _SettingsStatusText(
+              'Tanuki Flutter v$_appVersionLabel\nby Guzz.',
+            ),
             const _SettingsSectionTitle('Tarjetas Luego y Mas tarde'),
             _SettingsCheckBox(
               value: controller.state.showSeriesUpcomingCards,
@@ -5067,6 +5183,39 @@ List<String> _spaceSeriesIdentityKeys(SeriesItem series) {
   return [series.stableKey];
 }
 
+List<SeriesItem> _dedupeSeriesForDisplay(Iterable<SeriesItem> seriesItems) {
+  final byIdentity = <String, SeriesItem>{};
+  for (final series in seriesItems) {
+    final identities = _spaceSeriesIdentityKeys(series);
+    if (identities.isEmpty) {
+      continue;
+    }
+    final identity = identities.firstWhere(
+      byIdentity.containsKey,
+      orElse: () => identities.first,
+    );
+    final current = byIdentity[identity];
+    if (current == null ||
+        _spaceSeriesCompletenessScore(series) >
+            _spaceSeriesCompletenessScore(current)) {
+      if (current != null) {
+        for (final key in byIdentity.entries
+            .where((entry) => identical(entry.value, current))
+            .map((entry) => entry.key)
+            .toList(growable: false)) {
+          byIdentity[key] = series;
+        }
+      }
+      for (final key in identities) {
+        byIdentity[key] = series;
+      }
+    }
+  }
+  return byIdentity.values.toSet().toList()
+    ..sort((a, b) =>
+        _seriesTitleDedupeKey(a.name).compareTo(_seriesTitleDedupeKey(b.name)));
+}
+
 int _spaceSeriesCompletenessScore(SeriesItem series) {
   var score = series.episodeCount;
   if (series.imageUrl.isNotEmpty) {
@@ -5157,6 +5306,48 @@ List<RemoteSearchCandidate> _upcomingCandidates(
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
   return upcoming.take(10).toList(growable: false);
+}
+
+List<RemoteSearchCandidate> _latestMovieCandidates(
+  Iterable<RemoteSearchCandidate> candidates,
+) {
+  final byTitle = <String, RemoteSearchCandidate>{};
+  for (final candidate in candidates) {
+    if (!_candidateLooksMovieForHome(candidate)) {
+      continue;
+    }
+    final key = _seriesTitleDedupeKey(candidate.title);
+    if (key.isEmpty) {
+      continue;
+    }
+    final current = byTitle[key];
+    if (current == null ||
+        candidate.releaseYear > current.releaseYear ||
+        (candidate.releaseYear == current.releaseYear &&
+            candidate.episodeCount > current.episodeCount)) {
+      byTitle[key] = candidate;
+    }
+  }
+  final movies = byTitle.values.toList(growable: false);
+  movies.sort((left, right) {
+    final yearCompare = right.releaseYear.compareTo(left.releaseYear);
+    if (yearCompare != 0) {
+      return yearCompare;
+    }
+    return left.title.toLowerCase().compareTo(right.title.toLowerCase());
+  });
+  return movies.take(10).toList(growable: false);
+}
+
+bool _candidateLooksMovieForHome(RemoteSearchCandidate candidate) {
+  final text = normalizeSeriesKey([
+    candidate.format,
+    candidate.title,
+    candidate.watchUrl,
+  ].join(' '));
+  return text.contains('movie') ||
+      text.contains('pelicula') ||
+      candidate.watchUrl.toLowerCase().contains('/pelicula/');
 }
 
 DateTime? _candidateAirDate(RemoteSearchCandidate candidate) {
@@ -5713,10 +5904,12 @@ class _FocusableEpisodeSurface extends StatefulWidget {
   const _FocusableEpisodeSurface({
     required this.child,
     required this.onTap,
+    required this.onLongPress,
   });
 
   final Widget child;
   final VoidCallback onTap;
+  final VoidCallback onLongPress;
 
   @override
   State<_FocusableEpisodeSurface> createState() =>
@@ -5742,6 +5935,7 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: widget.onTap,
+          onLongPress: widget.onLongPress,
           onFocusChange: (value) {
             if (_focused != value) {
               setState(() => _focused = value);

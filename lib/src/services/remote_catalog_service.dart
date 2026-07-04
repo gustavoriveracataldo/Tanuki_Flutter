@@ -1959,13 +1959,20 @@ class RemoteCatalogService {
     final tmdbPosterAssetUrl =
         _pickTmdbImageAsset(images, 'posters', preferJapanese: true);
     final tmdbBackdropAssetUrl = _pickTmdbImageAsset(images, 'backdrops');
+    final explicitSeasonNumber = mediaType == 'tv'
+        ? _explicitSeasonNumberForCandidate(candidate)
+        : 0;
     final seasonNumber = mediaType == 'tv'
         ? _pickBestTmdbSeasonNumber(
             details,
             releaseYear: candidate.releaseYear,
             expectedEpisodeCount: candidate.episodeCount,
+            explicitSeasonNumber: explicitSeasonNumber,
           )
         : 0;
+    final seasonPosterUrl = mediaType == 'tv' && seasonNumber > 0
+        ? await _fetchTmdbSeasonPosterUrl(match.id, details, seasonNumber)
+        : '';
     final fanartVisuals = mediaType == 'movie'
         ? await _fetchFanartMovieVisuals(match.id)
         : await _fetchFanartSeriesVisuals(
@@ -1978,6 +1985,7 @@ class RemoteCatalogService {
             details,
             primarySeasonNumber: seasonNumber,
             expectedEpisodeCount: candidate.episodeCount,
+            explicitSeasonOnly: explicitSeasonNumber > 0,
           )
         : _buildTmdbMovieEpisodeMetadata(
             details,
@@ -1999,6 +2007,7 @@ class RemoteCatalogService {
         fanartVisuals?.logoUrl ?? '',
       ]),
       imageUrl: _firstNonEmpty([
+        seasonPosterUrl,
         tmdbPosterAssetUrl,
         fanartVisuals?.imageUrl ?? '',
         detailsPosterUrl,
@@ -2018,6 +2027,65 @@ class RemoteCatalogService {
           : _buildTmdbSeriesCast(details),
       episodes: episodes,
     );
+  }
+
+  int _explicitSeasonNumberForCandidate(RemoteSearchCandidate candidate) {
+    final text = _normalizeMatchText([
+      candidate.title,
+      candidate.japaneseTitle,
+      ...candidate.aliases,
+      candidate.format,
+      candidate.watchUrl,
+      candidate.seriesUrl,
+    ].join(' '));
+    final patterns = [
+      RegExp(r'(?:season|temporada|temp)\s*([0-9]{1,2})'),
+      RegExp(r'\b([0-9]{1,2})(?:st|nd|rd|th)\s+season\b'),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      final value = match == null ? 0 : int.tryParse(match.group(1) ?? '') ?? 0;
+      if (value > 1 && value <= 30) {
+        return value;
+      }
+    }
+    return 0;
+  }
+
+  Future<String> _fetchTmdbSeasonPosterUrl(
+    int seriesId,
+    Map<String, dynamic> details,
+    int seasonNumber,
+  ) async {
+    if (seriesId > 0 && seasonNumber > 0) {
+      final images = await _fetchTmdbJsonObject(
+        '/3/tv/$seriesId/season/$seasonNumber/images',
+        params: {'include_image_language': 'ja,es,en,null'},
+      );
+      final posterUrl = _pickTmdbImageAsset(
+        images ?? const <String, dynamic>{},
+        'posters',
+        preferJapanese: true,
+      );
+      if (posterUrl.isNotEmpty) {
+        return posterUrl;
+      }
+    }
+    final seasons = details['seasons'];
+    if (seasons is! List || seasonNumber <= 0) {
+      return '';
+    }
+    for (final rawSeason in seasons) {
+      if (rawSeason is! Map) {
+        continue;
+      }
+      final season = Map<String, dynamic>.from(rawSeason);
+      if (_readInt(season['season_number']) != seasonNumber) {
+        continue;
+      }
+      return _tmdbImageUrl(_readString(season['poster_path']), 'w500');
+    }
+    return '';
   }
 
   Future<_TmdbMatch?> _findBestTmdbMatch(
@@ -2644,10 +2712,23 @@ class RemoteCatalogService {
     Map<String, dynamic> details, {
     required int releaseYear,
     required int expectedEpisodeCount,
+    int explicitSeasonNumber = 0,
   }) {
     final seasons = details['seasons'];
     if (seasons is! List || seasons.isEmpty) {
       return 1;
+    }
+    if (explicitSeasonNumber > 0) {
+      for (final rawSeason in seasons) {
+        if (rawSeason is! Map) {
+          continue;
+        }
+        final number =
+            _readInt(Map<String, dynamic>.from(rawSeason)['season_number']);
+        if (number == explicitSeasonNumber) {
+          return explicitSeasonNumber;
+        }
+      }
     }
     var bestSeason = 0;
     var bestScore = -100000;
@@ -2693,9 +2774,13 @@ class RemoteCatalogService {
     Map<String, dynamic> details, {
     required int primarySeasonNumber,
     required int expectedEpisodeCount,
+    bool explicitSeasonOnly = false,
   }) async {
     final primary =
         await _fetchTmdbSeasonEpisodes(seriesId, primarySeasonNumber);
+    if (explicitSeasonOnly) {
+      return primary;
+    }
     final targetCount = expectedEpisodeCount > 0 ? expectedEpisodeCount : 0;
     if (targetCount <= 0 || primary.length >= targetCount) {
       return primary;
