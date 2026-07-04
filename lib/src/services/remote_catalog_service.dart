@@ -1795,7 +1795,8 @@ class RemoteCatalogService {
     final backdropPath = _readString(details['backdrop_path']);
     final detailsPosterUrl = _tmdbImageUrl(posterPath, 'w500');
     final detailsBackdropUrl = _tmdbImageUrl(backdropPath, 'w1280');
-    final tmdbPosterAssetUrl = _pickTmdbImageAsset(images, 'posters');
+    final tmdbPosterAssetUrl =
+        _pickTmdbImageAsset(images, 'posters', preferJapanese: true);
     final tmdbBackdropAssetUrl = _pickTmdbImageAsset(images, 'backdrops');
     final seasonNumber = mediaType == 'tv'
         ? _pickBestTmdbSeasonNumber(
@@ -1811,7 +1812,12 @@ class RemoteCatalogService {
             seasonNumber: seasonNumber,
           );
     final episodes = mediaType == 'tv' && seasonNumber > 0
-        ? await _fetchTmdbSeasonEpisodes(match.id, seasonNumber)
+        ? await _fetchTmdbSeriesEpisodes(
+            match.id,
+            details,
+            primarySeasonNumber: seasonNumber,
+            expectedEpisodeCount: candidate.episodeCount,
+          )
         : _buildTmdbMovieEpisodeMetadata(
             details,
             imageUrl: _firstNonEmpty([detailsBackdropUrl, detailsPosterUrl]),
@@ -1832,8 +1838,8 @@ class RemoteCatalogService {
         fanartVisuals?.logoUrl ?? '',
       ]),
       imageUrl: _firstNonEmpty([
-        fanartVisuals?.imageUrl ?? '',
         tmdbPosterAssetUrl,
+        fanartVisuals?.imageUrl ?? '',
         detailsPosterUrl,
         match.imageUrl,
       ]),
@@ -2237,13 +2243,16 @@ class RemoteCatalogService {
     return '';
   }
 
-  String _pickTmdbImageAsset(Map<String, dynamic> images, String key) {
+  String _pickTmdbImageAsset(
+    Map<String, dynamic> images,
+    String key, {
+    bool preferJapanese = false,
+  }) {
     final assets = images[key];
     if (assets is! List) {
       return '';
     }
-    var bestUrl = '';
-    var bestScore = -100000;
+    final candidates = <({String language, String url, int score})>[];
     for (final rawAsset in assets) {
       if (rawAsset is! Map) {
         continue;
@@ -2257,13 +2266,44 @@ class RemoteCatalogService {
       final voteCount = _readInt(asset['vote_count']);
       final width = _readInt(asset['width']);
       final height = _readInt(asset['height']);
+      final language = _readString(asset['iso_639_1']).toLowerCase();
       final score = voteAverage + voteCount * 3 + width ~/ 25 + height ~/ 40;
-      if (score > bestScore) {
-        bestScore = score;
-        bestUrl = _tmdbImageUrl(filePath, 'original');
-      }
+      candidates.add((
+        language: language,
+        url: _tmdbImageUrl(filePath, 'original'),
+        score: score,
+      ));
     }
-    return bestUrl;
+    if (candidates.isEmpty) {
+      return '';
+    }
+    if (!preferJapanese) {
+      candidates.sort((left, right) => right.score.compareTo(left.score));
+      return candidates.first.url;
+    }
+    const languagePriority = [
+      {'ja', 'ja-jp', 'jp'},
+      {'es', 'es-mx'},
+      {'en'},
+      {'', 'null', 'xx', '00'},
+      <String>{},
+    ];
+    for (final accepted in languagePriority) {
+      final group = candidates.where((candidate) {
+        if (accepted.isEmpty) {
+          return !languagePriority
+              .take(languagePriority.length - 1)
+              .any((group) => group.contains(candidate.language));
+        }
+        return accepted.contains(candidate.language);
+      }).toList();
+      if (group.isEmpty) {
+        continue;
+      }
+      group.sort((left, right) => right.score.compareTo(left.score));
+      return group.first.url;
+    }
+    return '';
   }
 
   int _languageScore(String language, {required bool preferJapanese}) {
@@ -2485,6 +2525,73 @@ class RemoteCatalogService {
       }
     }
     return bestSeason > 0 ? bestSeason : 1;
+  }
+
+  Future<List<SeriesEpisodeMetadata>> _fetchTmdbSeriesEpisodes(
+    int seriesId,
+    Map<String, dynamic> details, {
+    required int primarySeasonNumber,
+    required int expectedEpisodeCount,
+  }) async {
+    final primary =
+        await _fetchTmdbSeasonEpisodes(seriesId, primarySeasonNumber);
+    final targetCount = expectedEpisodeCount > 0 ? expectedEpisodeCount : 0;
+    if (targetCount <= 0 || primary.length >= targetCount) {
+      return primary;
+    }
+    final seasons = details['seasons'];
+    if (seasons is! List) {
+      return primary;
+    }
+    final seasonNumbers = <int>[];
+    for (final rawSeason in seasons) {
+      if (rawSeason is! Map) {
+        continue;
+      }
+      final number =
+          _readInt(Map<String, dynamic>.from(rawSeason)['season_number']);
+      if (number > 0) {
+        seasonNumbers.add(number);
+      }
+    }
+    seasonNumbers.sort();
+    if (seasonNumbers.length <= 1) {
+      return primary;
+    }
+    final collected = <SeriesEpisodeMetadata>[];
+    for (final seasonNumber in seasonNumbers) {
+      final seasonEpisodes = seasonNumber == primarySeasonNumber
+          ? primary
+          : await _fetchTmdbSeasonEpisodes(seriesId, seasonNumber);
+      if (seasonEpisodes.isEmpty) {
+        continue;
+      }
+      final offset = collected.length;
+      for (final episode in seasonEpisodes) {
+        collected.add(_renumberTmdbEpisodeMetadata(
+          episode,
+          offset + episode.episodeNumber,
+        ));
+      }
+      if (targetCount > 0 && collected.length >= targetCount) {
+        break;
+      }
+    }
+    return collected.length > primary.length ? collected : primary;
+  }
+
+  SeriesEpisodeMetadata _renumberTmdbEpisodeMetadata(
+    SeriesEpisodeMetadata episode,
+    int episodeNumber,
+  ) {
+    return SeriesEpisodeMetadata(
+      episodeNumber: episodeNumber,
+      title: episode.title,
+      description: episode.description,
+      imageUrl: episode.imageUrl,
+      durationLabel: episode.durationLabel,
+      airDateIso: episode.airDateIso,
+    );
   }
 
   Future<List<SeriesEpisodeMetadata>> _fetchTmdbSeasonEpisodes(

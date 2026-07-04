@@ -2030,7 +2030,7 @@ class _HeroBlock extends StatelessWidget {
                     const SizedBox(height: 10),
                     if (series?.logoUrl.isNotEmpty == true)
                       SizedBox(
-                        height: 58,
+                        height: 76,
                         child: Image.network(
                           series!.logoUrl,
                           fit: BoxFit.contain,
@@ -2043,7 +2043,7 @@ class _HeroBlock extends StatelessWidget {
                       Image.asset(
                         'assets/images/tanuki_brand_logo.png',
                         width: 250,
-                        height: 58,
+                        height: 66,
                         fit: BoxFit.contain,
                       )
                     else
@@ -2162,14 +2162,17 @@ class _HeroTitleFallback extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 58,
+      height: 82,
       child: Align(
         alignment: Alignment.centerLeft,
         child: Text(
           title,
-          maxLines: 2,
+          maxLines: 3,
           overflow: TextOverflow.ellipsis,
-          style: Theme.of(context).textTheme.headlineLarge,
+          style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+                fontSize: 34,
+                height: 1.04,
+              ),
         ),
       ),
     );
@@ -2324,64 +2327,11 @@ class _SeriesDetailInfo extends StatelessWidget {
         .map((entry) => entry.trim())
         .where((entry) => entry.isNotEmpty)
         .toList();
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(0, 4, 0, 20),
-      child: Column(
+    final posterUrl = series.imageUrl.trim();
+    Widget buildInfoColumn({required bool wide}) {
+      return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: onBack,
-              icon: const Icon(Icons.arrow_back),
-              label: const Text('Biblioteca'),
-            ),
-          ),
-          const SizedBox(height: 6),
-          if (hasLogo) ...[
-            SizedBox(
-              height: 76,
-              child: Image.network(
-                series.logoUrl,
-                fit: BoxFit.contain,
-                alignment: Alignment.centerLeft,
-                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              series.name,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: TanukiColors.text,
-                fontSize: 18,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ] else ...[
-            const SizedBox(height: 20),
-            Text(
-              series.name,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.headlineLarge,
-            ),
-          ],
-          if (series.imageUrl.trim().isNotEmpty) ...[
-            const SizedBox(height: 14),
-            SizedBox(
-              width: 138,
-              child: AspectRatio(
-                aspectRatio: 2 / 3,
-                child: _Poster(
-                  imageUrl: series.imageUrl,
-                  title: series.name,
-                ),
-              ),
-            ),
-          ],
-          const SizedBox(height: 10),
           Text(
             meta,
             maxLines: 2,
@@ -2395,7 +2345,7 @@ class _SeriesDetailInfo extends StatelessWidget {
           const SizedBox(height: 12),
           Text(
             description,
-            maxLines: 5,
+            maxLines: wide ? 9 : 5,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: Color(0xFFE7EEF6),
@@ -2459,6 +2409,95 @@ class _SeriesDetailInfo extends StatelessWidget {
                     : () => onPlayEpisode(nextEpisode!),
               ),
             ],
+          ),
+        ],
+      );
+    }
+
+    Widget buildPoster(double width) {
+      return SizedBox(
+        width: width,
+        child: AspectRatio(
+          aspectRatio: 2 / 3,
+          child: _Poster(
+            imageUrl: posterUrl,
+            title: series.name,
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 4, 0, 20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: onBack,
+              icon: const Icon(Icons.arrow_back),
+              label: const Text('Biblioteca'),
+            ),
+          ),
+          const SizedBox(height: 6),
+          if (hasLogo) ...[
+            SizedBox(
+              height: 76,
+              child: Image.network(
+                series.logoUrl,
+                fit: BoxFit.contain,
+                alignment: Alignment.centerLeft,
+                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              series.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: TanukiColors.text,
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ] else ...[
+            const SizedBox(height: 20),
+            Text(
+              series.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.headlineLarge,
+            ),
+          ],
+          const SizedBox(height: 18),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final horizontal =
+                  posterUrl.isNotEmpty && constraints.maxWidth >= 680;
+              if (!horizontal) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (posterUrl.isNotEmpty) ...[
+                      buildPoster(166),
+                      const SizedBox(height: 16),
+                    ],
+                    buildInfoColumn(wide: false),
+                  ],
+                );
+              }
+              final posterWidth = constraints.maxWidth >= 1100 ? 250.0 : 210.0;
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  buildPoster(posterWidth),
+                  const SizedBox(width: 24),
+                  Expanded(child: buildInfoColumn(wide: true)),
+                ],
+              );
+            },
           ),
           if (cast.isNotEmpty) ...[
             const SizedBox(height: 28),
@@ -5511,13 +5550,17 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
             }
             if (value) {
               widget.onFocused?.call();
-              Scrollable.ensureVisible(
-                context,
-                duration: const Duration(milliseconds: 180),
-                curve: Curves.easeOutCubic,
-                alignment: 0.78,
-                alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
-              );
+              final scrollable = Scrollable.maybeOf(context);
+              final renderObject = context.findRenderObject();
+              if (scrollable != null && renderObject != null) {
+                scrollable.position.ensureVisible(
+                  renderObject,
+                  duration: const Duration(milliseconds: 160),
+                  curve: Curves.easeOutCubic,
+                  alignment: 0.54,
+                  alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
+                );
+              }
             }
           },
           onHover: (value) {

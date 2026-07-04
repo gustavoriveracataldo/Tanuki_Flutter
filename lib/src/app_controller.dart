@@ -2073,7 +2073,7 @@ class AppController extends ChangeNotifier {
       watchUrl: candidate.watchUrl,
       seriesUrl: candidate.seriesUrl,
       imageUrl:
-          candidate.imageUrl.isNotEmpty ? candidate.imageUrl : cached.imageUrl,
+          cached.imageUrl.isNotEmpty ? cached.imageUrl : candidate.imageUrl,
       backgroundUrl: cached.backgroundUrl.isNotEmpty
           ? cached.backgroundUrl
           : candidate.backgroundUrl,
@@ -2107,6 +2107,11 @@ class AppController extends ChangeNotifier {
         candidate.title.trim().isEmpty) {
       return false;
     }
+    final cacheKey = _visualCacheKeyForCandidate(candidate);
+    if (candidate.releaseYear > 0 &&
+        !_state.visualCache.containsKey(cacheKey)) {
+      return true;
+    }
     return candidate.logoUrl.isEmpty ||
         candidate.backgroundUrl.isEmpty ||
         candidate.backgroundUrl == candidate.imageUrl;
@@ -2128,7 +2133,7 @@ class AppController extends ChangeNotifier {
   }
 
   String _visualCacheKeyForCandidate(RemoteSearchCandidate candidate) {
-    const cachePrefix = 'visual-v2';
+    const cachePrefix = 'visual-v3';
     if (candidate.catalogId > 0) {
       final yearSuffix =
           candidate.releaseYear > 0 ? ':${candidate.releaseYear}' : '';

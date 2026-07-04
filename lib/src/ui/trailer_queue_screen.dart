@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
 
 import '../services/playback_backend.dart';
 import 'toonami_theme.dart';
@@ -38,8 +39,10 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   String _error = '';
   Player? _player;
   VideoController? _videoController;
+  yt.YoutubeExplode? _youtube;
   bool _openedInApp = false;
   bool _opening = false;
+  int _openTicket = 0;
 
   TrailerQueueEntry? get _current {
     if (widget.entries.isEmpty ||
@@ -73,6 +76,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
 
   Future<void> _openCurrentTrailer() async {
     final entry = _current;
+    final ticket = ++_openTicket;
     if (entry == null) {
       setState(() {
         _status = 'No hay trailer disponible.';
@@ -108,8 +112,16 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     });
     try {
       await videoController.platform.future;
-      await player.open(Media(entry.trailerUrl), play: true);
-      if (!mounted) {
+      await player.stop();
+      if (!mounted || ticket != _openTicket) {
+        return;
+      }
+      final playableUrl = await _resolvePlayableTrailerUrl(entry.trailerUrl);
+      if (!mounted || ticket != _openTicket) {
+        return;
+      }
+      await player.open(Media(playableUrl), play: true);
+      if (!mounted || ticket != _openTicket) {
         return;
       }
       setState(() {
@@ -118,10 +130,13 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         _status = 'Trailer en app';
       });
     } catch (error) {
+      if (!mounted || ticket != _openTicket) {
+        return;
+      }
       try {
         await player.stop();
       } catch (_) {}
-      if (!mounted) {
+      if (!mounted || ticket != _openTicket) {
         return;
       }
       setState(() {
@@ -131,6 +146,39 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         _error = error.toString();
       });
     }
+  }
+
+  Future<String> _resolvePlayableTrailerUrl(String trailerUrl) async {
+    final videoId = yt.VideoId.parseVideoId(trailerUrl);
+    if (videoId == null) {
+      return trailerUrl;
+    }
+    if (mounted) {
+      setState(() {
+        _status = 'Resolviendo trailer de YouTube...';
+      });
+    }
+    final youtube = _youtube ??= yt.YoutubeExplode();
+    final manifest = await youtube.videos.streams.getManifest(
+      videoId,
+      ytClients: [yt.YoutubeApiClient.androidSdkless, yt.YoutubeApiClient.ios],
+    );
+    final hlsMuxed = manifest.hls.whereType<yt.HlsMuxedStreamInfo>().toList()
+      ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
+    if (hlsMuxed.isNotEmpty) {
+      return hlsMuxed.first.url.toString();
+    }
+    if (manifest.muxed.isNotEmpty) {
+      final muxed = manifest.muxed.toList()
+        ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
+      return muxed.first.url.toString();
+    }
+    if (manifest.hls.isNotEmpty) {
+      final hls = manifest.hls.toList()
+        ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
+      return hls.first.url.toString();
+    }
+    throw StateError('YouTube no entrego un stream reproducible.');
   }
 
   void _move(int delta) {
@@ -163,12 +211,16 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
 
   @override
   void dispose() {
+    _openTicket += 1;
     final player = _player;
+    final youtube = _youtube;
     _player = null;
     _videoController = null;
+    _youtube = null;
     if (player != null) {
       unawaited(player.dispose());
     }
+    youtube?.close();
     super.dispose();
   }
 

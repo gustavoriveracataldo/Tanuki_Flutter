@@ -21,10 +21,10 @@ El port Flutter replica la estructura visual principal y los flujos de uso que n
 - Inicio sin seccion `Biblioteca` en el panel principal y con `Tendencias` congeladas para que no cambien al buscar en el panel `Buscar`.
 - Rail lateral sobre el contenido en escritorio para que las tarjetas no lo tapen; en portrait/celular cambia a barra inferior y el avatar se redujo.
 - Inicio con hero fijo en capa superior; las filas pasan por debajo con fade gradual para que las tarjetas no tapen el hero. Las tarjetas remotas ya no muestran el icono visual de trailer.
-- Detalle de serie con dos columnas como Android: informacion/acciones a la izquierda, logo o titulo alternativo como la app nativa, panel glass de episodios a la derecha y feedback TV de foco en filas de episodio.
+- Detalle de serie con composicion mas cercana a Android: logo o titulo alternativo arriba, caratula grande de la serie a la izquierda, informacion/acciones a la derecha, panel glass de episodios a la derecha y feedback TV de foco en filas de episodio.
 - Detalle refresca visuales faltantes de series remotas ya importadas al abrir la ficha: logo, fondo, poster y miniaturas de episodio se reintentan con el mismo flujo TMDB/Fanart del importador, sin duplicar la serie.
 - Panel `Similares` desde el detalle, con titulo/estado y grilla de resultados remotos usando recomendaciones Jikan o busqueda fallback.
-- Trailers desde detalle, tendencias y busqueda: `trailerUrl` de Jikan se conserva en candidatos/series importadas y se abre una cola Flutter multiplataforma con controles anterior/siguiente; ahora intenta reproducir primero dentro de la app con `media_kit` y deja `Abrir externo` solo como fallback manual.
+- Trailers desde detalle, tendencias y busqueda: `trailerUrl` de Jikan/TMDB se conserva en candidatos/series importadas y se abre una cola Flutter multiplataforma con controles anterior/siguiente; URLs YouTube se resuelven a streams reproducibles con `youtube_explode_dart` antes de abrir `media_kit`, y `Abrir externo` queda solo como fallback manual.
 - Biblioteca local por carpetas con escaneo recursivo de videos.
 - Catalogo remoto via Jikan con poster, descripcion, ano, fecha de estreno, formato, rating y cantidad de episodios.
 - Busqueda AnimeAV1 por `catalogo?search=...`.
@@ -52,7 +52,8 @@ El port Flutter replica la estructura visual principal y los flujos de uso que n
 - Enriquecimiento de fichas de catalogo con Jikan para cast y metadata basica por episodio, y enriquecimiento opcional con TMDB/Fanart usando claves por `--dart-define` para poster, fondo, logo, descripcion, rating, trailer y metadata visual.
 - Selector de arte TMDB alineado con Android antiguo: logos en `original`, posters/fondos desde `/images` por votos/tamano cuando existen, Fanart por temporada y fallback a poster/backdrop del detalle.
 - Selector de arte TMDB/Fanart sensible al ano como Android antiguo: cuando el candidato trae ano, la busqueda prueba parametros de ano de TV/pelicula, descarta matches con diferencia mayor a 2 anos y cachea visuales con clave titulo/catalogo+ano para no mezclar series antiguas con remakes.
-- Override TMDB para falsos positivos de remakes confirmados: Saint Seiya clasico/Caballeros del Zodiaco con ano 1985-1990 fuerza `tv/42444` en lugar de `tv/90855`; los logos TMDB ahora priorizan idioma japones por grupo antes de votos/tamano. La cache visual paso a prefijo `visual-v2` para no reutilizar arte resuelto antes de este ajuste.
+- Override TMDB para falsos positivos de remakes confirmados: Saint Seiya clasico/Caballeros del Zodiaco con ano 1985-1990 fuerza `tv/42444` en lugar de `tv/90855`; logos y posters TMDB priorizan idioma japones por grupo antes de votos/tamano. La cache visual paso a prefijo `visual-v3` para no reutilizar arte resuelto antes de este ajuste.
+- Metadata visual de episodios TMDB para series largas: si la temporada elegida trae menos episodios que la serie importada, se juntan temporadas en orden y se renumeran a episodio 1, 2, 3... para evitar quedarse solo con 25 miniaturas cuando TMDB separa una serie en temporadas.
 - Persistencia JSON multiplataforma en application support.
 - Player Android/Windows con `media_kit` para archivos locales, URLs directas y AnimeAV1 HLS resuelto. Si el resolver remoto no encuentra una URL directa en un proveedor activo, marca esa fuente como fallida y prueba otra fuente automatica antes de dejar el estado como `Resolver remoto pendiente`; catalogo y fuentes fuera de alcance quedan pendientes sin abrir paginas no reproducibles. No abre paginas HTML remotas con `media_kit`, porque esos casos en Android dependian de WebView oculto y probes JavaScript. Si un proveedor remoto directo falla antes de iniciar, reintenta el mismo episodio con otra fuente automatica sin cambiar la preferencia persistida; si la fuente ya avanzo o entrego frame de video, se mantiene en esa fuente y no salta a otro proveedor. Para trailers, la app intenta reproducir en pantalla propia antes de ofrecer fallback externo.
 - Player con overlays propios auto-ocultables por inactividad, barra de progreso de `media_kit_video` en naranja Tanuki, panel de configuracion sin seccion redundante `Vista`, reanudacion con aliases expandidos por episodio equivalente y apertura con `Media.start` para AnimeAV1/Zilla cuando hay posicion guardada.
@@ -62,7 +63,7 @@ El port Flutter replica la estructura visual principal y los flujos de uso que n
 - Player Linux con autodeteccion de backend: usa video embebido si el build tiene `mpv`/`epoxy`, o fallback externo si no estan disponibles.
 - Build Android, Windows y Linux con carpetas nativas incluidas.
 - Empaquetado release simple en `dist/` con `scripts/build_release.sh` para Android/Linux y `scripts/build_release_windows.ps1` para Windows.
-- Versionado Flutter en `pubspec.yaml`; version actual `0.8.9+89`.
+- Versionado Flutter en `pubspec.yaml`; version actual `0.8.11+89`.
 - GitHub Actions de release: compila Android, Linux y Windows en jobs paralelos y junta APK/TAR.GZ/ZIP en un unico GitHub Release.
 - GitHub Actions valida secrets obligatorios antes del release: TMDB (`TMDB_API_KEY` o `TMDB_BEARER_TOKEN`), Fanart, MAL Client ID y SIMKL Client ID.
 - Scroll global con mouse/trackpad en desktop para filas horizontales y scrollables, usando `MaterialScrollBehavior` con `PointerDeviceKind.mouse`.
@@ -105,7 +106,7 @@ Esta lista queda como guia de trabajo. No se deben seguir agregando casos pequen
 
 - [ ] Auditar y ajustar `Inicio`: hero, rail, shelves, progreso/continuar viendo, acciones y densidad visual contra Android. Avance actual: se retiro la seccion `Biblioteca`, `Continuar viendo` deduplica por titulo normalizado, es la primera fila, admite `Ir a serie` y `Dejar de ver`, `Tendencias` ya no depende de la ultima busqueda, el hero volvio a la composicion antigua, queda fijo arriba, las tarjetas se desvanecen al pasar por debajo, el icono de trailer se retiro de tarjetas y el rail se adapta a portrait. Para TV se redujo la altura del hero, se reforzo la mascara superior para que las tarjetas no se vean por los bordes, el foco de tarjetas fuerza scroll por shelf para que se vea el titulo de la fila enfocada y el hero se actualiza con la tarjeta enfocada. Headers de filas mas compactos y sin subtitulos bajo la fila.
 - [ ] Auditar y ajustar `Buscador`: campo, filtros, resultados remotos/locales, estados vacios/carga, foco y acciones rapidas. Avance actual: resultados remotos deduplicados por serie, conteo de episodios consolidado, tarjetas sin chip visual de servidor/fuente ni icono de trailer, variantes LatAnime `latino/castellano` normalizadas/filtradas y grilla portrait a 3 columnas.
-- [ ] Auditar y ajustar `Detalle de serie`: poster/fondo/logo, acciones, metadata, lista de episodios, estado/progreso y paneles secundarios. Avance actual: las filas de episodio ya usan la imagen del episodio cuando existe y caen al poster de la serie cuando la metadata remota no trae miniatura; al abrir detalle se refrescan visuales faltantes de series remotas ya importadas. El control `Mi espacio` del detalle replica el patron Android con boton de icono y dialogo de estados, en vez de dropdown visible.
+- [ ] Auditar y ajustar `Detalle de serie`: poster/fondo/logo, acciones, metadata, lista de episodios, estado/progreso y paneles secundarios. Avance actual: las filas de episodio ya usan la imagen del episodio cuando existe y caen al poster de la serie cuando la metadata remota no trae miniatura; al abrir detalle se refrescan visuales faltantes de series remotas ya importadas. El control `Mi espacio` del detalle replica el patron Android con boton de icono y dialogo de estados, en vez de dropdown visible. La ficha ahora pone caratula grande junto a informacion/acciones y usa cache visual `visual-v3`.
 - [ ] Comparar pantalla por pantalla contra Android con capturas: rail, busqueda, detalle, episodios, playlist/player, `Mi espacio`, `Ajustes`, dialogos y overlays.
 - [ ] Revisar foco con control remoto/teclado: orden de foco, estados seleccionados, scroll, retorno/back y acciones principales. Avance actual: tarjetas de inicio llaman `ensureVisible` al recibir foco, rail lateral/barra inferior tienen borde naranja visible y el top bar del player mantiene overlay visible mientras un control tiene foco.
 - [ ] Ajustar solo diferencias visuales o de flujo que afecten el 1:1; evitar redisenos.
@@ -115,7 +116,7 @@ Esta lista queda como guia de trabajo. No se deben seguir agregando casos pequen
 - [ ] Revisar busqueda/importacion por proveedor activo: aliases, ano, formato, conteo de episodios, duplicados y fallback de catalogo.
 - [ ] Revisar que las preferencias por serie (`fuente`, `modo`, `servidor`, escala, subtitulos) se apliquen igual que Android.
 - [ ] Completar auditoria MAL/SIMKL: errores, conflictos, mappings faltantes, multiples perfiles y estados no felices.
-- [ ] Completar auditoria de metadata Jikan/TMDB/Fanart/Filler contra las vistas Android equivalentes. Avance actual: candidatos de Inicio/Buscador aplican cache visual persistente y lanzan enriquecimiento diferido TMDB/Fanart para logos/fondos como Android; en desktop tambien se leen claves desde variables de entorno si no vienen por `--dart-define`. TMDB ahora filtra visuales por ano cuando existe `releaseYear`, evitando que series antiguas como Samurai X o Saint Seiya tomen logos/fondos/episodios de remakes con el mismo nombre. Saint Seiya clasico queda cubierto con override explicito a TMDB `42444` y preferencia estricta de logo japones.
+- [ ] Completar auditoria de metadata Jikan/TMDB/Fanart/Filler contra las vistas Android equivalentes. Avance actual: candidatos de Inicio/Buscador aplican cache visual persistente y lanzan enriquecimiento diferido TMDB/Fanart para logos/fondos como Android; en desktop tambien se leen claves desde variables de entorno si no vienen por `--dart-define`. TMDB ahora filtra visuales por ano cuando existe `releaseYear`, evitando que series antiguas como Samurai X o Saint Seiya tomen logos/fondos/episodios de remakes con el mismo nombre. Saint Seiya clasico queda cubierto con override explicito a TMDB `42444`, preferencia estricta de logo/poster japones y union secuencial de temporadas TMDB cuando faltan miniaturas de episodios.
 
 ### P2 - Distribucion y verificacion final
 
@@ -125,7 +126,7 @@ Esta lista queda como guia de trabajo. No se deben seguir agregando casos pequen
 
 ## Verificacion reciente
 
-Ultima actualizacion: se actualizo el versionado de release a `0.8.9+89`.
+Ultima actualizacion: se ajusto detalle de serie, trailers embebidos, posters japoneses, miniaturas TMDB por temporadas y foco horizontal de Inicio.
 
 Verificacion puntual de cambios visuales recientes:
 
@@ -155,17 +156,23 @@ Verificacion puntual de cambios visuales recientes:
 - `dart format lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart`
 - `dart analyze lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart` (sin issues).
 - Revision estatica de `remote_catalog_service.dart` para override Saint Seiya clasico -> TMDB `42444`, rechazo de detalle TMDB con ano incompatible y selector de logo por prioridad de idioma japones.
-- Revision estatica de `app_controller.dart` para prefijo `visual-v2` en cache de candidatos.
+- Revision estatica de `app_controller.dart` para prefijo `visual-v3` en cache de candidatos.
 - `dart format lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart`
 - `dart analyze lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart` (sin issues).
-- Revision estatica de `pubspec.yaml`, `README.md` y `MIGRATION_STATUS.md` para version `0.8.9`.
+- Revision estatica de `pubspec.yaml`, `README.md` y `MIGRATION_STATUS.md` para version `0.8.11`.
 - Revision estatica de `toonami_app.dart` para drag de scroll con mouse/trackpad.
 - Revision estatica de `home_screen.dart` para poster en detalle y carga incremental de resultados.
 - Revision estatica de `app_controller.dart`/`remote_catalog_service.dart` para paginacion Jikan.
 - Revision estatica de `player_screen.dart` para recuperacion de seek remoto fuera de buffer.
 - Revision estatica de `app_controller.dart` para refresco de visuales al abrir detalle y aliases expandidos de progreso/reanudacion.
 - Revision estatica de `player_screen.dart` para auto-hide de overlays, tema naranja de controles `media_kit_video`, panel sin `Vista`, `Media.start` en AnimeAV1/Zilla y watchdog de seek grande.
-- No se pudo correr `dart format` porque `dart`/`flutter` no estan disponibles en el PATH de esta sesion.
+- Revision estatica de `home_screen.dart` para layout de detalle con caratula grande, fallback de titulo del hero y scroll horizontal del foco de tarjetas sin mover el scroll vertical.
+- Revision estatica de `trailer_queue_screen.dart` para resolver trailers YouTube a stream antes de abrir `media_kit` y bloquear aperturas superpuestas.
+- Revision estatica de `remote_catalog_service.dart` para prioridad de poster japones y union secuencial de temporadas TMDB en metadata de episodios.
+- Revision estatica de `app_controller.dart` para reemplazo de poster base por cache visual `visual-v3`.
+- `flutter pub get` para actualizar `pubspec.lock` con `youtube_explode_dart`.
+- `dart format lib/src/ui/trailer_queue_screen.dart lib/src/ui/home_screen.dart lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart`
+- `dart analyze lib/src/ui/trailer_queue_screen.dart lib/src/ui/home_screen.dart lib/src/services/remote_catalog_service.dart lib/src/app_controller.dart` detecto el conflicto de import `Video` entre `media_kit_video` y `youtube_explode_dart`; se corrigio usando alias. El reintento posterior del analyzer quedo sin salida durante varios minutos y se detuvo, sin generar builds.
 
 Verificacion puntual de cambios recientes del WebView nativo:
 
