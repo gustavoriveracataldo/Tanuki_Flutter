@@ -1299,6 +1299,26 @@ class AppController extends ChangeNotifier {
     return _applyVisualCacheToCandidates(cached);
   }
 
+  Future<List<RemoteSearchCandidate>> loadHomeMovieCandidates({
+    int pages = 2,
+  }) async {
+    final targetPages = pages.clamp(1, 4).toInt();
+    final results = <RemoteSearchCandidate>[];
+    for (var page = 1; page <= targetPages; page += 1) {
+      final pageResults = await _remoteCatalog.discoverCatalogMovies(
+        page: page,
+        limit: 25,
+      );
+      results.addAll(pageResults);
+      if (pageResults.length < 20) {
+        break;
+      }
+    }
+    return _dedupeCandidates(
+      _applyVisualCacheToCandidates(_activeRemoteCandidates(results)),
+    );
+  }
+
   Future<void> _refreshRemoteResultVisuals() async {
     final source = _remoteBaseResults;
     if (source.isEmpty) {

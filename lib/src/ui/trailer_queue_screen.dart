@@ -5,12 +5,17 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:video_player/video_player.dart' as vp;
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
 
 import '../services/playback_backend.dart';
 import 'toonami_theme.dart';
+
+const _trailerUserAgent =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 
 class TrailerQueueEntry {
   const TrailerQueueEntry({
@@ -42,11 +47,13 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   String _error = '';
   Player? _player;
   VideoController? _videoController;
+  vp.VideoPlayerController? _fallbackVideoController;
   WebViewController? _webViewController;
   yt.YoutubeExplode? _youtube;
   bool _openedInApp = false;
   bool _opening = false;
   bool _usingWebView = false;
+  bool _usingFallbackVideo = false;
   int _openTicket = 0;
 
   TrailerQueueEntry? get _current {
@@ -111,59 +118,41 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       await _openCurrentTrailerInWebView(entry, ticket);
       return;
     }
-    if (player == null || videoController == null) {
-      if (_canUseWebTrailer) {
-        await _openCurrentTrailerInWebView(entry, ticket);
-        return;
-      }
-      setState(() {
-        _openedInApp = false;
-        _opening = false;
-        _usingWebView = false;
-        _status = 'Reproductor embebido no disponible.';
-        _error = PlaybackBackend.initializationError.isNotEmpty
-            ? PlaybackBackend.initializationError
-            : 'No se pudo iniciar media_kit.';
-      });
-      return;
-    }
     setState(() {
       _openedInApp = false;
       _opening = true;
       _usingWebView = false;
+      _usingFallbackVideo = false;
       _webViewController = null;
       _error = '';
       _status = 'Cargando trailer en la app...';
     });
+    await _disposeFallbackVideoController();
     try {
-      await videoController.platform.future;
-      await player.stop();
-      if (!mounted || ticket != _openTicket) {
-        return;
-      }
       final playableUrl = await _resolvePlayableTrailerUrl(entry.trailerUrl)
           .timeout(const Duration(seconds: 16));
       if (!mounted || ticket != _openTicket) {
         return;
       }
-      await player
-          .open(Media(playableUrl), play: true)
-          .timeout(const Duration(seconds: 12));
-      if (!mounted || ticket != _openTicket) {
+      final openedWithFallback =
+          await _openWithFallbackVideoPlayer(playableUrl, ticket);
+      if (openedWithFallback || !mounted || ticket != _openTicket) {
         return;
       }
-      setState(() {
-        _openedInApp = true;
-        _opening = false;
-        _usingWebView = false;
-        _status = 'Trailer en app';
-      });
+      if (player == null || videoController == null) {
+        throw StateError(PlaybackBackend.initializationError.isNotEmpty
+            ? PlaybackBackend.initializationError
+            : 'media_kit no esta disponible.');
+      }
+      await _openWithMediaKit(player, videoController, playableUrl, ticket);
     } catch (error) {
       if (!mounted || ticket != _openTicket) {
         return;
       }
       try {
-        await player.stop();
+        if (player != null) {
+          await player.stop();
+        }
       } catch (_) {}
       if (!mounted || ticket != _openTicket) {
         return;
@@ -179,16 +168,91 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         _openedInApp = false;
         _opening = false;
         _usingWebView = false;
+        _usingFallbackVideo = false;
         _status = 'No se pudo reproducir en app.';
         _error = error.toString();
       });
     }
   }
 
+  Future<bool> _openWithFallbackVideoPlayer(
+    String playableUrl,
+    int ticket,
+  ) async {
+    vp.VideoPlayerController? controller;
+    try {
+      setState(() {
+        _status = 'Probando reproductor alternativo...';
+      });
+      controller = vp.VideoPlayerController.networkUrl(
+        Uri.parse(playableUrl),
+        httpHeaders: _trailerPlaybackHeaders(playableUrl),
+      );
+      await controller.initialize().timeout(const Duration(seconds: 14));
+      await controller.play().timeout(const Duration(seconds: 6));
+      if (!mounted || ticket != _openTicket) {
+        await controller.dispose();
+        return true;
+      }
+      setState(() {
+        _fallbackVideoController = controller;
+        _openedInApp = true;
+        _opening = false;
+        _usingFallbackVideo = true;
+        _usingWebView = false;
+        _status = 'Trailer en reproductor alternativo';
+      });
+      return true;
+    } catch (_) {
+      try {
+        await controller?.dispose();
+      } catch (_) {}
+      if (mounted && ticket == _openTicket) {
+        setState(() {
+          _status = 'Probando media_kit...';
+        });
+      }
+      return false;
+    }
+  }
+
+  Future<void> _openWithMediaKit(
+    Player player,
+    VideoController videoController,
+    String playableUrl,
+    int ticket,
+  ) async {
+    await videoController.platform.future;
+    await player.stop();
+    if (!mounted || ticket != _openTicket) {
+      return;
+    }
+    await player
+        .open(
+          Media(
+            playableUrl,
+            httpHeaders: _trailerPlaybackHeaders(playableUrl),
+          ),
+          play: true,
+        )
+        .timeout(const Duration(seconds: 12));
+    if (!mounted || ticket != _openTicket) {
+      return;
+    }
+    setState(() {
+      _openedInApp = true;
+      _opening = false;
+      _usingWebView = false;
+      _usingFallbackVideo = false;
+      _status = 'Trailer en media_kit';
+    });
+  }
+
   Future<void> _openCurrentTrailerInWebView(
     TrailerQueueEntry entry,
     int ticket,
   ) async {
+    await _disposeFallbackVideoController();
     final uri = Uri.parse(entry.trailerUrl);
     final controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -203,6 +267,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               _openedInApp = true;
               _opening = true;
               _usingWebView = true;
+              _usingFallbackVideo = false;
               _status = 'Cargando trailer web...';
             });
           },
@@ -214,6 +279,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               _openedInApp = true;
               _opening = false;
               _usingWebView = true;
+              _usingFallbackVideo = false;
               _status = 'Trailer web en app';
             });
           },
@@ -226,6 +292,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               _openedInApp = false;
               _opening = false;
               _usingWebView = false;
+              _usingFallbackVideo = false;
               _status = 'No se pudo reproducir en app.';
               _error = error.description;
             });
@@ -235,6 +302,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     final androidController = controller.platform;
     if (androidController is AndroidWebViewController) {
       await androidController.setMediaPlaybackRequiresUserGesture(false);
+      await androidController.setUserAgent(_trailerUserAgent);
     }
     if (!mounted || ticket != _openTicket) {
       return;
@@ -242,6 +310,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     setState(() {
       _webViewController = controller;
       _usingWebView = true;
+      _usingFallbackVideo = false;
       _openedInApp = true;
       _opening = true;
       _error = '';
@@ -253,7 +322,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       if (youtubeId.isNotEmpty) {
         await controller.loadHtmlString(
           _buildYouTubeEmbedHtml(youtubeId),
-          baseUrl: 'https://www.youtube-nocookie.com',
+          baseUrl: 'https://www.youtube.com',
         );
       } else if (vimeoId.isNotEmpty) {
         await controller.loadHtmlString(
@@ -290,7 +359,13 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     final youtube = _youtube ??= yt.YoutubeExplode();
     final manifest = await youtube.videos.streams.getManifest(
       videoId,
-      ytClients: [yt.YoutubeApiClient.androidSdkless, yt.YoutubeApiClient.ios],
+      ytClients: [
+        yt.YoutubeApiClient.androidSdkless,
+        yt.YoutubeApiClient.ios,
+        yt.YoutubeApiClient.safari,
+        yt.YoutubeApiClient.tv,
+        yt.YoutubeApiClient.mweb,
+      ],
     );
     final hlsMuxed = manifest.hls.whereType<yt.HlsMuxedStreamInfo>().toList()
       ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
@@ -320,6 +395,17 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     unawaited(_openCurrentTrailer());
   }
 
+  Future<void> _disposeFallbackVideoController() async {
+    final controller = _fallbackVideoController;
+    _fallbackVideoController = null;
+    _usingFallbackVideo = false;
+    if (controller != null) {
+      try {
+        await controller.dispose();
+      } catch (_) {}
+    }
+  }
+
   Future<void> _openExternalTrailer() async {
     final entry = _current;
     final uri = entry == null ? null : Uri.tryParse(entry.trailerUrl);
@@ -342,13 +428,18 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   void dispose() {
     _openTicket += 1;
     final player = _player;
+    final fallbackVideo = _fallbackVideoController;
     final youtube = _youtube;
     _player = null;
     _videoController = null;
+    _fallbackVideoController = null;
     _webViewController = null;
     _youtube = null;
     if (player != null) {
       unawaited(player.dispose());
+    }
+    if (fallbackVideo != null) {
+      unawaited(fallbackVideo.dispose());
     }
     youtube?.close();
     super.dispose();
@@ -368,6 +459,18 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
           if (_usingWebView && _webViewController != null)
             Positioned.fill(
                 child: WebViewWidget(controller: _webViewController!))
+          else if (_usingFallbackVideo && _fallbackVideoController != null)
+            Positioned.fill(
+              child: Center(
+                child: AspectRatio(
+                  aspectRatio:
+                      _fallbackVideoController!.value.aspectRatio > 0
+                          ? _fallbackVideoController!.value.aspectRatio
+                          : 16 / 9,
+                  child: vp.VideoPlayer(_fallbackVideoController!),
+                ),
+              ),
+            )
           else if (_videoController != null)
             Positioned.fill(
               child: Video(
@@ -523,6 +626,18 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   }
 }
 
+Map<String, String> _trailerPlaybackHeaders(String url) {
+  final uri = Uri.tryParse(url);
+  if (uri == null || !uri.host.contains('googlevideo.com')) {
+    return const {};
+  }
+  return const {
+    'User-Agent': _trailerUserAgent,
+    'Origin': 'https://www.youtube.com',
+    'Referer': 'https://www.youtube.com/',
+  };
+}
+
 String _extractYouTubeVideoId(String trailerUrl) {
   return yt.VideoId.parseVideoId(trailerUrl) ?? '';
 }
@@ -543,8 +658,9 @@ String _extractVimeoVideoId(Uri uri) {
 String _buildYouTubeEmbedHtml(String videoId) {
   final safeId = _escapeHtmlAttribute(videoId);
   return _buildTrailerEmbedHtml(
-    'https://www.youtube-nocookie.com/embed/$safeId'
-    '?autoplay=1&controls=1&rel=0&modestbranding=1&playsinline=1',
+    'https://www.youtube.com/embed/$safeId'
+    '?autoplay=1&controls=1&rel=0&modestbranding=1&playsinline=1'
+    '&origin=https%3A%2F%2Fwww.youtube.com',
   );
 }
 

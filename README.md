@@ -60,7 +60,7 @@ flutter create --platforms=android,windows,linux .
 Ejecuta los scripts siempre desde la carpeta Flutter, no desde `android-tv-shell`:
 
 ```sh
-cd /media/guzz/Series/CODE/ToonamiViernesNoche/apps/toonami_viernes_noche_flutter
+cd /ruta/a/Tanuki
 flutter pub get
 ```
 
@@ -223,6 +223,26 @@ Linux:
 sh scripts/build_linux.sh
 ```
 
+Si moviste el proyecto de disco/carpeta y Linux falla con un error como
+`CMakeCache.txt ... is different than the directory ... where CMakeCache.txt was created`,
+es una cache absoluta vieja de CMake. `scripts/build_linux.sh` la detecta y borra
+automaticamente desde ahora. Si quieres limpiarlo manualmente:
+
+```sh
+rm -rf build/linux
+sh scripts/build_linux.sh
+```
+
+Si durante Linux aparece `media_kit: WARNING: package:media_kit_libs_*** not found.`,
+la cache de CMake puede haber quedado con `MEDIA_KIT_LIBS_AVAILABLE=OFF` despues
+de mover el proyecto o cambiar dependencias. El script tambien limpia esa cache.
+Despues de actualizar dependencias, corre:
+
+```sh
+flutter pub get
+sh scripts/build_linux.sh
+```
+
 En este proyecto conviene usar los scripts con `sh` porque la carpeta esta en un volumen que puede no conservar permisos ejecutables (`android/gradlew` queda sin `+x`). El script Android copia el proyecto a `~/.codex/build-work/tanuki_android_build`, corrige permisos ahi y copia el APK de vuelta.
 
 Si aun quieres usar comandos directos, hazlo solo desde un filesystem que conserve permisos ejecutables:
@@ -232,7 +252,7 @@ flutter build apk --release
 flutter build linux --release
 ```
 
-El build Linux no exige `libmpv-dev`. Para habilitar video embebido en Linux en la maquina de build, instala los paquetes de desarrollo de `mpv` y `epoxy`; sin ellos el binario sigue funcionando con fallback externo.
+El build Linux no exige `libmpv-dev` para correr, pero si quieres que el reproductor se abra dentro de la app en Linux debes contar con los paquetes de desarrollo de `mpv` y `epoxy`. El script de build intenta instalarlos automaticamente en Debian/Ubuntu cuando faltan (`libmpv-dev`, `libepoxy-dev`, `libgtk-3-dev`, `cmake`, `ninja-build`); si no puedes instalarlos, el binario sigue funcionando con fallback externo.
 
 ## Releases con GitHub Actions
 

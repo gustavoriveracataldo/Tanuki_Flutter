@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -53,6 +54,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _handlingPlaybackError = false;
   bool _playerOverlaysVisible = true;
   bool _playerControlsFocused = false;
+  final FocusNode _playerControlsRootFocusNode = FocusNode(debugLabel: 'playerControlsRoot');
+  final FocusNode _playerBackButtonFocusNode = FocusNode(debugLabel: 'playerBackButton');
   late VideoScaleMode _videoScaleMode;
   RemoteDirectStream? _currentResolvedStream;
   String _selectedRemoteSubtitleTrackKey = '';
@@ -111,6 +114,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _animeAv1SeekRecoveryTimer?.cancel();
     _upcomingCardStartTimer?.cancel();
     _upcomingCardSequenceTimer?.cancel();
+    _playerControlsRootFocusNode.dispose();
+    _playerBackButtonFocusNode.dispose();
     _cancelRemoteVideoFrameWatchdog();
     _cancelDeferredAnimeAv1PlaybackError();
     final positionSubscription = _positionSubscription;
@@ -772,6 +777,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _completedSubscription = player.stream.completed.listen((completed) {
       if (completed) {
         unawaited(_commitPlaybackCompletion());
+        if (mounted) {
+          unawaited(_playNext());
+        }
       }
     });
   }
@@ -1096,74 +1104,80 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final sourceStatus = _sourceStatus();
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Listener(
-        onPointerDown: (_) => _showPlayerOverlays(),
-        onPointerMove: (_) => _showPlayerOverlays(),
-        onPointerHover: (_) => _showPlayerOverlays(),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: _openedMedia && _videoController != null
-                  ? _TanukiVideoTheme(
-                      child: Video(
-                        controller: _videoController!,
-                        fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                        subtitleViewConfiguration: SubtitleViewConfiguration(
-                          visible: _subtitlesEnabled,
+      body: Focus(
+        focusNode: _playerControlsRootFocusNode,
+        autofocus: true,
+        onKeyEvent: _handlePlayerRootKey,
+        child: Listener(
+          onPointerDown: (_) => _showPlayerOverlays(),
+          onPointerMove: (_) => _showPlayerOverlays(),
+          onPointerHover: (_) => _showPlayerOverlays(),
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: _openedMedia && _videoController != null
+                    ? _TanukiVideoTheme(
+                        child: Video(
+                          controller: _videoController!,
+                          fit: _boxFitForVideoScaleMode(_videoScaleMode),
+                          subtitleViewConfiguration: SubtitleViewConfiguration(
+                            visible: _subtitlesEnabled,
+                          ),
                         ),
+                      )
+                    : _PlayerFallback(
+                        episode: episode,
+                        error: _error,
                       ),
-                    )
-                  : _PlayerFallback(
-                      episode: episode,
-                      error: _error,
-                    ),
-            ),
-            Positioned(
-              left: 0,
-              top: 0,
-              right: 0,
-              child: IgnorePointer(
-                ignoring: _openedMedia && !_playerOverlaysVisible,
-                child: AnimatedOpacity(
-                  opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
-                  duration: const Duration(milliseconds: 220),
-                  child: _PlayerTopBar(
-                    episode: episode,
-                    status: sourceStatus.label,
-                    statusIcon: sourceStatus.icon,
-                    statusColor: sourceStatus.color,
-                    onBack: () => Navigator.of(context).maybePop(),
-                    onPrevious: _playPrevious,
-                    onNext: _playNext,
-                    subtitlesEnabled: _subtitlesEnabled,
-                    videoScaleMode: _videoScaleMode,
-                    onToggleSubtitles: _toggleSubtitles,
-                    onToggleViewMode: _cycleVideoScaleMode,
-                    onSettings: _showPlayerSettingsDialog,
-                    onControlFocusChanged: _setPlayerControlsFocused,
-                  ),
-                ),
               ),
-            ),
-            if (widget.controller.state.showPlaylistUpcomingCards &&
-                visibleUpcomingCard != null)
               Positioned(
-                right: 18,
-                bottom: 24,
+                left: 0,
+                top: 0,
+                right: 0,
                 child: IgnorePointer(
-                  ignoring: true,
+                  ignoring: _openedMedia && !_playerOverlaysVisible,
                   child: AnimatedOpacity(
-                    opacity: 1,
+                    opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
                     duration: const Duration(milliseconds: 220),
-                    child: _UpcomingCard(
-                      label: _visibleUpcomingCardLabel(),
-                      labelColor: _visibleUpcomingCardColor(),
-                      episode: visibleUpcomingCard,
+                    child: _PlayerTopBar(
+                      episode: episode,
+                      status: sourceStatus.label,
+                      statusIcon: sourceStatus.icon,
+                      statusColor: sourceStatus.color,
+                      onBack: () => Navigator.of(context).maybePop(),
+                      onPrevious: _playPrevious,
+                      onNext: _playNext,
+                      subtitlesEnabled: _subtitlesEnabled,
+                      videoScaleMode: _videoScaleMode,
+                      onToggleSubtitles: _toggleSubtitles,
+                      onToggleViewMode: _cycleVideoScaleMode,
+                      onSettings: _showPlayerSettingsDialog,
+                      onControlFocusChanged: _setPlayerControlsFocused,
+                      backButtonFocusNode: _playerBackButtonFocusNode,
                     ),
                   ),
                 ),
               ),
-          ],
+              if (widget.controller.state.showPlaylistUpcomingCards &&
+                  visibleUpcomingCard != null)
+                Positioned(
+                  right: 18,
+                  bottom: 24,
+                  child: IgnorePointer(
+                    ignoring: true,
+                    child: AnimatedOpacity(
+                      opacity: 1,
+                      duration: const Duration(milliseconds: 220),
+                      child: _UpcomingCard(
+                        label: _visibleUpcomingCardLabel(),
+                        labelColor: _visibleUpcomingCardColor(),
+                        episode: visibleUpcomingCard,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -1212,6 +1226,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _playerOverlayHideTimer?.cancel();
     } else {
       _schedulePlayerOverlayHide();
+    }
+  }
+
+  KeyEventResult _handlePlayerRootKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    final isNavigationKey = key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown ||
+        key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.arrowRight ||
+        key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.gameButtonA;
+    if (isNavigationKey) {
+      _showPlayerOverlays();
+      if (!_playerControlsFocused) {
+        _requestPlayerControlFocus();
+      }
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _requestPlayerControlFocus() {
+    if (!mounted) {
+      return;
+    }
+    if (_playerBackButtonFocusNode.canRequestFocus) {
+      _playerBackButtonFocusNode.requestFocus();
     }
   }
 
@@ -1907,9 +1951,11 @@ class _PlayerTopBar extends StatelessWidget {
     required this.onToggleViewMode,
     required this.onSettings,
     required this.onControlFocusChanged,
+    this.backButtonFocusNode,
   });
 
   final EpisodeItem episode;
+  final FocusNode? backButtonFocusNode;
   final String status;
   final IconData statusIcon;
   final Color statusColor;
@@ -1933,6 +1979,7 @@ class _PlayerTopBar extends StatelessWidget {
           _PlayerIconButton(
             icon: Icons.arrow_back,
             tooltip: 'Volver',
+            focusNode: backButtonFocusNode,
             onPressed: onBack,
             onFocusChanged: onControlFocusChanged,
           ),
@@ -2021,6 +2068,7 @@ class _PlayerCaptionButton extends StatelessWidget {
     required this.active,
     required this.onPressed,
     required this.onFocusChanged,
+    this.focusNode,
   });
 
   final String label;
@@ -2028,19 +2076,19 @@ class _PlayerCaptionButton extends StatelessWidget {
   final bool active;
   final VoidCallback onPressed;
   final ValueChanged<bool> onFocusChanged;
+  final FocusNode? focusNode;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
       message: tooltip,
       child: Focus(
-        canRequestFocus: false,
-        skipTraversal: true,
         onFocusChange: onFocusChanged,
         child: SizedBox(
           width: 56,
           height: 44,
           child: OutlinedButton(
+            focusNode: focusNode,
             onPressed: onPressed,
             style: ButtonStyle(
               padding: MaterialStateProperty.all(EdgeInsets.zero),
@@ -2103,22 +2151,23 @@ class _PlayerIconButton extends StatelessWidget {
     required this.tooltip,
     required this.onPressed,
     required this.onFocusChanged,
+    this.focusNode,
   });
 
   final IconData icon;
   final String tooltip;
   final VoidCallback onPressed;
   final ValueChanged<bool> onFocusChanged;
+  final FocusNode? focusNode;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
       message: tooltip,
       child: Focus(
-        canRequestFocus: false,
-        skipTraversal: true,
         onFocusChange: onFocusChanged,
         child: IconButton(
+          focusNode: focusNode,
           onPressed: onPressed,
           icon: Icon(icon),
           style: ButtonStyle(

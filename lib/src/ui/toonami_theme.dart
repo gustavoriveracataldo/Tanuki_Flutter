@@ -83,22 +83,19 @@ BoxDecoration glassDecoration({
 }) {
   final useGlassGradient = color == TanukiColors.panel;
   return BoxDecoration(
-    color: useGlassGradient ? null : color,
+    color: useGlassGradient ? null : color.withOpacity(0.18),
     gradient: useGlassGradient
-        ? const LinearGradient(
+        ? LinearGradient(
             begin: Alignment.centerLeft,
             end: Alignment.centerRight,
-            colors: [TanukiColors.panel, TanukiColors.panelEnd],
+            colors: [
+              const Color(0x20FFFFFF),
+              const Color(0x10FFFFFF),
+            ],
           )
         : null,
     borderRadius: BorderRadius.circular(radius),
-    border: Border.all(color: borderColor.withValues(alpha: 0.55)),
-    boxShadow: const [
-      BoxShadow(
-        color: Color(0x55000000),
-        blurRadius: 16,
-        offset: Offset(0, 8),
-      ),
-    ],
+    border: Border.all(color: borderColor.withOpacity(0.25)),
+    boxShadow: [],
   );
 }

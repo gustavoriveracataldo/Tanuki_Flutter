@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../app_controller.dart';
@@ -10,7 +11,7 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
-const _appVersionLabel = '0.9.0';
+const _appVersionLabel = '0.9.5';
 
 enum _Section {
   anime,
@@ -44,12 +45,16 @@ class _HomeScreenState extends State<HomeScreen> {
   List<RemoteSearchCandidate> _similarResults = const [];
   List<RemoteSearchCandidate> _detailSimilarResults = const [];
   List<RemoteSearchCandidate> _homeTrendingResults = const [];
+  List<RemoteSearchCandidate> _homeMovieResults = const [];
   bool _similarLoading = false;
   bool _detailSimilarLoading = false;
   bool _homeTrendingLoading = false;
+  bool _homeMoviesLoading = false;
   bool _randomLoading = false;
+  double _animePanelScrollOffset = 0.0;
   int _detailSimilarRequest = 0;
   int _homeTrendingVisualRequest = 0;
+  int _homeMovieVisualRequest = 0;
   String _similarStatus = '';
   String _detailSimilarStatus = '';
   bool _profilePickerVisible = false;
@@ -60,6 +65,7 @@ class _HomeScreenState extends State<HomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         unawaited(_loadHomeTrending());
+        unawaited(_loadHomeMovies());
       }
     });
   }
@@ -202,6 +208,10 @@ class _HomeScreenState extends State<HomeScreen> {
       detailSimilarLoading: _detailSimilarLoading,
       trendingCandidates: _homeTrendingResults,
       trendingLoading: _homeTrendingLoading,
+      movieCandidates: _homeMovieResults,
+      moviesLoading: _homeMoviesLoading,
+      scrollOffset: _animePanelScrollOffset,
+      onScrollOffset: _updateAnimePanelOpacity,
       onSeriesCleared: _clearSelectedSeries,
       onRemoteCandidateSelected: (candidate) {
         _openRemoteCandidate(candidate);
@@ -282,6 +292,14 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _heroPreviewSeries = preview;
     });
+  }
+
+  void _updateAnimePanelOpacity(double offset) {
+    if (offset != _animePanelScrollOffset) {
+      setState(() {
+        _animePanelScrollOffset = offset;
+      });
+    }
   }
 
   Future<void> _refreshSelectedSeriesVisuals(SeriesItem series) async {
@@ -423,6 +441,33 @@ class _HomeScreenState extends State<HomeScreen> {
     unawaited(_refreshHomeTrendingVisuals(_homeTrendingResults));
   }
 
+  Future<void> _loadHomeMovies() async {
+    if (_homeMoviesLoading) {
+      return;
+    }
+    setState(() {
+      _homeMoviesLoading = true;
+    });
+    try {
+      final movies = await widget.controller.loadHomeMovieCandidates(pages: 3);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _homeMovieResults = movies.take(18).toList(growable: false);
+        _homeMoviesLoading = false;
+      });
+      unawaited(_refreshHomeMovieVisuals(_homeMovieResults));
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _homeMoviesLoading = false;
+      });
+    }
+  }
+
   Future<void> _refreshHomeTrendingVisuals(
       List<RemoteSearchCandidate> candidates) async {
     if (candidates.isEmpty) {
@@ -454,6 +499,24 @@ class _HomeScreenState extends State<HomeScreen> {
               refreshedPreview.toSeries(existingNames: const []);
         }
       }
+    });
+  }
+
+  Future<void> _refreshHomeMovieVisuals(
+      List<RemoteSearchCandidate> candidates) async {
+    if (candidates.isEmpty) {
+      return;
+    }
+    final request = ++_homeMovieVisualRequest;
+    final refreshed = await widget.controller.refreshCandidateVisuals(
+      candidates,
+      limit: 14,
+    );
+    if (!mounted || request != _homeMovieVisualRequest) {
+      return;
+    }
+    setState(() {
+      _homeMovieResults = refreshed.take(18).toList(growable: false);
     });
   }
 
@@ -636,7 +699,7 @@ class _SideRail extends StatelessWidget {
     final items = _navigationItems();
 
     return Container(
-      width: 54,
+      width: 72,
       height: double.infinity,
       decoration: const BoxDecoration(
         color: TanukiColors.rail,
@@ -735,13 +798,13 @@ class _SideRailButtonState extends State<_SideRailButton> {
           focusColor: Colors.transparent,
           hoverColor: Colors.transparent,
           child: Container(
-            width: 38,
-            height: 34,
+            width: 56,
+            height: 56,
             decoration: const BoxDecoration(color: Colors.transparent),
             child: Stack(
               alignment: Alignment.center,
               children: [
-                Icon(widget.item.icon, size: 18, color: foreground),
+                Icon(widget.item.icon, size: 36, color: foreground),
                 if (widget.active)
                   const Positioned(
                     bottom: 3,
@@ -846,7 +909,7 @@ class _BottomRailButton extends StatelessWidget {
         icon: Icon(item.icon),
         color: active ? TanukiColors.text : TanukiColors.muted,
         style: ButtonStyle(
-          fixedSize: MaterialStateProperty.all(const Size(42, 42)),
+          fixedSize: MaterialStateProperty.all(const Size(72, 72)),
           backgroundColor: MaterialStateProperty.resolveWith((states) {
             return active ? const Color(0x332B3B4D) : Colors.transparent;
           }),
@@ -1032,11 +1095,13 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
 
   Widget _buildPicker() {
     final profiles = controller.profiles;
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final profileRowHeight = (screenHeight * 0.38).clamp(180.0, 260.0);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         SizedBox(
-          height: 220,
+          height: profileRowHeight,
           child: ListView.separated(
             clipBehavior: Clip.none,
             scrollDirection: Axis.horizontal,
@@ -1074,11 +1139,13 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
 
   Widget _buildManage() {
     final profiles = controller.profiles;
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final manageListMaxHeight = (screenHeight * 0.5).clamp(260.0, 380.0);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 330),
+          constraints: BoxConstraints(maxHeight: manageListMaxHeight),
           child: ListView.separated(
             shrinkWrap: true,
             itemBuilder: (context, index) {
@@ -1392,8 +1459,10 @@ class _ProfileTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.sizeOf(context).width;
+    final tileWidth = (screenWidth * 0.14).clamp(120.0, 160.0);
     return SizedBox(
-      width: 136,
+      width: tileWidth,
       child: InkWell(
         onTap: onSelect,
         borderRadius: BorderRadius.circular(26),
@@ -1537,17 +1606,22 @@ class _ProfileActionButton extends StatelessWidget {
       padding: const EdgeInsets.only(bottom: 10),
       child: Align(
         alignment: Alignment.center,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 360),
-          child: SizedBox(
-            width: double.infinity,
-            height: 44,
-            child: OutlinedButton.icon(
-              onPressed: onPressed,
-              icon: Icon(icon, color: danger ? TanukiColors.danger : null),
-              label: Text(label),
-            ),
-          ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final maxButtonWidth = (constraints.maxWidth * 0.85).clamp(220.0, 360.0);
+            return ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: maxButtonWidth),
+              child: SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: OutlinedButton.icon(
+                  onPressed: onPressed,
+                  icon: Icon(icon, color: danger ? TanukiColors.danger : null),
+                  label: Text(label),
+                ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -1743,7 +1817,7 @@ class _HeroBackground extends StatelessWidget {
         ? series!.backgroundUrl
         : series?.imageUrl ?? '';
     return DecoratedBox(
-      decoration: const BoxDecoration(color: TanukiColors.background),
+      decoration: const BoxDecoration(color: Colors.transparent),
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -1763,15 +1837,18 @@ class _HeroBackground extends StatelessWidget {
               ),
             ),
           Container(
+            color: const Color(0x22000000),
+          ),
+          Container(
             decoration: const BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.centerLeft,
                 end: Alignment.centerRight,
                 colors: [
-                  Color(0xFF081018),
-                  Color(0xEE081018),
-                  Color(0xAA081018),
-                  Color(0x22081018),
+                  Color(0x33000000),
+                  Colors.transparent,
+                  Colors.transparent,
+                  Color(0x22000000),
                 ],
               ),
             ),
@@ -1781,7 +1858,7 @@ class _HeroBackground extends StatelessWidget {
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
-                colors: [Color(0x77000000), Color(0xFF081018)],
+                colors: [Color(0x00000000), Color(0x66000000)],
               ),
             ),
           ),
@@ -1802,6 +1879,10 @@ class _AnimePanel extends StatelessWidget {
     required this.detailSimilarLoading,
     required this.trendingCandidates,
     required this.trendingLoading,
+    required this.movieCandidates,
+    required this.moviesLoading,
+    required this.scrollOffset,
+    required this.onScrollOffset,
     required this.onSeriesCleared,
     required this.onRemoteCandidateSelected,
     required this.onSimilarSeriesRequested,
@@ -1823,6 +1904,10 @@ class _AnimePanel extends StatelessWidget {
   final bool detailSimilarLoading;
   final List<RemoteSearchCandidate> trendingCandidates;
   final bool trendingLoading;
+  final List<RemoteSearchCandidate> movieCandidates;
+  final bool moviesLoading;
+  final double scrollOffset;
+  final ValueChanged<double> onScrollOffset;
   final VoidCallback onSeriesCleared;
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final ValueChanged<SeriesItem> onSimilarSeriesRequested;
@@ -1842,7 +1927,98 @@ class _AnimePanel extends StatelessWidget {
         (library.isEmpty ? null : library.first);
     final continueWatching = _continueWatchingEntries(controller);
     final upcoming = _upcomingCandidates(trendingCandidates);
-    final latestMovies = _latestMovieCandidates(trendingCandidates);
+    final latestMovies = _latestMovieCandidates(
+      [...movieCandidates, ...trendingCandidates],
+    );
+
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final heroHeight = (screenHeight * 0.36).clamp(320.0, 480.0);
+    final topPadding = heroHeight + 18;
+    final sectionHeight = (screenHeight * 0.3525).clamp(320.0, 480.0);
+    const sectionGap = 28.0;
+    const fadeDistance = 80.0;
+
+    double sectionOpacity(double sectionTop) {
+      final startOffset = sectionTop + topPadding - heroHeight;
+      final delta = scrollOffset - startOffset;
+      if (delta <= 0) return 1.0;
+      if (delta >= fadeDistance) return 0.0;
+      return 1.0 - (delta / fadeDistance);
+    }
+
+    Widget fadeSection(double sectionTop, Widget child) {
+      return Opacity(
+        opacity: sectionOpacity(sectionTop),
+        child: child,
+      );
+    }
+
+    final panelChildren = <Widget>[];
+    final sectionPadding = (sectionHeight * 0.5).clamp(180.0, 240.0);
+    panelChildren.add(SizedBox(height: sectionPadding));
+    double nextSectionTop = sectionPadding;
+    if (continueWatching.isNotEmpty) {
+      panelChildren.add(fadeSection(
+        nextSectionTop,
+        _ContinueWatchingShelf(
+          entries: continueWatching,
+          onPlayEpisode: onPlayEpisode,
+          onStopWatchingSeries: onStopWatchingSeries,
+          onGoToSeries: onSeriesSelected,
+          onEntryFocused: onPreviewSeries,
+        ),
+      ));
+      panelChildren.add(const SizedBox(height: sectionGap));
+      nextSectionTop += sectionHeight + sectionGap;
+    }
+    if (trendingCandidates.isNotEmpty || trendingLoading) {
+      panelChildren.add(fadeSection(
+        nextSectionTop,
+        _TrendingPosterShelf(
+          controller: controller,
+          candidates: trendingCandidates,
+          loading: trendingLoading,
+          onCandidateSelected: onRemoteCandidateSelected,
+          onCandidateFocused: onPreviewRemoteCandidate,
+          onPlayTrailers: onPlayTrendingTrailers,
+        ),
+      ));
+      panelChildren.add(const SizedBox(height: sectionGap));
+      nextSectionTop += sectionHeight + sectionGap;
+    }
+    if (upcoming.isNotEmpty) {
+      panelChildren.add(fadeSection(
+        nextSectionTop,
+        _UpcomingPosterShelf(
+          candidates: upcoming,
+          controller: controller,
+          onCandidateSelected: onRemoteCandidateSelected,
+          onCandidateFocused: onPreviewRemoteCandidate,
+        ),
+      ));
+      panelChildren.add(const SizedBox(height: sectionGap));
+      nextSectionTop += sectionHeight + sectionGap;
+    }
+    if (latestMovies.isNotEmpty || moviesLoading) {
+      panelChildren.add(fadeSection(
+        nextSectionTop,
+        _UpcomingPosterShelf(
+          title: 'Ultimas peliculas',
+          trailing: moviesLoading && latestMovies.isEmpty
+              ? 'Cargando...'
+              : '${latestMovies.length} peliculas',
+          candidates: latestMovies,
+          loading: moviesLoading,
+          controller: controller,
+          onCandidateSelected: onRemoteCandidateSelected,
+          onCandidateFocused: onPreviewRemoteCandidate,
+        ),
+      ));
+      panelChildren.add(const SizedBox(height: sectionGap));
+      nextSectionTop += sectionHeight + sectionGap;
+    }
+    panelChildren.add(SizedBox(height: sectionPadding));
+    panelChildren.add(const SizedBox(height: 56));
 
     if (selectedSeries != null) {
       return Padding(
@@ -1869,62 +2045,31 @@ class _AnimePanel extends StatelessWidget {
         clipBehavior: Clip.none,
         children: [
           Positioned.fill(
-            child: SingleChildScrollView(
-              clipBehavior: Clip.none,
-              padding: const EdgeInsets.only(top: 286),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (continueWatching.isNotEmpty) ...[
-                    _ContinueWatchingShelf(
-                      entries: continueWatching,
-                      onPlayEpisode: onPlayEpisode,
-                      onStopWatchingSeries: onStopWatchingSeries,
-                      onGoToSeries: onSeriesSelected,
-                      onEntryFocused: onPreviewSeries,
-                    ),
-                    const SizedBox(height: 24),
-                  ],
-                  if (trendingCandidates.isNotEmpty || trendingLoading)
-                    _TrendingPosterShelf(
-                      controller: controller,
-                      candidates: trendingCandidates,
-                      loading: trendingLoading,
-                      onCandidateSelected: onRemoteCandidateSelected,
-                      onCandidateFocused: onPreviewRemoteCandidate,
-                      onPlayTrailers: onPlayTrendingTrailers,
-                    ),
-                  if (upcoming.isNotEmpty) ...[
-                    const SizedBox(height: 24),
-                    _UpcomingPosterShelf(
-                      candidates: upcoming,
-                      controller: controller,
-                      onCandidateSelected: onRemoteCandidateSelected,
-                      onCandidateFocused: onPreviewRemoteCandidate,
-                    ),
-                  ],
-                  if (latestMovies.isNotEmpty) ...[
-                    const SizedBox(height: 24),
-                    _UpcomingPosterShelf(
-                      title: 'Ultimas peliculas',
-                      trailing: '${latestMovies.length} peliculas',
-                      candidates: latestMovies,
-                      controller: controller,
-                      onCandidateSelected: onRemoteCandidateSelected,
-                      onCandidateFocused: onPreviewRemoteCandidate,
-                    ),
-                  ],
-                  const SizedBox(height: 56),
-                ],
+            child: NotificationListener<ScrollNotification>(
+              onNotification: (notification) {
+                if (notification.depth != 0 ||
+                    notification.metrics.axis != Axis.vertical) {
+                  return false;
+                }
+                onScrollOffset(notification.metrics.pixels);
+                return false;
+              },
+              child: SingleChildScrollView(
+                clipBehavior: Clip.none,
+                padding: EdgeInsets.only(top: heroHeight + 46),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: panelChildren,
+                ),
               ),
             ),
           ),
-          const Positioned(
+          Positioned(
             left: -20,
             top: -14,
             right: -14,
-            height: 330,
-            child: IgnorePointer(child: _HeroFadeOverlay()),
+            height: heroHeight + 56,
+            child: const IgnorePointer(child: _HeroFadeOverlay()),
           ),
           Positioned(
             left: 0,
@@ -1933,6 +2078,7 @@ class _AnimePanel extends StatelessWidget {
             child: _HeroBlock(
               controller: controller,
               series: hero,
+              height: heroHeight,
               onPlayEpisode: onPlayEpisode,
               onOpenTrailer: onOpenSeriesTrailer,
             ),
@@ -1954,10 +2100,10 @@ class _HeroFadeOverlay extends StatelessWidget {
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: const [
-            Color(0xFF081018),
-            Color(0xFF081018),
-            Color(0xF7081018),
-            Color(0x00081018),
+            Colors.transparent,
+            Colors.transparent,
+            Colors.transparent,
+            Colors.transparent,
           ],
           stops: const [0, 0.72, 0.9, 1],
         ),
@@ -2058,16 +2204,38 @@ class _RandomLoadingPanel extends StatelessWidget {
   }
 }
 
+double _homeResponsiveValue(BuildContext context, double base,
+    {double min = 0, double max = double.infinity}) {
+  final width = MediaQuery.sizeOf(context).width;
+  final scale = (width / 960).clamp(0.88, 1.24);
+  final value = base * scale;
+  return value.clamp(min == 0 ? base * 0.8 : min, max);
+}
+
+double _heroButtonSide(BuildContext context) =>
+    _homeResponsiveValue(context, 48, min: 42, max: 60);
+
+double _heroIconSize(BuildContext context) =>
+    _homeResponsiveValue(context, 28, min: 24, max: 34);
+
+double _heroLogoHeight(BuildContext context) =>
+    _homeResponsiveValue(context, 72, min: 54, max: 90);
+
+double _heroTitleFontSize(BuildContext context) =>
+    _homeResponsiveValue(context, 34, min: 26, max: 42);
+
 class _HeroBlock extends StatelessWidget {
   const _HeroBlock({
     required this.controller,
     required this.series,
+    required this.height,
     required this.onPlayEpisode,
     required this.onOpenTrailer,
   });
 
   final AppController controller;
   final SeriesItem? series;
+  final double height;
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final ValueChanged<SeriesItem> onOpenTrailer;
 
@@ -2081,8 +2249,10 @@ class _HeroBlock extends StatelessWidget {
         : 'Playlist nocturna, biblioteca local y catalogo anime en una interfaz TV.';
     final nextEpisode =
         series == null ? null : controller.firstPlayableEpisode(series!);
+    final maxHeroTextWidth =
+        (MediaQuery.sizeOf(context).width * 0.55).clamp(340.0, 520.0);
     return Container(
-      height: 274,
+      height: height,
       padding: const EdgeInsets.fromLTRB(20, 14, 20, 10),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2091,7 +2261,7 @@ class _HeroBlock extends StatelessWidget {
             child: Align(
               alignment: Alignment.topLeft,
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 446),
+                constraints: BoxConstraints(maxWidth: maxHeroTextWidth),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -2099,7 +2269,7 @@ class _HeroBlock extends StatelessWidget {
                     const SizedBox(height: 10),
                     if (series?.logoUrl.isNotEmpty == true)
                       SizedBox(
-                        height: 76,
+                        height: _heroLogoHeight(context),
                         child: Image.network(
                           series!.logoUrl,
                           fit: BoxFit.contain,
@@ -2111,8 +2281,9 @@ class _HeroBlock extends StatelessWidget {
                     else if (series == null)
                       Image.asset(
                         'assets/images/tanuki_brand_logo.png',
-                        width: 250,
-                        height: 66,
+                        width: (MediaQuery.sizeOf(context).width * 0.27)
+                            .clamp(200.0, 280.0),
+                        height: _heroLogoHeight(context),
                         fit: BoxFit.contain,
                       )
                     else
@@ -2230,8 +2401,9 @@ class _HeroTitleFallback extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final fontSize = _heroTitleFontSize(context);
     return SizedBox(
-      height: 82,
+      height: fontSize * 2.4,
       child: Align(
         alignment: Alignment.centerLeft,
         child: Text(
@@ -2239,7 +2411,7 @@ class _HeroTitleFallback extends StatelessWidget {
           maxLines: 3,
           overflow: TextOverflow.ellipsis,
           style: Theme.of(context).textTheme.headlineLarge?.copyWith(
-                fontSize: 34,
+                fontSize: fontSize,
                 height: 1.04,
               ),
         ),
@@ -2263,18 +2435,21 @@ class _HeroIconButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final buttonSide = _heroButtonSide(context);
     return Tooltip(
       message: tooltip,
       child: IconButton(
         onPressed: onPressed,
         icon: Icon(icon),
+        iconSize: _heroIconSize(context),
         style: IconButton.styleFrom(
-          fixedSize: const Size(42, 42),
+          fixedSize: Size(buttonSide, buttonSide),
           backgroundColor: primary ? Colors.white : const Color(0x554A5E72),
           foregroundColor: primary ? TanukiColors.background : Colors.white,
           disabledForegroundColor: TanukiColors.subtle,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(21)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(buttonSide / 2),
+          ),
         ),
       ),
     );
@@ -2317,7 +2492,10 @@ class _SeriesDetailPanel extends StatelessWidget {
         : series.description.replaceAll('\n', ' ').trim();
     return LayoutBuilder(
       builder: (context, constraints) {
+        final screenHeight = MediaQuery.sizeOf(context).height;
         final wide = constraints.maxWidth >= 900;
+        final episodePanelHeight = (screenHeight * 0.55).clamp(320.0, 560.0);
+        final episodePanelWidth = (constraints.maxWidth * 0.34).clamp(320.0, 480.0);
         final info = _SeriesDetailInfo(
           controller: controller,
           series: series,
@@ -2351,7 +2529,7 @@ class _SeriesDetailPanel extends StatelessWidget {
                 const SizedBox(height: 18),
                 similar,
                 const SizedBox(height: 18),
-                SizedBox(height: 560, child: episodes),
+                SizedBox(height: episodePanelHeight, child: episodes),
               ],
             ),
           );
@@ -2374,7 +2552,7 @@ class _SeriesDetailPanel extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 18),
-              SizedBox(width: 420, child: episodes),
+              SizedBox(width: episodePanelWidth, child: episodes),
             ],
           ),
         );
@@ -2580,18 +2758,19 @@ class _SeriesDetailInfo extends StatelessWidget {
               final horizontal =
                   posterUrl.isNotEmpty && constraints.maxWidth >= 680;
               if (!horizontal) {
+                final posterWidth = (constraints.maxWidth * 0.62).clamp(150.0, 220.0);
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     if (posterUrl.isNotEmpty) ...[
-                      buildPoster(166),
+                      buildPoster(posterWidth),
                       const SizedBox(height: 16),
                     ],
                     buildInfoColumn(wide: false),
                   ],
                 );
               }
-              final posterWidth = constraints.maxWidth >= 1100 ? 250.0 : 210.0;
+              final posterWidth = (constraints.maxWidth * 0.24).clamp(160.0, 250.0);
               final posterHeight = posterWidth * 1.5;
               return Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -2663,7 +2842,11 @@ class _DetailSimilarCarousel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final posterHeight = (screenHeight * 0.225).clamp(200.0, 240.0);
+    final posterWidth = posterHeight * 0.7;
     final visibleStatus = status.trim();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2679,7 +2862,7 @@ class _DetailSimilarCarousel extends StatelessWidget {
         ],
         const SizedBox(height: 8),
         SizedBox(
-          height: 228,
+          height: posterHeight + 16,
           child: loading
               ? const Center(child: CircularProgressIndicator())
               : candidates.isEmpty
@@ -2696,7 +2879,8 @@ class _DetailSimilarCarousel extends StatelessWidget {
                       itemBuilder: (context, index) {
                         final candidate = candidates[index];
                         return SizedBox(
-                          width: 148,
+                          width: posterWidth,
+                          height: posterHeight,
                           child: _SearchResultPosterCard(
                             candidate: candidate,
                             imported: controller.findRemoteSeriesForCandidate(
@@ -3318,6 +3502,9 @@ class _TrendingPosterShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final posterHeight = (screenHeight * 0.24).clamp(220.0, 280.0);
+    final posterWidth = posterHeight * 0.7;
     final visibleCandidates = candidates.take(14).toList(growable: false);
     void focusCandidate(RemoteSearchCandidate candidate) {
       _ensureFocusedShelfVisible(context);
@@ -3352,9 +3539,9 @@ class _TrendingPosterShelf extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         SizedBox(
-          height: 228,
+          height: posterHeight + 16,
           child: loading && visibleCandidates.isEmpty
-              ? const _PosterShelfSkeleton()
+              ? _PosterShelfSkeleton(width: posterWidth, height: posterHeight)
               : ListView.separated(
                   scrollDirection: Axis.horizontal,
                   clipBehavior: Clip.none,
@@ -3362,6 +3549,8 @@ class _TrendingPosterShelf extends StatelessWidget {
                   itemBuilder: (context, index) {
                     final candidate = visibleCandidates[index];
                     return _RemotePosterCard(
+                      width: posterWidth,
+                      height: posterHeight,
                       candidate: candidate,
                       imported:
                           controller.findRemoteSeriesForCandidate(candidate) !=
@@ -3381,12 +3570,16 @@ class _TrendingPosterShelf extends StatelessWidget {
 
 class _RemotePosterCard extends StatelessWidget {
   const _RemotePosterCard({
+    required this.width,
+    required this.height,
     required this.candidate,
     required this.imported,
     required this.onTap,
     required this.onFocused,
   });
 
+  final double width;
+  final double height;
   final RemoteSearchCandidate candidate;
   final bool imported;
   final VoidCallback onTap;
@@ -3395,8 +3588,8 @@ class _RemotePosterCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 150,
-      height: 212,
+      width: width,
+      height: height,
       child: _SearchResultPosterCard(
         candidate: candidate,
         imported: imported,
@@ -3443,6 +3636,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
   const _UpcomingPosterShelf({
     this.title = 'Proximos estrenos',
     this.trailing,
+    this.loading = false,
     required this.candidates,
     required this.controller,
     required this.onCandidateSelected,
@@ -3451,6 +3645,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
 
   final String title;
   final String? trailing;
+  final bool loading;
   final List<RemoteSearchCandidate> candidates;
   final AppController controller;
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
@@ -3458,6 +3653,10 @@ class _UpcomingPosterShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final posterHeight = (screenHeight * 0.24).clamp(220.0, 280.0);
+    final posterWidth = posterHeight * 0.7;
+
     void focusCandidate(RemoteSearchCandidate candidate) {
       _ensureFocusedShelfVisible(context);
       onCandidateFocused(candidate);
@@ -3472,24 +3671,29 @@ class _UpcomingPosterShelf extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         SizedBox(
-          height: 228,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            clipBehavior: Clip.none,
-            padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-            itemBuilder: (context, index) {
-              final candidate = candidates[index];
-              return _RemotePosterCard(
-                candidate: candidate,
-                imported:
-                    controller.findRemoteSeriesForCandidate(candidate) != null,
-                onTap: () => onCandidateSelected(candidate),
-                onFocused: () => focusCandidate(candidate),
-              );
-            },
-            separatorBuilder: (_, __) => const SizedBox(width: 8),
-            itemCount: candidates.length,
-          ),
+          height: posterHeight + 16,
+          child: loading && candidates.isEmpty
+              ? _PosterShelfSkeleton(width: posterWidth, height: posterHeight)
+              : ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  clipBehavior: Clip.none,
+                  padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                  itemBuilder: (context, index) {
+                    final candidate = candidates[index];
+                    return _RemotePosterCard(
+                      width: posterWidth,
+                      height: posterHeight,
+                      candidate: candidate,
+                      imported:
+                          controller.findRemoteSeriesForCandidate(candidate) !=
+                              null,
+                      onTap: () => onCandidateSelected(candidate),
+                      onFocused: () => focusCandidate(candidate),
+                    );
+                  },
+                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                  itemCount: candidates.length,
+                ),
         ),
       ],
     );
@@ -3497,7 +3701,13 @@ class _UpcomingPosterShelf extends StatelessWidget {
 }
 
 class _PosterShelfSkeleton extends StatelessWidget {
-  const _PosterShelfSkeleton();
+  const _PosterShelfSkeleton({
+    required this.width,
+    required this.height,
+  });
+
+  final double width;
+  final double height;
 
   @override
   Widget build(BuildContext context) {
@@ -3505,8 +3715,8 @@ class _PosterShelfSkeleton extends StatelessWidget {
       scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
       itemBuilder: (_, __) => Container(
-        width: 150,
-        height: 212,
+        width: width,
+        height: height,
         decoration: BoxDecoration(
           color: const Color(0xFF233445),
           borderRadius: BorderRadius.circular(8),
@@ -3537,7 +3747,7 @@ class _SearchGridSkeleton extends StatelessWidget {
             for (var index = 0; index < columns * 2; index++)
               SizedBox(
                 width: cardWidth,
-                height: 208,
+                height: (cardWidth * 1.5).clamp(208.0, 340.0),
                 child: _PosterSkeletonCard(),
               ),
           ],
@@ -3637,6 +3847,10 @@ class _ContinueWatchingShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final posterHeight = (screenHeight * 0.235).clamp(220.0, 280.0);
+    final posterWidth = posterHeight * 0.7;
+
     void focusEntry(_ContinueWatchingEntry entry) {
       _ensureFocusedShelfVisible(context);
       final series = entry.series;
@@ -3654,7 +3868,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         SizedBox(
-          height: 228,
+          height: posterHeight + 16,
           child: ListView.separated(
             clipBehavior: Clip.none,
             scrollDirection: Axis.horizontal,
@@ -3662,6 +3876,8 @@ class _ContinueWatchingShelf extends StatelessWidget {
             itemBuilder: (context, index) {
               final entry = entries[index];
               return _ContinueWatchingPosterCard(
+                width: posterWidth,
+                height: posterHeight,
                 entry: entry,
                 onTap: () => onPlayEpisode(entry.episode),
                 onGoToSeries: entry.series == null
@@ -3684,6 +3900,8 @@ class _ContinueWatchingShelf extends StatelessWidget {
 
 class _ContinueWatchingPosterCard extends StatelessWidget {
   const _ContinueWatchingPosterCard({
+    required this.width,
+    required this.height,
     required this.entry,
     required this.onTap,
     required this.onGoToSeries,
@@ -3691,6 +3909,8 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
     required this.onFocused,
   });
 
+  final double width;
+  final double height;
   final _ContinueWatchingEntry entry;
   final VoidCallback onTap;
   final VoidCallback? onGoToSeries;
@@ -3700,8 +3920,8 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 150,
-      height: 212,
+      width: width,
+      height: height,
       child: _FocusablePosterSurface(
         onTap: onTap,
         onFocused: onFocused,
@@ -3986,11 +4206,14 @@ class _PlaylistPanel extends StatelessWidget {
                         ),
                 );
                 if (!wide) {
+                  final screenHeight = MediaQuery.sizeOf(context).height;
+                  final queueHeight = (screenHeight * 0.45).clamp(250.0, 420.0);
+                  final seriesHeight = (screenHeight * 0.38).clamp(220.0, 360.0);
                   return ListView(
                     children: [
-                      SizedBox(height: 420, child: queue),
+                      SizedBox(height: queueHeight, child: queue),
                       const SizedBox(height: 16),
-                      SizedBox(height: 360, child: seriesColumn),
+                      SizedBox(height: seriesHeight, child: seriesColumn),
                     ],
                   );
                 }
@@ -4540,6 +4763,10 @@ class _SpaceSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final posterHeight = (screenHeight * 0.235).clamp(220.0, 280.0);
+    final posterWidth = posterHeight * 0.7;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -4552,7 +4779,7 @@ class _SpaceSection extends StatelessWidget {
         if (series.isNotEmpty) ...[
           const SizedBox(height: 4),
           SizedBox(
-            height: 228,
+            height: posterHeight + 16,
             child: ListView.separated(
               clipBehavior: Clip.none,
               scrollDirection: Axis.horizontal,
@@ -4560,6 +4787,8 @@ class _SpaceSection extends StatelessWidget {
               itemBuilder: (context, index) {
                 final item = series[index];
                 return _SpacePosterCard(
+                  width: posterWidth,
+                  height: posterHeight,
                   series: item,
                   onTap: () => onSeriesSelected(item),
                 );
@@ -4576,18 +4805,22 @@ class _SpaceSection extends StatelessWidget {
 
 class _SpacePosterCard extends StatelessWidget {
   const _SpacePosterCard({
+    required this.width,
+    required this.height,
     required this.series,
     required this.onTap,
   });
 
+  final double width;
+  final double height;
   final SeriesItem series;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 150,
-      height: 212,
+      width: width,
+      height: height,
       child: Material(
         color: Colors.transparent,
         elevation: 6,
@@ -4677,6 +4910,15 @@ class _SettingsPanel extends StatelessWidget {
     final profile = controller.state.profile;
     final malAuth = profile.myAnimeListAuth;
     final simklAuth = profile.simklAuth;
+    final media = MediaQuery.of(context);
+    final logicalSize = media.size;
+    final dpr = media.devicePixelRatio;
+    final physicalSize = Size(logicalSize.width * dpr, logicalSize.height * dpr);
+    final aspectRatio = logicalSize.width / logicalSize.height;
+    const targetAspectRatio = 16 / 9;
+    final aspectDiff = (aspectRatio - targetAspectRatio).abs();
+    final isSixteenByNine = aspectDiff <= 0.05;
+    final safePadding = media.padding;
     return SingleChildScrollView(
       padding: const EdgeInsets.only(left: 20, right: 4, bottom: 24),
       child: ConstrainedBox(
@@ -4729,6 +4971,14 @@ class _SettingsPanel extends StatelessWidget {
                   : const Icon(Icons.cloud_sync),
               label: const Text('Actualizar relleno'),
             ),
+            const _SettingsSectionTitle('Debug de pantalla'),
+            _SettingsStatusText('Resolución lógica: ${logicalSize.width.toStringAsFixed(0)} x ${logicalSize.height.toStringAsFixed(0)}'),
+            _SettingsStatusText('Resolución física: ${physicalSize.width.toStringAsFixed(0)} x ${physicalSize.height.toStringAsFixed(0)}'),
+            _SettingsStatusText('DPI de dispositivo: ${dpr.toStringAsFixed(2)}'),
+            _SettingsStatusText('Aspect ratio: ${aspectRatio.toStringAsFixed(3)}'),
+            _SettingsStatusText('Cerca de 16:9: ${isSixteenByNine ? 'Sí' : 'No'}'),
+            _SettingsStatusText('Safe area: top ${safePadding.top.toStringAsFixed(0)}, bottom ${safePadding.bottom.toStringAsFixed(0)}, left ${safePadding.left.toStringAsFixed(0)}, right ${safePadding.right.toStringAsFixed(0)}'),
+            const SizedBox(height: 16),
             const _SettingsSectionTitle('MyAnimeList'),
             Wrap(
               spacing: 8,
@@ -5372,7 +5622,7 @@ void _ensureFocusedShelfVisible(BuildContext context) {
       context,
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
-      alignment: 0.48,
+      alignment: 0.78,
       alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
     );
   });
@@ -5842,57 +6092,126 @@ class _FocusablePosterSurface extends StatefulWidget {
 class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   bool _focused = false;
   bool _hovered = false;
+  final FocusNode _focusNode = FocusNode();
+  Timer? _remoteLongPressTimer;
+  bool _remoteLongPressTriggered = false;
+  bool _remoteKeyDown = false;
 
   bool get _active => _focused || _hovered;
 
   @override
+  void dispose() {
+    _remoteLongPressTimer?.cancel();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleRemoteKeyEvent(FocusNode node, KeyEvent event) {
+    if (widget.onLongPress == null) {
+      return KeyEventResult.ignored;
+    }
+    if (event is! KeyDownEvent && event is! KeyUpEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    final key = event.logicalKey;
+    final isSelectKey = key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.gameButtonA;
+    if (!isSelectKey) {
+      return KeyEventResult.ignored;
+    }
+
+    if (event is KeyDownEvent) {
+      if (_remoteKeyDown) {
+        return KeyEventResult.ignored;
+      }
+      _remoteKeyDown = true;
+      _remoteLongPressTriggered = false;
+      _remoteLongPressTimer?.cancel();
+      _remoteLongPressTimer = Timer(
+        const Duration(milliseconds: 450),
+        _triggerRemoteLongPress,
+      );
+    } else if (event is KeyUpEvent) {
+      _remoteKeyDown = false;
+      _remoteLongPressTimer?.cancel();
+      _remoteLongPressTimer = null;
+      if (_remoteLongPressTriggered) {
+        _remoteLongPressTriggered = false;
+        return KeyEventResult.handled;
+      }
+    }
+
+    return KeyEventResult.ignored;
+  }
+
+  void _triggerRemoteLongPress() {
+    if (!mounted || !_remoteKeyDown) {
+      return;
+    }
+    _remoteLongPressTriggered = true;
+    widget.onLongPress?.call();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return AnimatedScale(
-      scale: _active ? 1.015 : 1,
-      duration: const Duration(milliseconds: 120),
-      curve: Curves.easeOut,
-      child: Material(
-        color: Colors.transparent,
-        elevation: _active ? 12 : widget.elevation,
-        shadowColor: const Color(0x77000000),
-        borderRadius: BorderRadius.circular(8),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: widget.onTap,
-          onLongPress: widget.onLongPress,
-          onFocusChange: (value) {
-            if (_focused != value) {
-              setState(() => _focused = value);
-            }
-            if (value) {
-              widget.onFocused?.call();
-              final scrollable = Scrollable.maybeOf(context);
-              final renderObject = context.findRenderObject();
-              if (scrollable != null && renderObject != null) {
-                scrollable.position.ensureVisible(
-                  renderObject,
-                  duration: const Duration(milliseconds: 160),
-                  curve: Curves.easeOutCubic,
-                  alignment: 0.54,
-                  alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
-                );
+    return Focus(
+      focusNode: _focusNode,
+      onKeyEvent: _handleRemoteKeyEvent,
+      child: AnimatedScale(
+        scale: _active ? 1.015 : 1,
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
+        child: Material(
+          color: Colors.transparent,
+          elevation: _active ? 12 : widget.elevation,
+          shadowColor: const Color(0x77000000),
+          borderRadius: BorderRadius.circular(8),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: () {
+              if (_remoteLongPressTriggered) {
+                _remoteLongPressTriggered = false;
+                return;
               }
-            }
-          },
-          onHover: (value) {
-            if (_hovered != value) {
-              setState(() => _hovered = value);
-            }
-          },
-          child: Container(
-            foregroundDecoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: _active ? TanukiColors.orange : Colors.transparent,
-                width: 3,
+              widget.onTap();
+            },
+            onLongPress: widget.onLongPress,
+            onFocusChange: (value) {
+              if (_focused != value) {
+                setState(() => _focused = value);
+              }
+              if (value) {
+                widget.onFocused?.call();
+                final scrollable = Scrollable.maybeOf(context);
+                final renderObject = context.findRenderObject();
+                if (scrollable != null && renderObject != null) {
+                  scrollable.position.ensureVisible(
+                    renderObject,
+                    duration: const Duration(milliseconds: 160),
+                    curve: Curves.easeOutCubic,
+                    alignment: 0.54,
+                    alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
+                  );
+                }
+              }
+            },
+            onHover: (value) {
+              if (_hovered != value) {
+                setState(() => _hovered = value);
+              }
+            },
+            child: Container(
+              foregroundDecoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: _active ? TanukiColors.orange : Colors.transparent,
+                  width: 3,
+                ),
               ),
+              child: widget.child,
             ),
-            child: widget.child,
           ),
         ),
       ),
@@ -5919,42 +6238,108 @@ class _FocusableEpisodeSurface extends StatefulWidget {
 class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
   bool _focused = false;
   bool _hovered = false;
+  final FocusNode _focusNode = FocusNode();
+  Timer? _remoteLongPressTimer;
+  bool _remoteLongPressTriggered = false;
+  bool _remoteKeyDown = false;
 
   bool get _active => _focused || _hovered;
 
   @override
+  void dispose() {
+    _remoteLongPressTimer?.cancel();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleRemoteKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyUpEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    final key = event.logicalKey;
+    final isSelectKey = key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.gameButtonA;
+    if (!isSelectKey) {
+      return KeyEventResult.ignored;
+    }
+
+    if (event is KeyDownEvent) {
+      if (_remoteKeyDown) {
+        return KeyEventResult.ignored;
+      }
+      _remoteKeyDown = true;
+      _remoteLongPressTriggered = false;
+      _remoteLongPressTimer?.cancel();
+      _remoteLongPressTimer = Timer(
+        const Duration(milliseconds: 450),
+        _triggerRemoteLongPress,
+      );
+    } else if (event is KeyUpEvent) {
+      _remoteKeyDown = false;
+      _remoteLongPressTimer?.cancel();
+      _remoteLongPressTimer = null;
+      if (_remoteLongPressTriggered) {
+        _remoteLongPressTriggered = false;
+        return KeyEventResult.handled;
+      }
+    }
+
+    return KeyEventResult.ignored;
+  }
+
+  void _triggerRemoteLongPress() {
+    if (!mounted || !_remoteKeyDown) {
+      return;
+    }
+    _remoteLongPressTriggered = true;
+    widget.onLongPress();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return AnimatedScale(
-      scale: _active ? 1.004 : 1,
-      duration: const Duration(milliseconds: 90),
-      curve: Curves.easeOut,
-      child: Material(
-        color: const Color(0xFF11161D),
-        elevation: _active ? 9 : 6,
-        borderRadius: BorderRadius.circular(7),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: widget.onTap,
-          onLongPress: widget.onLongPress,
-          onFocusChange: (value) {
-            if (_focused != value) {
-              setState(() => _focused = value);
-            }
-          },
-          onHover: (value) {
-            if (_hovered != value) {
-              setState(() => _hovered = value);
-            }
-          },
-          child: Container(
-            foregroundDecoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(7),
-              border: Border.all(
-                color: _active ? TanukiColors.orange : Colors.transparent,
-                width: 3,
+    return Focus(
+      focusNode: _focusNode,
+      onKeyEvent: _handleRemoteKeyEvent,
+      child: AnimatedScale(
+        scale: _active ? 1.004 : 1,
+        duration: const Duration(milliseconds: 90),
+        curve: Curves.easeOut,
+        child: Material(
+          color: const Color(0xFF11161D),
+          elevation: _active ? 9 : 6,
+          borderRadius: BorderRadius.circular(7),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: () {
+              if (_remoteLongPressTriggered) {
+                _remoteLongPressTriggered = false;
+                return;
+              }
+              widget.onTap();
+            },
+            onLongPress: widget.onLongPress,
+            onFocusChange: (value) {
+              if (_focused != value) {
+                setState(() => _focused = value);
+              }
+            },
+            onHover: (value) {
+              if (_hovered != value) {
+                setState(() => _hovered = value);
+              }
+            },
+            child: Container(
+              foregroundDecoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(
+                  color: _active ? TanukiColors.orange : Colors.transparent,
+                  width: 3,
+                ),
               ),
+              child: widget.child,
             ),
-            child: widget.child,
           ),
         ),
       ),
@@ -6007,11 +6392,14 @@ class _PosterFallback extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final fontSize = _homeResponsiveValue(context, 10, min: 9, max: 12);
+    final padding = _homeResponsiveValue(context, 12, min: 10, max: 14);
+    final labelPadding = _homeResponsiveValue(context, 6, min: 5, max: 8);
     return Stack(
       fit: StackFit.expand,
       children: [
         Padding(
-          padding: const EdgeInsets.all(12),
+          padding: EdgeInsets.all(padding),
           child: Image.asset('assets/images/tanuki_brand_icon.png',
               fit: BoxFit.contain),
         ),
@@ -6019,14 +6407,14 @@ class _PosterFallback extends StatelessWidget {
           alignment: Alignment.bottomCenter,
           child: Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(6),
+            padding: EdgeInsets.all(labelPadding),
             color: const Color(0x99000000),
             child: Text(
               title,
               maxLines: 2,
               textAlign: TextAlign.center,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700),
+              style: TextStyle(fontSize: fontSize, fontWeight: FontWeight.w700),
             ),
           ),
         ),
@@ -6042,8 +6430,14 @@ class _ScheduleChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final horizontalPadding = _homeResponsiveValue(context, 8, min: 6, max: 10);
+    final verticalPadding = _homeResponsiveValue(context, 4, min: 3, max: 6);
+    final fontSize = _homeResponsiveValue(context, 11, min: 10, max: 14);
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: EdgeInsets.symmetric(
+        horizontal: horizontalPadding,
+        vertical: verticalPadding,
+      ),
       decoration: BoxDecoration(
         color: const Color(0xCC1E7A63),
         borderRadius: BorderRadius.circular(12),
@@ -6053,7 +6447,7 @@ class _ScheduleChip extends StatelessWidget {
         text,
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
-        style: const TextStyle(
+        style: TextStyle(
           color: Color(0xFFF9FCFF),
           fontSize: 8,
           fontWeight: FontWeight.w900,
@@ -6120,14 +6514,16 @@ class _SectionHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final titleFontSize = _homeResponsiveValue(context, 22, min: 18, max: 28);
+    final trailingFontSize = _homeResponsiveValue(context, 13, min: 11, max: 16);
     return Row(
       children: [
         Expanded(
           child: Text(
             title,
-            style: const TextStyle(
+            style: TextStyle(
               color: TanukiColors.text,
-              fontSize: 22,
+              fontSize: titleFontSize,
               fontWeight: FontWeight.w900,
             ),
           ),
@@ -6139,9 +6535,9 @@ class _SectionHeader extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.end,
-              style: const TextStyle(
+              style: TextStyle(
                 color: TanukiColors.text,
-                fontSize: 13,
+                fontSize: trailingFontSize,
                 fontWeight: FontWeight.w800,
               ),
             ),

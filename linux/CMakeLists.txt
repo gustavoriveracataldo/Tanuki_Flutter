@@ -56,10 +56,35 @@ pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 pkg_check_modules(MEDIA_KIT_LINUX_MPV QUIET mpv)
 pkg_check_modules(MEDIA_KIT_LINUX_EPOXY QUIET epoxy)
 
-# Keep Linux builds reproducible on machines without libmpv-dev. When mpv and
-# epoxy development files are present, media_kit_video builds the embedded
-# player; otherwise Dart falls back to the system default player.
-if(MEDIA_KIT_LINUX_MPV_FOUND AND MEDIA_KIT_LINUX_EPOXY_FOUND)
+function(_media_kit_linux_has_valid_paths result_var prefix)
+  set(_valid TRUE)
+  foreach(_path IN LISTS ${prefix}_INCLUDE_DIRS)
+    if(_path AND NOT EXISTS "${_path}")
+      set(_valid FALSE)
+    endif()
+  endforeach()
+  foreach(_path IN LISTS ${prefix}_LIBRARY_DIRS)
+    if(_path AND NOT EXISTS "${_path}")
+      set(_valid FALSE)
+    endif()
+  endforeach()
+  set(${result_var} "${_valid}" PARENT_SCOPE)
+endfunction()
+
+# Keep Linux builds reproducible on machines without valid libmpv-dev/epoxy
+# development files. When mpv and epoxy are present and their pkg-config paths
+# resolve to real directories, media_kit_video builds the embedded player;
+# otherwise Dart falls back to the system default player.
+set(_media_kit_linux_mpv_valid FALSE)
+set(_media_kit_linux_epoxy_valid FALSE)
+if(MEDIA_KIT_LINUX_MPV_FOUND)
+  _media_kit_linux_has_valid_paths(_media_kit_linux_mpv_valid MEDIA_KIT_LINUX_MPV)
+endif()
+if(MEDIA_KIT_LINUX_EPOXY_FOUND)
+  _media_kit_linux_has_valid_paths(_media_kit_linux_epoxy_valid MEDIA_KIT_LINUX_EPOXY)
+endif()
+
+if(MEDIA_KIT_LINUX_MPV_FOUND AND MEDIA_KIT_LINUX_EPOXY_FOUND AND _media_kit_linux_mpv_valid AND _media_kit_linux_epoxy_valid)
   set(MEDIA_KIT_LIBS_AVAILABLE ON CACHE BOOL "Build media_kit with mpv video output on Linux" FORCE)
 else()
   set(MEDIA_KIT_LIBS_AVAILABLE OFF CACHE BOOL "Build media_kit without mpv headers on Linux" FORCE)
@@ -85,6 +110,15 @@ set_target_properties(${BINARY_NAME}
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# media_kit_video currently trips newer GCC/Clang warnings that are treated as
+# errors by this project. Keep the build working by suppressing the specific
+# warnings in its plugin target.
+if(TARGET media_kit_video_plugin)
+  target_compile_options(media_kit_video_plugin PRIVATE
+    -Wno-error=conversion-null
+    -Wno-error=sign-compare
+  )
+endif()
 
 # === Installation ===
 # By default, "installing" just makes a relocatable bundle in the build

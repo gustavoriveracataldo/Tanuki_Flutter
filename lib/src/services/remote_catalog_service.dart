@@ -88,6 +88,32 @@ class RemoteCatalogService {
     );
   }
 
+  Future<List<RemoteSearchCandidate>> discoverCatalogMovies({
+    int limit = 25,
+    int page = 1,
+  }) async {
+    final normalizedLimit = limit.clamp(1, 25).toInt();
+    final normalizedPage = page < 1 ? 1 : page;
+    final uri = Uri.https('api.jikan.moe', '/v4/anime', {
+      'type': 'movie',
+      'status': 'complete',
+      'order_by': 'start_date',
+      'sort': 'desc',
+      'page': '$normalizedPage',
+      'limit': '$normalizedLimit',
+      'sfw': 'true',
+    });
+    final response = await _get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'Jikan peliculas respondio ${response.statusCode}',
+      );
+    }
+    return _parseJikanCandidateList(response.body)
+        .where((candidate) => _candidateLooksMovie(candidate))
+        .toList(growable: false);
+  }
+
   Future<RemoteSearchCandidate?> fetchCatalogRandomFallback(
       {int attempts = 8}) async {
     final targetAttempts = attempts.clamp(1, 20).toInt();
