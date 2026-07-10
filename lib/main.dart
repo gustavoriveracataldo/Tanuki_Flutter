@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fvp/fvp.dart' as fvp;
@@ -8,7 +10,9 @@ import 'src/ui/toonami_app.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  fvp.registerWith();
+  if (Platform.isLinux || Platform.isWindows) {
+    fvp.registerWith();
+  }
   PlaybackBackend.ensureInitialized();
   await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   final controller = AppController();

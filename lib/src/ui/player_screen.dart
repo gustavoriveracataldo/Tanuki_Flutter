@@ -1,16 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' show FontFeature;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:video_player/video_player.dart' as vp;
 
 import '../app_controller.dart';
 import '../models.dart';
 import '../services/playback_backend.dart';
+import '../services/remote_hls_proxy.dart';
 import 'toonami_theme.dart';
 
 const _remotePlaybackUserAgent =
@@ -21,6 +25,10 @@ const _animeAv1PlaybackErrorFallbackDelay = Duration(seconds: 45);
 const _playerOverlayAutoHideDelay = Duration(seconds: 5);
 const _remoteSeekJumpThreshold = Duration(seconds: 45);
 const _remoteSeekStallDelay = Duration(seconds: 11);
+const _remoteOpeningRecoveryMaxAttempts = 1;
+const _androidHardwareDecoderCodecs = 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1';
+const _androidHardwareDecoderCodecsWithoutAv1 =
+    'h264,hevc,mpeg4,mpeg2video,vp8,vp9';
 
 enum _UpcomingCardPhase {
   none,
@@ -45,17 +53,23 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> {
   Player? _player;
   VideoController? _videoController;
+  vp.VideoPlayerController? _androidExoController;
+  RemoteHlsProxy? _remoteHlsProxy;
   String _status = 'Preparando reproductor...';
   String _error = '';
   bool _openedMedia = false;
   bool _completionCommitted = false;
+  bool _androidExoCompletionHandled = false;
+  bool _handlingAndroidExoError = false;
   bool _simklScrobbleActive = false;
   bool _subtitlesEnabled = true;
   bool _handlingPlaybackError = false;
   bool _playerOverlaysVisible = true;
   bool _playerControlsFocused = false;
-  final FocusNode _playerControlsRootFocusNode = FocusNode(debugLabel: 'playerControlsRoot');
-  final FocusNode _playerBackButtonFocusNode = FocusNode(debugLabel: 'playerBackButton');
+  final FocusNode _playerControlsRootFocusNode =
+      FocusNode(debugLabel: 'playerControlsRoot');
+  final FocusNode _playerBackButtonFocusNode =
+      FocusNode(debugLabel: 'playerBackButton');
   late VideoScaleMode _videoScaleMode;
   RemoteDirectStream? _currentResolvedStream;
   String _selectedRemoteSubtitleTrackKey = '';
@@ -64,11 +78,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
   RemoteProvider? _serverFallbackProvider;
   DateTime _lastPlaybackSave = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastPositionChangeAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _lastLargePositionJumpAt;
+  Duration _positionBeforeLastLargeJump = Duration.zero;
   Duration _lastPosition = Duration.zero;
   Duration _lastDuration = Duration.zero;
+  int _lastPositionDebugBucket = -1;
+  int _lastBufferDebugBucket = -1;
+  DateTime _lastAndroidExoRebuild = DateTime.fromMillisecondsSinceEpoch(0);
+  final Map<String, DateTime> _nativeLogLastPrintedAt = <String, DateTime>{};
   double _lastSimklScrobbleProgress = -1;
   Timer? _simklScrobbleTimer;
   Timer? _remoteVideoFrameWatchdogTimer;
+  Timer? _remoteOpeningRecoveryTimer;
   Timer? _deferredAnimeAv1PlaybackErrorTimer;
   Timer? _playerOverlayHideTimer;
   Timer? _animeAv1SeekRecoveryTimer;
@@ -81,11 +102,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
   StreamSubscription<int?>? _videoWidthSubscription;
   StreamSubscription<int?>? _videoHeightSubscription;
   StreamSubscription<bool>? _playingSubscription;
+  StreamSubscription<bool>? _bufferingSubscription;
+  StreamSubscription<Duration>? _bufferSubscription;
+  StreamSubscription<Track>? _trackSubscription;
+  StreamSubscription<Tracks>? _tracksSubscription;
+  StreamSubscription<VideoParams>? _videoParamsSubscription;
+  StreamSubscription<PlayerLog>? _nativeLogSubscription;
   bool _remotePlaybackAccepted = false;
   bool _remoteVideoFrameReady = false;
   bool _remoteVideoFrameFallbackHandled = false;
   int? _remoteVideoWidth;
   int? _remoteVideoHeight;
+  int _remoteOpeningRecoveryAttempts = 0;
   String _deferredAnimeAv1PlaybackError = '';
   String _currentPlaybackPath = '';
   _UpcomingCardPhase _upcomingCardPhase = _UpcomingCardPhase.none;
@@ -98,20 +126,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.initState();
     _videoScaleMode =
         widget.controller.videoScaleModeForEpisode(widget.episode);
-    if (PlaybackBackend.mediaKitAvailable) {
+    if (!_usesAndroidExoPlayer && PlaybackBackend.mediaKitAvailable) {
       _player = Player();
-      _videoController = VideoController(_player!);
+      _videoController = VideoController(
+        _player!,
+        configuration: VideoControllerConfiguration(
+          androidAttachSurfaceAfterVideoParameters:
+              Platform.isAndroid ? false : null,
+        ),
+      );
     }
-    _openEpisode();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_openEpisode());
+    });
   }
 
   @override
   void dispose() {
     unawaited(_pauseSimklScrobble());
-    unawaited(_persistPlayback(force: true));
+    _schedulePlaybackPersistAfterDispose();
     _simklScrobbleTimer?.cancel();
     _playerOverlayHideTimer?.cancel();
     _animeAv1SeekRecoveryTimer?.cancel();
+    _remoteOpeningRecoveryTimer?.cancel();
     _upcomingCardStartTimer?.cancel();
     _upcomingCardSequenceTimer?.cancel();
     _playerControlsRootFocusNode.dispose();
@@ -122,6 +162,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final durationSubscription = _durationSubscription;
     final completedSubscription = _completedSubscription;
     final playbackErrorSubscription = _playbackErrorSubscription;
+    final bufferSubscription = _bufferSubscription;
+    final trackSubscription = _trackSubscription;
+    final tracksSubscription = _tracksSubscription;
+    final videoParamsSubscription = _videoParamsSubscription;
+    final nativeLogSubscription = _nativeLogSubscription;
     if (positionSubscription != null) {
       unawaited(positionSubscription.cancel());
     }
@@ -134,20 +179,158 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (playbackErrorSubscription != null) {
       unawaited(playbackErrorSubscription.cancel());
     }
+    if (bufferSubscription != null) {
+      unawaited(bufferSubscription.cancel());
+    }
+    if (trackSubscription != null) {
+      unawaited(trackSubscription.cancel());
+    }
+    if (tracksSubscription != null) {
+      unawaited(tracksSubscription.cancel());
+    }
+    if (videoParamsSubscription != null) {
+      unawaited(videoParamsSubscription.cancel());
+    }
+    if (nativeLogSubscription != null) {
+      unawaited(nativeLogSubscription.cancel());
+    }
     _player?.dispose();
+    final androidExoController = _androidExoController;
+    if (androidExoController != null) {
+      androidExoController.removeListener(_handleAndroidExoValue);
+      unawaited(androidExoController.dispose());
+    }
+    unawaited(_remoteHlsProxy?.dispose());
     super.dispose();
   }
 
+  bool get _usesAndroidExoPlayer =>
+      Platform.isAndroid && widget.episode.isRemote;
+
+  void _schedulePlaybackPersistAfterDispose() {
+    final position = _lastPosition;
+    final duration = _lastDuration;
+    if (position <= Duration.zero && duration <= Duration.zero) {
+      return;
+    }
+    final controller = widget.controller;
+    final episode = widget.episode;
+    Timer.run(() {
+      unawaited(
+        controller.saveEpisodePlayback(
+          episode,
+          position: position,
+          duration: duration,
+        ),
+      );
+    });
+  }
+
+  void _debugPlayerEvent(String message) {
+    assert(() {
+      debugPrint('PlayerScreen: $message');
+      return true;
+    }());
+  }
+
+  String _debugMediaLabel(String value) {
+    final uri = Uri.tryParse(value);
+    if (uri == null || !uri.hasScheme) {
+      return value;
+    }
+    final path = uri.path;
+    final compactPath = path.length > 48 ? '${path.substring(0, 48)}...' : path;
+    return '${uri.scheme}://${uri.host}$compactPath';
+  }
+
+  String _debugHeadersLabel(Map<String, String>? headers) {
+    if (headers == null || headers.isEmpty) {
+      return '{}';
+    }
+    return '{${headers.entries.map((entry) {
+      final name = entry.key;
+      if (name.toLowerCase() == 'user-agent') {
+        return '$name=<${entry.value.length} chars>';
+      }
+      return '$name=${_debugMediaLabel(entry.value)}';
+    }).join(', ')}}';
+  }
+
+  String _debugShortText(String value, [int limit = 260]) {
+    final normalized = value.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (normalized.length <= limit) {
+      return normalized;
+    }
+    return '${normalized.substring(0, limit)}...';
+  }
+
+  String _debugPlayerState(Player player) {
+    final state = player.state;
+    return 'playing=${state.playing} buffering=${state.buffering} '
+        'position=${_formatPlaybackTime(state.position)} '
+        'duration=${_formatPlaybackTime(state.duration)} '
+        'size=${state.width ?? 0}x${state.height ?? 0}';
+  }
+
+  String _debugTrackLabel(dynamic track) {
+    final id = '${track.id}'.trim();
+    final codec = '${track.codec ?? ''}'.trim();
+    final decoder = '${track.decoder ?? ''}'.trim();
+    final title = '${track.title ?? ''}'.trim();
+    final language = '${track.language ?? ''}'.trim();
+    final size = track is VideoTrack && (track.w != null || track.h != null)
+        ? ' ${track.w ?? 0}x${track.h ?? 0}'
+        : '';
+    return [
+      if (id.isNotEmpty) 'id=$id',
+      if (codec.isNotEmpty) 'codec=$codec',
+      if (decoder.isNotEmpty) 'decoder=$decoder',
+      if (title.isNotEmpty) 'title=$title',
+      if (language.isNotEmpty) 'lang=$language',
+      if (size.isNotEmpty) size.trim(),
+    ].join(' ');
+  }
+
+  bool _shouldLogNativePlayerMessage(PlayerLog log) {
+    final level = log.level.toLowerCase();
+    if (level.contains('fatal') ||
+        level.contains('error') ||
+        level.contains('warn')) {
+      return true;
+    }
+    final text = log.text.toLowerCase();
+    return text.contains('http') ||
+        text.contains('hls') ||
+        text.contains('codec') ||
+        text.contains('decoder') ||
+        text.contains('video') ||
+        text.contains('audio') ||
+        text.contains('buffer') ||
+        text.contains('seek') ||
+        text.contains('timeout') ||
+        text.contains('failed');
+  }
+
   Future<void> _openEpisode() async {
+    _debugPlayerEvent(
+      'open start remote=${widget.episode.isRemote} '
+      'episode="${widget.episode.displayName}"',
+    );
     await widget.controller.setCurrentEntry(widget.episode);
+    await _remoteHlsProxy?.dispose();
+    _remoteHlsProxy = null;
     _cancelRemoteVideoFrameWatchdog();
     _resetUpcomingCards();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
     _remotePlaybackAccepted = false;
+    _remoteOpeningRecoveryAttempts = 0;
     _playerOverlaysVisible = true;
     _lastPosition = Duration.zero;
     _lastDuration = Duration.zero;
+    _lastPositionChangeAt = DateTime.now();
+    _lastPositionDebugBucket = -1;
+    _lastBufferDebugBucket = -1;
     if (path.isEmpty) {
       setState(() {
         _error = 'El episodio no tiene una ruta reproducible.';
@@ -171,6 +354,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _currentResolvedStream = resolved;
         _reconcileRemoteSubtitleSelection(resolved);
         path = resolved.playbackUrl;
+        _debugPlayerEvent(
+          'resolved provider=${resolved.provider?.id ?? 'unknown'} '
+          'mode=${resolved.selectedMode} kind=${resolved.playbackKind} '
+          'server=${resolved.server} url=${_debugMediaLabel(path)}',
+        );
         if (mounted) {
           setState(() {
             _status =
@@ -226,6 +414,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
+    if (_usesAndroidExoPlayer) {
+      await _openAndroidExoPlayer(path);
+      return;
+    }
+
     final player = _player;
     final videoController = _videoController;
     if (player == null || videoController == null) {
@@ -242,28 +435,47 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     try {
       await videoController.platform.future;
+      await _configureAndroidHardwareDecoding(player);
       _attachPlaybackTracking(player);
       final resumePosition =
           widget.controller.resumePositionForEpisode(widget.episode);
-      final startPosition = _mediaStartPositionFor(path, resumePosition);
-      _currentPlaybackPath = path;
-      await player.open(
-        Media(
-          path,
-          httpHeaders: _remoteMediaHeaders(path),
-          start: startPosition,
-        ),
-        play: true,
+      final startPosition = initialMediaStartPosition(
+        resumePosition: resumePosition,
+        canStartAtPosition: _shouldUseStartPositionForPath(path),
       );
+      final mediaHeaders = _remoteMediaHeaders(path);
+      if (shouldProxyZillaHls(path)) {
+        final proxy = RemoteHlsProxy();
+        _remoteHlsProxy = proxy;
+        path = await proxy.start(path, headers: mediaHeaders);
+        _debugPlayerEvent('using local HLS compatibility proxy');
+      }
+      _currentPlaybackPath = path;
+      _debugPlayerEvent(
+        'player.open url=${_debugMediaLabel(path)} '
+        'resume=${resumePosition == null ? 'none' : _formatPlaybackTime(resumePosition)} '
+        'start=${startPosition == null ? 'none' : _formatPlaybackTime(startPosition)} '
+        'headers=${_debugHeadersLabel(mediaHeaders)}',
+      );
+      await _openPlayerMedia(
+        player,
+        path: path,
+        headers: mediaHeaders,
+        start: startPosition,
+      );
+      _debugPlayerEvent('player.open returned ${_debugPlayerState(player)}');
       unawaited(_applyRemoteSubtitleTrack(player));
-      if (resumePosition != null && startPosition == null) {
+      if (resumePosition != null && !_shouldUseStartPositionForPath(path)) {
         await player.seek(resumePosition);
         _lastPosition = resumePosition;
-      } else if (startPosition != null) {
-        _lastPosition = startPosition;
+        _lastPositionChangeAt = DateTime.now();
+      } else {
+        _lastPosition = startPosition ?? Duration.zero;
+        _lastPositionChangeAt = DateTime.now();
       }
       _attachPlaybackErrorFallback(player);
       _attachRemoteVideoFrameWatchdog(player);
+      _scheduleRemoteOpeningRecovery(resumePosition ?? startPosition);
       _startSimklScrobble();
       if (!mounted) {
         return;
@@ -300,6 +512,212 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  Future<void> _openAndroidExoPlayer(String path) async {
+    final previous = _androidExoController;
+    if (previous != null) {
+      previous.removeListener(_handleAndroidExoValue);
+      await previous.dispose();
+    }
+    _androidExoController = null;
+    _androidExoCompletionHandled = false;
+    _handlingAndroidExoError = false;
+
+    final headers = _remoteMediaHeaders(path) ?? const <String, String>{};
+    final formatHint =
+        (_currentResolvedStream?.playbackKind.toLowerCase() == 'hls' ||
+                path.toLowerCase().contains('.m3u8') ||
+                path.toLowerCase().contains('/m3u8/'))
+            ? vp.VideoFormat.hls
+            : null;
+    final controller = vp.VideoPlayerController.networkUrl(
+      Uri.parse(path),
+      formatHint: formatHint,
+      httpHeaders: headers,
+      videoPlayerOptions: vp.VideoPlayerOptions(
+        mixWithOthers: false,
+        allowBackgroundPlayback: false,
+      ),
+    );
+    _androidExoController = controller;
+    controller.addListener(_handleAndroidExoValue);
+    _debugPlayerEvent(
+      'ExoPlayer open url=${_debugMediaLabel(path)} '
+      'format=${formatHint?.name ?? 'auto'} '
+      'headers=${_debugHeadersLabel(headers)}',
+    );
+
+    try {
+      await controller.initialize().timeout(const Duration(seconds: 30));
+      final resumePosition =
+          widget.controller.resumePositionForEpisode(widget.episode);
+      await controller.seekTo(resumePosition ?? Duration.zero);
+      _lastPosition = resumePosition ?? Duration.zero;
+      _lastDuration = controller.value.duration;
+      _lastPositionChangeAt = DateTime.now();
+      await _applyAndroidExoSubtitleTrack();
+      await controller.play();
+      _remotePlaybackAccepted = true;
+      _startSimklScrobble();
+      if (!mounted || _androidExoController != controller) {
+        return;
+      }
+      setState(() {
+        _openedMedia = true;
+        _error = '';
+        _status = resumePosition == null
+            ? 'Reproduciendo con ExoPlayer'
+            : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
+      });
+      _scheduleOpeningUpcomingCards();
+      _schedulePlayerOverlayHide();
+    } catch (error) {
+      controller.removeListener(_handleAndroidExoValue);
+      await controller.dispose();
+      if (_androidExoController == controller) {
+        _androidExoController = null;
+      }
+      if (!mounted) {
+        return;
+      }
+      if (await _retryRemoteFallback('ExoPlayer: $error')) {
+        return;
+      }
+      setState(() {
+        _error = 'No se pudo abrir el video con ExoPlayer: $error';
+        _status = 'Error de reproduccion';
+      });
+    }
+  }
+
+  void _handleAndroidExoValue() {
+    final controller = _androidExoController;
+    if (controller == null) {
+      return;
+    }
+    final value = controller.value;
+    if (value.hasError && _openedMedia && !_handlingAndroidExoError) {
+      _handlingAndroidExoError = true;
+      unawaited(_handleAndroidExoError(value.errorDescription ?? 'Error'));
+      return;
+    }
+    if (!value.isInitialized) {
+      return;
+    }
+    final previous = _lastPosition;
+    _lastPosition = value.position;
+    _lastDuration = value.duration;
+    if (value.position != previous) {
+      _lastPositionChangeAt = DateTime.now();
+      _remotePlaybackAccepted = true;
+    }
+    _maybeScheduleUpcomingCards(value.position);
+    _persistPlaybackThrottled();
+
+    if (value.isCompleted && !_androidExoCompletionHandled) {
+      _androidExoCompletionHandled = true;
+      unawaited(_commitPlaybackCompletion());
+      if (mounted) {
+        unawaited(_playNext());
+      }
+    }
+
+    final now = DateTime.now();
+    if (mounted &&
+        now.difference(_lastAndroidExoRebuild) >=
+            const Duration(milliseconds: 250)) {
+      _lastAndroidExoRebuild = now;
+      setState(() {});
+    }
+  }
+
+  Future<void> _handleAndroidExoError(String error) async {
+    _debugPlayerEvent('ExoPlayer error: $error');
+    try {
+      final retrying = await _retryRemoteFallback(error);
+      if (!retrying && mounted) {
+        setState(() {
+          _error = 'No se pudo reproducir el video remoto: $error';
+          _status = 'Error de reproduccion';
+        });
+      }
+    } finally {
+      _handlingAndroidExoError = false;
+    }
+  }
+
+  Future<void> _toggleAndroidExoPlayback() async {
+    final controller = _androidExoController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (controller.value.isPlaying) {
+      await controller.pause();
+    } else {
+      if (controller.value.isCompleted) {
+        await controller.seekTo(Duration.zero);
+        _androidExoCompletionHandled = false;
+      }
+      await controller.play();
+    }
+    _showPlayerOverlays();
+  }
+
+  Future<void> _seekAndroidExoPlayer(Duration target) async {
+    final controller = _androidExoController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    await controller.seekTo(target);
+    _lastPosition = target;
+    _lastPositionChangeAt = DateTime.now();
+    _androidExoCompletionHandled = false;
+    unawaited(_persistPlayback(force: true));
+    _showPlayerOverlays();
+  }
+
+  Future<void> _applyAndroidExoSubtitleTrack() async {
+    final controller = _androidExoController;
+    if (controller == null) {
+      return;
+    }
+    if (!_subtitlesEnabled) {
+      await controller.setClosedCaptionFile(null);
+      return;
+    }
+    _reconcileRemoteSubtitleSelection(_currentResolvedStream);
+    final track = selectRemoteSubtitleTrack(
+      _currentResolvedStream,
+      selectedKey: _selectedRemoteSubtitleTrackKey,
+    );
+    if (track == null) {
+      await controller.setClosedCaptionFile(null);
+      return;
+    }
+    _selectedRemoteSubtitleTrackKey = remoteSubtitleTrackKey(track);
+    await controller.setClosedCaptionFile(_loadAndroidExoCaption(track));
+  }
+
+  Future<vp.ClosedCaptionFile> _loadAndroidExoCaption(
+    RemoteSubtitleTrack track,
+  ) async {
+    final response = await http.get(
+      Uri.parse(track.url),
+      headers: _remoteMediaHeaders(track.url),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw HttpException(
+        'Subtitle HTTP ${response.statusCode}',
+        uri: Uri.parse(track.url),
+      );
+    }
+    final body = utf8.decode(response.bodyBytes, allowMalformed: true);
+    if (track.url.toLowerCase().contains('.vtt') ||
+        body.trimLeft().startsWith('WEBVTT')) {
+      return vp.WebVTTCaptionFile(body);
+    }
+    return vp.SubRipCaptionFile(body);
+  }
+
   void _attachPlaybackErrorFallback(Player player) {
     final playbackErrorSubscription = _playbackErrorSubscription;
     if (playbackErrorSubscription != null) {
@@ -314,6 +732,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (trimmed.isEmpty) {
         return;
       }
+      _debugPlayerEvent(
+        'player error "$trimmed" ${_debugPlayerState(player)}',
+      );
       unawaited(_handleRemotePlaybackError(trimmed));
     });
   }
@@ -322,6 +743,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     String error, {
     bool forceImmediate = false,
   }) async {
+    _debugPlayerEvent(
+      'handle remote error force=$forceImmediate error="$error"',
+    );
     if (_handlingPlaybackError || !mounted || !widget.episode.isRemote) {
       return;
     }
@@ -350,10 +774,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<bool> _retryRemoteFallback(String reason) async {
+    _debugPlayerEvent(
+      'retry remote fallback requested reason="${_debugShortText(reason)}" '
+      'streamProvider=${_currentResolvedStream?.provider?.id ?? 'none'} '
+      'episodeProvider=${widget.episode.provider?.id ?? 'none'} '
+      'failedProviders=${_failedRemoteProviders.map((p) => p.id).join(',')} '
+      'failedServers=${_failedRemoteServers.join(',')}',
+    );
     if (!mounted || !widget.episode.isRemote) {
       return false;
     }
     if (_shouldKeepCurrentRemoteSource()) {
+      _debugPlayerEvent('fallback skipped because current source is accepted');
       return false;
     }
     _cancelDeferredAnimeAv1PlaybackError();
@@ -361,6 +793,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _currentResolvedStream?.provider ?? widget.episode.provider;
     if (provider != null &&
         await _retryRemoteServerFallback(provider, reason)) {
+      _debugPlayerEvent(
+          'fallback will retry another server for ${provider.id}');
       return true;
     }
     if (provider == null ||
@@ -368,6 +802,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         provider == RemoteProvider.animeFlv ||
         provider == RemoteProvider.catalog ||
         !_failedRemoteProviders.add(provider)) {
+      _debugPlayerEvent(
+        'fallback stopped provider=${provider?.id ?? 'none'}',
+      );
       return false;
     }
 
@@ -394,6 +831,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<bool> _retryRemoteServerResolveMiss(RemoteDirectStream stream) async {
+    _debugPlayerEvent(
+      'server resolve miss provider=${stream.provider?.id ?? 'none'} '
+      'server=${stream.server} modes=${stream.availableModes.join(',')}',
+    );
     if (!mounted || !widget.episode.isRemote) {
       return false;
     }
@@ -428,8 +869,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       failedProviders: _failedRemoteProviders,
     );
     if (provider == null || !_failedRemoteProviders.add(provider)) {
+      _debugPlayerEvent('provider resolve miss has no next provider');
       return false;
     }
+    _debugPlayerEvent('provider resolve miss excludes ${provider.id}');
 
     _failedRemoteServers.clear();
     _serverFallbackProvider = null;
@@ -448,9 +891,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   ) async {
     _cancelDeferredAnimeAv1PlaybackError();
     final server = _currentResolvedStream?.server.trim() ?? '';
+    _debugPlayerEvent(
+      'server fallback check provider=${provider.id} server=$server '
+      'reason="${_debugShortText(reason)}"',
+    );
     if (!_supportsRemoteServerFallback(provider) ||
         server.isEmpty ||
         !_failedRemoteServers.add(server)) {
+      _debugPlayerEvent('server fallback unavailable');
       return false;
     }
 
@@ -492,23 +940,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     _videoWidthSubscription = player.stream.width.listen((width) {
       _remoteVideoWidth = width;
+      _debugPlayerEvent('width=$width ${_debugPlayerState(player)}');
       if (_hasRemoteVideoFrame) {
         _markRemoteVideoFrameReady();
       }
     });
     _videoHeightSubscription = player.stream.height.listen((height) {
       _remoteVideoHeight = height;
+      _debugPlayerEvent('height=$height ${_debugPlayerState(player)}');
       if (_hasRemoteVideoFrame) {
         _markRemoteVideoFrameReady();
       }
     });
     _playingSubscription = player.stream.playing.listen((playing) {
+      _debugPlayerEvent('playing=$playing ${_debugPlayerState(player)}');
       if (playing) {
         _armRemoteVideoFrameWatchdog(player);
       } else {
         _remoteVideoFrameWatchdogTimer?.cancel();
         _remoteVideoFrameWatchdogTimer = null;
       }
+    });
+    _bufferingSubscription = player.stream.buffering.listen((buffering) {
+      _debugPlayerEvent('buffering=$buffering ${_debugPlayerState(player)}');
     });
     if (player.state.playing) {
       _armRemoteVideoFrameWatchdog(player);
@@ -552,6 +1006,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _armRemoteVideoFrameWatchdog(player);
           return;
         }
+        _debugPlayerEvent(
+          'missing video frame watchdog fallback ${_debugPlayerState(player)}',
+        );
         _remoteVideoFrameFallbackHandled = true;
         unawaited(
           _retryRemoteFallback('AnimeAV1 reprodujo audio pero no video'),
@@ -570,9 +1027,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _cancelDeferredAnimeAv1PlaybackError();
     _remoteVideoFrameWatchdogTimer?.cancel();
     _remoteVideoFrameWatchdogTimer = null;
+    _remoteOpeningRecoveryTimer?.cancel();
+    _remoteOpeningRecoveryTimer = null;
+    _debugPlayerEvent(
+      'video frame ready ${_remoteVideoWidth ?? 0}x${_remoteVideoHeight ?? 0}',
+    );
   }
 
   bool _shouldKeepCurrentRemoteSource() {
+    if (_shouldWatchAnimeAv1VideoFrame() && !_hasRemoteVideoFrame) {
+      return false;
+    }
     return _remotePlaybackAccepted ||
         _remoteVideoFrameReady ||
         _hasRemoteVideoFrame;
@@ -581,9 +1046,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void _cancelRemoteVideoFrameWatchdog() {
     _remoteVideoFrameWatchdogTimer?.cancel();
     _remoteVideoFrameWatchdogTimer = null;
+    _remoteOpeningRecoveryTimer?.cancel();
+    _remoteOpeningRecoveryTimer = null;
     final videoWidthSubscription = _videoWidthSubscription;
     final videoHeightSubscription = _videoHeightSubscription;
     final playingSubscription = _playingSubscription;
+    final bufferingSubscription = _bufferingSubscription;
     if (videoWidthSubscription != null) {
       unawaited(videoWidthSubscription.cancel());
       _videoWidthSubscription = null;
@@ -595,6 +1063,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (playingSubscription != null) {
       unawaited(playingSubscription.cancel());
       _playingSubscription = null;
+    }
+    if (bufferingSubscription != null) {
+      unawaited(bufferingSubscription.cancel());
+      _bufferingSubscription = null;
     }
     _remoteVideoFrameReady = false;
     _remoteVideoFrameFallbackHandled = false;
@@ -707,6 +1179,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!widget.episode.isRemote) {
       return;
     }
+    _debugPlayerEvent('manual reload remote source');
     _failedRemoteProviders.clear();
     _failedRemoteServers.clear();
     _serverFallbackProvider = null;
@@ -716,6 +1189,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _remotePlaybackAccepted = false;
     _completionCommitted = false;
     await _pauseSimklScrobble();
+    final androidExoController = _androidExoController;
+    if (androidExoController != null) {
+      androidExoController.removeListener(_handleAndroidExoValue);
+      await androidExoController.dispose();
+      _androidExoController = null;
+    }
     await _player?.stop();
     if (!mounted) {
       return;
@@ -745,6 +1224,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final positionSubscription = _positionSubscription;
     final durationSubscription = _durationSubscription;
     final completedSubscription = _completedSubscription;
+    final bufferSubscription = _bufferSubscription;
+    final trackSubscription = _trackSubscription;
+    final tracksSubscription = _tracksSubscription;
+    final videoParamsSubscription = _videoParamsSubscription;
+    final nativeLogSubscription = _nativeLogSubscription;
     if (positionSubscription != null) {
       unawaited(positionSubscription.cancel());
     }
@@ -754,16 +1238,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (completedSubscription != null) {
       unawaited(completedSubscription.cancel());
     }
+    if (bufferSubscription != null) {
+      unawaited(bufferSubscription.cancel());
+    }
+    if (trackSubscription != null) {
+      unawaited(trackSubscription.cancel());
+    }
+    if (tracksSubscription != null) {
+      unawaited(tracksSubscription.cancel());
+    }
+    if (videoParamsSubscription != null) {
+      unawaited(videoParamsSubscription.cancel());
+    }
+    if (nativeLogSubscription != null) {
+      unawaited(nativeLogSubscription.cancel());
+    }
     _positionSubscription = player.stream.position.listen((position) {
       final previous = _lastPosition;
       _lastPosition = position;
       _lastPositionChangeAt = DateTime.now();
+      final bucket = position.inSeconds ~/ 30;
+      if (position > Duration.zero && bucket != _lastPositionDebugBucket) {
+        _lastPositionDebugBucket = bucket;
+        _debugPlayerEvent('progress ${_debugPlayerState(player)}');
+      }
       if (widget.episode.isRemote && position > Duration.zero) {
         _remotePlaybackAccepted = true;
       }
       if (widget.episode.isRemote &&
           previous > Duration.zero &&
+          position > const Duration(seconds: 3) &&
           _durationDistance(previous, position) >= _remoteSeekJumpThreshold) {
+        _lastLargePositionJumpAt = DateTime.now();
+        _positionBeforeLastLargeJump = previous;
+        _debugPlayerEvent(
+          'position jump ${_formatPlaybackTime(previous)} -> '
+          '${_formatPlaybackTime(position)}',
+        );
         _scheduleRemoteSeekRecovery(position);
       }
       _maybeScheduleUpcomingCards(position);
@@ -771,16 +1282,75 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _durationSubscription = player.stream.duration.listen((duration) {
       _lastDuration = duration;
+      _debugPlayerEvent(
+        'duration=${_formatPlaybackTime(duration)} ${_debugPlayerState(player)}',
+      );
       _maybeScheduleUpcomingCards(_lastPosition);
       _persistPlaybackThrottled();
     });
     _completedSubscription = player.stream.completed.listen((completed) {
+      _debugPlayerEvent(
+        'completed=$completed ${_debugPlayerState(player)}',
+      );
       if (completed) {
+        if (shouldIgnoreRemoteCompletionAfterJump(
+          isRemote: widget.episode.isRemote,
+          jumpAt: _lastLargePositionJumpAt,
+          positionBeforeJump: _positionBeforeLastLargeJump,
+          duration: _lastDuration,
+          now: DateTime.now(),
+        )) {
+          _debugPlayerEvent('ignored completion after anomalous position jump');
+          return;
+        }
         unawaited(_commitPlaybackCompletion());
         if (mounted) {
           unawaited(_playNext());
         }
       }
+    });
+    _bufferSubscription = player.stream.buffer.listen((buffer) {
+      final bucket = buffer.inSeconds ~/ 30;
+      if (bucket == _lastBufferDebugBucket) {
+        return;
+      }
+      _lastBufferDebugBucket = bucket;
+      _debugPlayerEvent(
+        'buffer=${_formatPlaybackTime(buffer)} ${_debugPlayerState(player)}',
+      );
+    });
+    _trackSubscription = player.stream.track.listen((track) {
+      _debugPlayerEvent(
+        'selected tracks video=[${_debugTrackLabel(track.video)}] '
+        'audio=[${_debugTrackLabel(track.audio)}] '
+        'subtitle=[${_debugTrackLabel(track.subtitle)}]',
+      );
+    });
+    _tracksSubscription = player.stream.tracks.listen((tracks) {
+      _debugPlayerEvent(
+        'available tracks video=${tracks.video.length} '
+        'audio=${tracks.audio.length} subtitle=${tracks.subtitle.length} '
+        'firstVideo=[${tracks.video.isEmpty ? '' : _debugTrackLabel(tracks.video.first)}]',
+      );
+    });
+    _videoParamsSubscription = player.stream.videoParams.listen((params) {
+      _debugPlayerEvent('video params $params ${_debugPlayerState(player)}');
+    });
+    _nativeLogSubscription = player.stream.log.listen((log) {
+      if (!_shouldLogNativePlayerMessage(log)) {
+        return;
+      }
+      final throttleKey = _nativeLogThrottleKey(log);
+      final now = DateTime.now();
+      final lastPrintedAt = _nativeLogLastPrintedAt[throttleKey];
+      if (lastPrintedAt != null &&
+          now.difference(lastPrintedAt) < const Duration(seconds: 5)) {
+        return;
+      }
+      _nativeLogLastPrintedAt[throttleKey] = now;
+      _debugPlayerEvent(
+        'native ${log.level}/${log.prefix}: ${_debugShortText(log.text)}',
+      );
     });
   }
 
@@ -1055,8 +1625,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   EpisodeItem? _visibleUpcomingCardEpisode(List<EpisodeItem> nextEntries) {
     return switch (_upcomingCardPhase) {
-      _UpcomingCardPhase.next =>
-        nextEntries.isEmpty ? null : nextEntries.first,
+      _UpcomingCardPhase.next => nextEntries.isEmpty ? null : nextEntries.first,
       _UpcomingCardPhase.later =>
         nextEntries.length < 2 ? null : nextEntries[1],
       _ => null,
@@ -1115,20 +1684,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
           child: Stack(
             children: [
               Positioned.fill(
-                child: _openedMedia && _videoController != null
-                    ? _TanukiVideoTheme(
-                        child: Video(
-                          controller: _videoController!,
-                          fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                          subtitleViewConfiguration: SubtitleViewConfiguration(
-                            visible: _subtitlesEnabled,
-                          ),
-                        ),
+                child: _openedMedia &&
+                        _androidExoController?.value.isInitialized == true
+                    ? _AndroidExoVideoSurface(
+                        controller: _androidExoController!,
+                        fit: _boxFitForVideoScaleMode(_videoScaleMode),
+                        subtitlesEnabled: _subtitlesEnabled,
                       )
-                    : _PlayerFallback(
-                        episode: episode,
-                        error: _error,
-                      ),
+                    : _openedMedia && _videoController != null
+                        ? _TanukiVideoTheme(
+                            child: Video(
+                              controller: _videoController!,
+                              fit: _boxFitForVideoScaleMode(_videoScaleMode),
+                              subtitleViewConfiguration:
+                                  SubtitleViewConfiguration(
+                                visible: _subtitlesEnabled,
+                              ),
+                            ),
+                          )
+                        : _PlayerFallback(
+                            episode: episode,
+                            error: _error,
+                          ),
               ),
               Positioned(
                 left: 0,
@@ -1172,6 +1749,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         label: _visibleUpcomingCardLabel(),
                         labelColor: _visibleUpcomingCardColor(),
                         episode: visibleUpcomingCard,
+                      ),
+                    ),
+                  ),
+                ),
+              if (_openedMedia &&
+                  _androidExoController?.value.isInitialized == true)
+                Positioned(
+                  left: 14,
+                  right: 14,
+                  bottom: 10,
+                  child: IgnorePointer(
+                    ignoring: !_playerOverlaysVisible,
+                    child: AnimatedOpacity(
+                      opacity: _playerOverlaysVisible ? 1 : 0,
+                      duration: const Duration(milliseconds: 220),
+                      child: _AndroidExoControls(
+                        controller: _androidExoController!,
+                        onTogglePlayback: _toggleAndroidExoPlayback,
+                        onSeek: _seekAndroidExoPlayer,
+                        formatTime: _formatPlaybackTime,
+                        onFocusChanged: _setPlayerControlsFocused,
                       ),
                     ),
                   ),
@@ -1259,16 +1857,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  Duration? _mediaStartPositionFor(String path, Duration? resumePosition) {
-    if (resumePosition == null || resumePosition <= Duration.zero) {
-      return null;
-    }
-    if (_shouldUseStartPositionForPath(path)) {
-      return _safeRemoteStartPosition(resumePosition);
-    }
-    return null;
-  }
-
   bool _shouldUseStartPositionForPath(String path) {
     if (!widget.episode.isRemote) {
       return false;
@@ -1280,6 +1868,96 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return _looksLikeDirectVideo(path);
   }
 
+  Future<void> _configureAndroidHardwareDecoding(Player player) async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    final platform = player.platform;
+    if (platform is! NativePlayer) {
+      return;
+    }
+    final codecs = androidHardwareDecoderCodecs(
+      disableAv1: _shouldWatchAnimeAv1VideoFrame(),
+    );
+    if (widget.episode.isRemote) {
+      await platform.setProperty('cache-on-disk', 'no');
+    }
+    await platform.setProperty('rebase-start-time', 'yes');
+    _debugPlayerEvent(
+      'android hwdec-codecs=$codecs '
+      'diskCache=${widget.episode.isRemote ? 'off' : 'default'}',
+    );
+    await platform.setProperty('hwdec-codecs', codecs);
+  }
+
+  Future<void> _openPlayerMedia(
+    Player player, {
+    required String path,
+    required Map<String, String>? headers,
+    required Duration? start,
+  }) async {
+    final stabilizeAndroidAv1 =
+        Platform.isAndroid && _shouldWatchAnimeAv1VideoFrame();
+    final videoReady = stabilizeAndroidAv1
+        ? player.stream.videoParams
+            .firstWhere(
+              (params) =>
+                  (params.dw ?? 0) > 0 &&
+                  (params.dh ?? 0) > 0 &&
+                  (params.pixelformat?.isNotEmpty ?? false),
+            )
+            .timeout(const Duration(seconds: 12))
+        : null;
+    await player.open(
+      Media(path, httpHeaders: headers, start: start),
+      play: !stabilizeAndroidAv1,
+    );
+    if (!stabilizeAndroidAv1) {
+      return;
+    }
+    _debugPlayerEvent('waiting for Android AV1 video surface');
+    try {
+      await videoReady;
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      await _seekPrecisely(player, start ?? Duration.zero);
+      _debugPlayerEvent(
+        'Android AV1 surface ready; seeked to '
+        '${_formatPlaybackTime(start ?? Duration.zero)}',
+      );
+    } on TimeoutException {
+      _debugPlayerEvent('Android AV1 video surface wait timed out');
+    }
+    await player.play();
+    _debugPlayerEvent('Android AV1 playback started after surface setup');
+  }
+
+  Future<void> _seekPrecisely(Player player, Duration target) async {
+    final platform = player.platform;
+    if (platform is NativePlayer) {
+      await platform.command([
+        'seek',
+        (target.inMilliseconds / 1000).toStringAsFixed(3),
+        'absolute+exact',
+      ]);
+      return;
+    }
+    await player.seek(target);
+  }
+
+  String _nativeLogThrottleKey(PlayerLog log) {
+    final text = log.text.toLowerCase();
+    if (text.contains('obu_') ||
+        text.contains('obu data') ||
+        text.contains('temporal unit') ||
+        text.contains('leb128') ||
+        text.contains('out of range') ||
+        text.contains('failed to read unit') ||
+        text.contains('invalid obu')) {
+      return '${log.prefix}:av1-parse';
+    }
+    return '${log.prefix}:${log.text.trim()}';
+  }
+
   Duration _safeRemoteStartPosition(Duration position) {
     if (position <= const Duration(seconds: 2)) {
       return Duration.zero;
@@ -1287,8 +1965,61 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return position - const Duration(seconds: 2);
   }
 
+  void _scheduleRemoteOpeningRecovery(Duration? target) {
+    _remoteOpeningRecoveryTimer?.cancel();
+    _remoteOpeningRecoveryTimer = null;
+    if (target == null ||
+        target <= Duration.zero ||
+        !_shouldWatchAnimeAv1VideoFrame()) {
+      return;
+    }
+    _debugPlayerEvent(
+      'opening recovery armed target=${_formatPlaybackTime(target)}',
+    );
+    _remoteOpeningRecoveryTimer = Timer(_remoteSeekStallDelay, () {
+      final player = _player;
+      if (!mounted ||
+          player == null ||
+          !_openedMedia ||
+          !widget.episode.isRemote ||
+          !_shouldWatchAnimeAv1VideoFrame()) {
+        return;
+      }
+      if (!shouldRecoverRemoteOpeningStall(
+        isPlaying: player.state.playing,
+        isBuffering: player.state.buffering,
+        position: player.state.position,
+        target: target,
+        width: _remoteVideoWidth,
+        height: _remoteVideoHeight,
+      )) {
+        _debugPlayerEvent(
+          'opening recovery skipped ${_debugPlayerState(player)}',
+        );
+        return;
+      }
+      if (_remoteOpeningRecoveryAttempts >= _remoteOpeningRecoveryMaxAttempts) {
+        _debugPlayerEvent(
+          'opening recovery fallback after $_remoteOpeningRecoveryAttempts '
+          'attempts ${_debugPlayerState(player)}',
+        );
+        unawaited(
+          _retryRemoteFallback('AnimeAV1 no entrego video tras reanudar'),
+        );
+        return;
+      }
+      _remoteOpeningRecoveryAttempts += 1;
+      _debugPlayerEvent(
+        'opening recovery attempt $_remoteOpeningRecoveryAttempts '
+        'target=${_formatPlaybackTime(target)} ${_debugPlayerState(player)}',
+      );
+      unawaited(_recoverRemoteSeek(target));
+    });
+  }
+
   void _scheduleRemoteSeekRecovery(Duration target) {
     _animeAv1SeekRecoveryTimer?.cancel();
+    _remoteOpeningRecoveryAttempts = _remoteOpeningRecoveryMaxAttempts;
     _animeAv1SeekRecoveryTimer = Timer(_remoteSeekStallDelay, () {
       final player = _player;
       if (!mounted ||
@@ -1307,6 +2038,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (!player.state.buffering && !player.state.playing) {
         return;
       }
+      _debugPlayerEvent(
+        'seek recovery target=${_formatPlaybackTime(target)} '
+        '${_debugPlayerState(player)}',
+      );
       unawaited(_recoverRemoteSeek(target));
     });
     unawaited(_persistPlayback(force: true));
@@ -1320,6 +2055,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         !_shouldUseStartPositionForPath(path)) {
       return;
     }
+    _remoteOpeningRecoveryTimer?.cancel();
+    _remoteOpeningRecoveryTimer = null;
     if (mounted) {
       setState(() {
         _status = 'Recuperando stream...';
@@ -1328,17 +2065,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     try {
       final start = _safeRemoteStartPosition(target);
-      await player.open(
-        Media(
-          path,
-          httpHeaders: _remoteMediaHeaders(path),
-          start: start,
-        ),
-        play: true,
+      _debugPlayerEvent(
+        'recover open url=${_debugMediaLabel(path)} '
+        'target=${_formatPlaybackTime(target)} '
+        'start=${_formatPlaybackTime(start)}',
+      );
+      await _openPlayerMedia(
+        player,
+        path: path,
+        headers: _remoteMediaHeaders(path),
+        start: start,
       );
       _lastPosition = start;
       _lastPositionChangeAt = DateTime.now();
       unawaited(_applyRemoteSubtitleTrack(player));
+      _scheduleRemoteOpeningRecovery(target);
       if (mounted) {
         setState(() {
           _openedMedia = true;
@@ -1357,6 +2098,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _applyRemoteSubtitleTrackIfReady() async {
+    if (_usesAndroidExoPlayer) {
+      await _applyAndroidExoSubtitleTrack();
+      return;
+    }
     final player = _player;
     if (player == null || !_openedMedia) {
       return;
@@ -1367,6 +2112,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _applyRemoteSubtitleTrack(Player player) async {
     try {
       if (!_subtitlesEnabled) {
+        _debugPlayerEvent('subtitle disabled: selecting no subtitle track');
         await player.setSubtitleTrack(SubtitleTrack.no());
         return;
       }
@@ -1377,11 +2123,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
       if (track == null) {
         if (!widget.episode.isRemote) {
+          _debugPlayerEvent('subtitle local auto track');
           await player.setSubtitleTrack(SubtitleTrack.auto());
         }
+        _debugPlayerEvent('subtitle no remote track selected');
         return;
       }
       _selectedRemoteSubtitleTrackKey = remoteSubtitleTrackKey(track);
+      _debugPlayerEvent(
+        'subtitle selected ${remoteSubtitleTrackLabel(track)} '
+        'url=${_debugMediaLabel(track.url)}',
+      );
       await player.setSubtitleTrack(
         SubtitleTrack.uri(
           track.url,
@@ -1868,6 +2620,168 @@ class _PlayerDialogSectionTitle extends StatelessWidget {
   }
 }
 
+class _AndroidExoVideoSurface extends StatelessWidget {
+  const _AndroidExoVideoSurface({
+    required this.controller,
+    required this.fit,
+    required this.subtitlesEnabled,
+  });
+
+  final vp.VideoPlayerController controller;
+  final BoxFit fit;
+  final bool subtitlesEnabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final value = controller.value;
+    final width = value.size.width > 0 ? value.size.width : 16.0;
+    final height = value.size.height > 0 ? value.size.height : 9.0;
+    final caption = subtitlesEnabled ? value.caption.text.trim() : '';
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        ClipRect(
+          child: FittedBox(
+            fit: fit,
+            child: SizedBox(
+              width: width,
+              height: height,
+              child: vp.VideoPlayer(controller),
+            ),
+          ),
+        ),
+        if (caption.isNotEmpty)
+          Positioned(
+            left: 24,
+            right: 24,
+            bottom: 78,
+            child: Text(
+              caption,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+                shadows: [
+                  Shadow(color: Colors.black, blurRadius: 4),
+                  Shadow(color: Colors.black, offset: Offset(1, 1)),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _AndroidExoControls extends StatefulWidget {
+  const _AndroidExoControls({
+    required this.controller,
+    required this.onTogglePlayback,
+    required this.onSeek,
+    required this.formatTime,
+    required this.onFocusChanged,
+  });
+
+  final vp.VideoPlayerController controller;
+  final Future<void> Function() onTogglePlayback;
+  final Future<void> Function(Duration target) onSeek;
+  final String Function(Duration duration) formatTime;
+  final ValueChanged<bool> onFocusChanged;
+
+  @override
+  State<_AndroidExoControls> createState() => _AndroidExoControlsState();
+}
+
+class _AndroidExoControlsState extends State<_AndroidExoControls> {
+  double? _dragPositionMs;
+
+  @override
+  Widget build(BuildContext context) {
+    final value = widget.controller.value;
+    final durationMs = value.duration.inMilliseconds.clamp(1, 1 << 53);
+    final currentMs = _dragPositionMs ??
+        value.position.inMilliseconds.clamp(0, durationMs).toDouble();
+    return Focus(
+      onFocusChange: widget.onFocusChanged,
+      child: Container(
+        height: 58,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xD9101419),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: TanukiColors.panelStroke),
+        ),
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: value.isPlaying ? 'Pausar' : 'Reproducir',
+              onPressed: () => unawaited(widget.onTogglePlayback()),
+              icon: Icon(
+                value.isPlaying ? Icons.pause : Icons.play_arrow,
+                color: TanukiColors.text,
+              ),
+            ),
+            SizedBox(
+              width: 54,
+              child: Text(
+                widget.formatTime(
+                  Duration(milliseconds: currentMs.round()),
+                ),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: TanukiColors.text,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+            Expanded(
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  activeTrackColor: TanukiColors.orange,
+                  inactiveTrackColor: const Color(0x665C6873),
+                  thumbColor: TanukiColors.orangeHot,
+                  overlayColor: const Color(0x33F0B760),
+                  trackHeight: 4,
+                ),
+                child: Slider(
+                  min: 0,
+                  max: durationMs.toDouble(),
+                  value: currentMs.clamp(0, durationMs.toDouble()),
+                  onChanged: (position) {
+                    setState(() {
+                      _dragPositionMs = position;
+                    });
+                  },
+                  onChangeEnd: (position) {
+                    setState(() {
+                      _dragPositionMs = null;
+                    });
+                    unawaited(
+                      widget.onSeek(Duration(milliseconds: position.round())),
+                    );
+                  },
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 54,
+              child: Text(
+                widget.formatTime(value.duration),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: TanukiColors.muted,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _TanukiVideoTheme extends StatelessWidget {
   const _TanukiVideoTheme({required this.child});
 
@@ -2261,6 +3175,44 @@ bool shouldWatchAnimeAv1VideoFrame(
       source.contains('zilla-networks.com');
 }
 
+Duration? initialMediaStartPosition({
+  required Duration? resumePosition,
+  required bool canStartAtPosition,
+}) {
+  if (resumePosition == null || resumePosition <= Duration.zero) {
+    return Duration.zero;
+  }
+  if (!canStartAtPosition) {
+    return null;
+  }
+  if (resumePosition <= const Duration(seconds: 2)) {
+    return Duration.zero;
+  }
+  return resumePosition - const Duration(seconds: 2);
+}
+
+String androidHardwareDecoderCodecs({required bool disableAv1}) {
+  return disableAv1
+      ? _androidHardwareDecoderCodecsWithoutAv1
+      : _androidHardwareDecoderCodecs;
+}
+
+bool shouldIgnoreRemoteCompletionAfterJump({
+  required bool isRemote,
+  required DateTime? jumpAt,
+  required Duration positionBeforeJump,
+  required Duration duration,
+  required DateTime now,
+}) {
+  if (!isRemote || jumpAt == null || duration <= Duration.zero) {
+    return false;
+  }
+  if (now.difference(jumpAt) > const Duration(seconds: 3)) {
+    return false;
+  }
+  return duration - positionBeforeJump > const Duration(seconds: 30);
+}
+
 bool shouldRetryMissingVideoFrame({
   required bool isPlaying,
   required bool isBuffering,
@@ -2275,6 +3227,31 @@ bool shouldRetryMissingVideoFrame({
     return false;
   }
   return position >= _remoteVideoFramePlaybackGrace;
+}
+
+bool shouldRecoverRemoteOpeningStall({
+  required bool isPlaying,
+  required bool isBuffering,
+  required Duration position,
+  required Duration target,
+  required int? width,
+  required int? height,
+}) {
+  if (target <= Duration.zero) {
+    return false;
+  }
+  if ((width ?? 0) > 0 && (height ?? 0) > 0) {
+    return false;
+  }
+  if (position <= const Duration(seconds: 2)) {
+    return true;
+  }
+  final distance = position.inMilliseconds - target.inMilliseconds;
+  final nearTarget = Duration(
+        milliseconds: distance < 0 ? -distance : distance,
+      ) <=
+      const Duration(seconds: 10);
+  return nearTarget && (isPlaying || isBuffering);
 }
 
 bool shouldDeferAnimeAv1PlaybackError({

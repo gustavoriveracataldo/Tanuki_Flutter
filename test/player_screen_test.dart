@@ -215,6 +215,103 @@ void main() {
     );
   });
 
+  test('recovers remote opening when resumed stream never advances', () {
+    expect(
+      shouldRecoverRemoteOpeningStall(
+        isPlaying: false,
+        isBuffering: true,
+        position: Duration.zero,
+        target: const Duration(minutes: 12),
+        width: null,
+        height: null,
+      ),
+      isTrue,
+    );
+  });
+
+  test('starts new and completed episodes at zero', () {
+    expect(
+      initialMediaStartPosition(
+        resumePosition: null,
+        canStartAtPosition: true,
+      ),
+      Duration.zero,
+    );
+  });
+
+  test('disables only AV1 hardware decoding for AnimeAV1 streams', () {
+    final codecs = androidHardwareDecoderCodecs(disableAv1: true);
+
+    expect(codecs.split(','), isNot(contains('av1')));
+    expect(codecs.split(','), containsAll(<String>['h264', 'hevc', 'vp9']));
+    expect(
+      androidHardwareDecoderCodecs(disableAv1: false).split(','),
+      contains('av1'),
+    );
+  });
+
+  test('ignores remote completion caused by a jump to the end', () {
+    final now = DateTime(2026, 7, 10);
+    expect(
+      shouldIgnoreRemoteCompletionAfterJump(
+        isRemote: true,
+        jumpAt: now.subtract(const Duration(seconds: 1)),
+        positionBeforeJump: const Duration(seconds: 10),
+        duration: const Duration(minutes: 24),
+        now: now,
+      ),
+      isTrue,
+    );
+  });
+
+  test('starts a remote resume slightly before saved progress', () {
+    expect(
+      initialMediaStartPosition(
+        resumePosition: const Duration(minutes: 10),
+        canStartAtPosition: true,
+      ),
+      const Duration(minutes: 9, seconds: 58),
+    );
+  });
+
+  test('seeks local media after opening instead of using media start', () {
+    expect(
+      initialMediaStartPosition(
+        resumePosition: const Duration(minutes: 10),
+        canStartAtPosition: false,
+      ),
+      isNull,
+    );
+  });
+
+  test('recovers remote opening when resumed stream stalls near target', () {
+    expect(
+      shouldRecoverRemoteOpeningStall(
+        isPlaying: true,
+        isBuffering: false,
+        position: const Duration(minutes: 11, seconds: 55),
+        target: const Duration(minutes: 12),
+        width: null,
+        height: null,
+      ),
+      isTrue,
+    );
+  });
+
+  test('does not recover remote opening after video dimensions arrive', () {
+    expect(
+      shouldRecoverRemoteOpeningStall(
+        isPlaying: true,
+        isBuffering: false,
+        position: const Duration(minutes: 12),
+        target: const Duration(minutes: 12),
+        width: 1920,
+        height: 1080,
+      ),
+      isFalse,
+    );
+  });
+
   test('defers early AnimeAV1 playback errors before fallback', () {
     expect(
       shouldDeferAnimeAv1PlaybackError(

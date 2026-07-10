@@ -52,6 +52,44 @@ void main() {
     expect(candidate?.trailerUrl, 'https://www.youtube.com/watch?v=demo123');
   });
 
+  test('normalizes Jikan youtube-nocookie trailer embeds', () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(request.url.toString(), 'https://api.jikan.moe/v4/random/anime');
+        return http.Response(
+          '''
+          {
+            "data": {
+              "mal_id": 123,
+              "title": "Embed Demo",
+              "url": "https://myanimelist.net/anime/123",
+              "type": "TV",
+              "episodes": 12,
+              "images": {
+                "jpg": {
+                  "large_image_url": "https://cdn.example.test/poster.jpg"
+                }
+              },
+              "trailer": {
+                "embed_url": "https://www.youtube-nocookie.com/embed/ODxfIvSgWuo?enablejsapi=1&wmode=opaque&autoplay=1"
+              }
+            }
+          }
+          ''',
+          200,
+          request: request,
+        );
+      }),
+    );
+
+    final candidate = await service.fetchCatalogRandomFallback();
+
+    expect(
+      candidate?.trailerUrl,
+      'https://www.youtube.com/watch?v=ODxfIvSgWuo',
+    );
+  });
+
   test('aggregate search skips disabled AnimeFLV provider', () async {
     final requestedHosts = <String>[];
     final service = RemoteCatalogService(
@@ -344,7 +382,7 @@ void main() {
 
     expect(calls.any((url) => url.contains('/3/search/tv')), isTrue);
     expect(calls.any((url) => url.contains('/v3/tv/1234')), isTrue);
-    expect(series.logoUrl, 'https://image.tmdb.org/t/p/w500/logo.png');
+    expect(series.logoUrl, 'https://image.tmdb.org/t/p/original/logo.png');
     expect(series.imageUrl, 'https://fanart.test/season.jpg');
     expect(
         series.backgroundUrl, 'https://image.tmdb.org/t/p/w1280/backdrop.jpg');
@@ -2296,6 +2334,32 @@ void main() {
       'https://video.xx.fbcdn.net/v/t42.1790-2/demo_hd.mp4'
       '?efg=$progressiveTag&bytestart=0',
     );
+  });
+
+  test('ignores social preview mp4 direct media candidates', () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://catalog.example.test/demo/1' => http.Response(
+              '''
+              <meta property="og:video" content="https://pbs.twimg.com/static/money/x-card-animation-v4.mp4">
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(_episode(
+      provider: RemoteProvider.catalog,
+      filePath: 'https://catalog.example.test/demo/1',
+      watchUrl: 'https://catalog.example.test/demo',
+      slug: 'demo',
+    ));
+
+    expect(stream, isNull);
   });
 
   test('uses Android WebView resolver fallback after HTTP resolver misses',

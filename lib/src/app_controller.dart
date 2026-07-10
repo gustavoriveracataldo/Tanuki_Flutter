@@ -187,6 +187,75 @@ String _seasonDisplayName(String season) {
   };
 }
 
+class TrailerDetailRequest {
+  const TrailerDetailRequest({
+    required this.id,
+    required this.title,
+    required this.trailerUrl,
+    this.seriesKey = '',
+    this.providerId = '',
+    this.slug = '',
+    this.watchUrl = '',
+    this.seriesUrl = '',
+    this.catalogId = 0,
+  });
+
+  final int id;
+  final String title;
+  final String trailerUrl;
+  final String seriesKey;
+  final String providerId;
+  final String slug;
+  final String watchUrl;
+  final String seriesUrl;
+  final int catalogId;
+
+  RemoteProvider? get provider => remoteProviderFromId(providerId);
+
+  RemoteSearchCandidate? toRemoteCandidate() {
+    final normalizedTitle = title.trim();
+    if (normalizedTitle.isEmpty) {
+      return null;
+    }
+    return RemoteSearchCandidate(
+      provider: provider ?? RemoteProvider.catalog,
+      slug: slug.trim(),
+      title: normalizedTitle,
+      watchUrl: watchUrl.trim().isNotEmpty ? watchUrl.trim() : seriesUrl.trim(),
+      seriesUrl: seriesUrl.trim(),
+      trailerUrl: trailerUrl.trim(),
+      catalogId: catalogId,
+    );
+  }
+
+  static TrailerDetailRequest? tryParse(String link, {required int id}) {
+    final uri = Uri.tryParse(link.trim());
+    if (uri == null ||
+        uri.scheme != 'tanuki' ||
+        uri.host != 'series' ||
+        uri.path != '/detail') {
+      return null;
+    }
+    final query = uri.queryParameters;
+    final title = query['title']?.trim() ?? '';
+    final trailerUrl = query['trailerUrl']?.trim() ?? '';
+    if (title.isEmpty && trailerUrl.isEmpty) {
+      return null;
+    }
+    return TrailerDetailRequest(
+      id: id,
+      title: title,
+      trailerUrl: trailerUrl,
+      seriesKey: query['seriesKey']?.trim() ?? '',
+      providerId: query['provider']?.trim() ?? '',
+      slug: query['slug']?.trim() ?? '',
+      watchUrl: query['watchUrl']?.trim() ?? '',
+      seriesUrl: query['seriesUrl']?.trim() ?? '',
+      catalogId: int.tryParse(query['catalogId']?.trim() ?? '') ?? 0,
+    );
+  }
+}
+
 class AppController extends ChangeNotifier {
   static const MethodChannel _deepLinkChannel = MethodChannel(
     'tanuki/deep_links',
@@ -228,6 +297,8 @@ class AppController extends ChangeNotifier {
   bool _isScanning = false;
   bool _isSearching = false;
   bool _isLoadingMoreSearchResults = false;
+  int _trailerDetailRequestSerial = 0;
+  TrailerDetailRequest? _pendingTrailerDetailRequest;
   bool _hasMoreSearchResults = false;
   bool _isSaving = false;
   bool _isRefreshingFillerMetadata = false;
@@ -243,12 +314,42 @@ class AppController extends ChangeNotifier {
   String _lastSearchQuery = '';
   int _searchPage = 1;
 
+  void _debugRemotePlayback(String message) {
+    assert(() {
+      debugPrint('AppControllerRemotePlayback: $message');
+      return true;
+    }());
+  }
+
+  String _debugRemoteUrlLabel(String value) {
+    final uri = Uri.tryParse(value);
+    if (uri == null || !uri.hasScheme) {
+      return value;
+    }
+    final path =
+        uri.path.length > 52 ? '${uri.path.substring(0, 52)}...' : uri.path;
+    return '${uri.scheme}://${uri.host}$path';
+  }
+
+  String _debugStreamLabel(RemoteDirectStream? stream) {
+    if (stream == null) {
+      return 'null';
+    }
+    return 'provider=${stream.provider?.id ?? 'none'} '
+        'kind=${stream.playbackKind} mode=${stream.selectedMode} '
+        'server=${stream.server} url=${_debugRemoteUrlLabel(stream.playbackUrl)} '
+        'page=${_debugRemoteUrlLabel(stream.pageUrl)} '
+        'subs=${stream.subtitleTracks.length} headers=${stream.httpHeaders.keys.join(',')}';
+  }
+
   AppState get state => _state;
   List<SeriesItem> get localLibrary => _localLibrary;
   List<SeriesItem> get remoteLibrary => _state.remoteLibrary;
   List<SeriesItem> get library => [..._localLibrary, ..._state.remoteLibrary];
   List<UserProfileState> get profiles => _state.profiles;
   List<RemoteSearchCandidate> get remoteResults => _remoteResults;
+  TrailerDetailRequest? get pendingTrailerDetailRequest =>
+      _pendingTrailerDetailRequest;
   SearchFormatFilter get searchFormatFilter => _searchFormatFilter;
   SearchSeasonFilter get searchSeasonFilter => _searchSeasonFilter;
   SearchYearFilter get searchYearFilter => _searchYearFilter;
@@ -360,6 +461,18 @@ class AppController extends ChangeNotifier {
   void setStatusMessage(String message) {
     _statusMessage = message.trim();
     notifyListeners();
+  }
+
+  void clearPendingTrailerDetailRequest(int requestId) {
+    if (_pendingTrailerDetailRequest?.id != requestId) {
+      return;
+    }
+    _pendingTrailerDetailRequest = null;
+    notifyListeners();
+  }
+
+  Future<void> handleInternalDeepLink(String link) async {
+    await _handleNativeDeepLink(link);
   }
 
   Future<void> setMyAnimeListClientId(String clientId) async {
@@ -892,11 +1005,23 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _handleNativeDeepLink(String link) async {
-    if (link.trim().isEmpty ||
-        !_myAnimeListService.looksLikeAuthorizationRedirect(link)) {
+    if (link.trim().isEmpty) {
       return;
     }
-    await completeMyAnimeListConnection(link);
+    if (_myAnimeListService.looksLikeAuthorizationRedirect(link)) {
+      await completeMyAnimeListConnection(link);
+      return;
+    }
+    final trailerDetailRequest = TrailerDetailRequest.tryParse(
+      link,
+      id: _trailerDetailRequestSerial + 1,
+    );
+    if (trailerDetailRequest == null) {
+      return;
+    }
+    _trailerDetailRequestSerial = trailerDetailRequest.id;
+    _pendingTrailerDetailRequest = trailerDetailRequest;
+    notifyListeners();
   }
 
   Future<void> chooseLibraryRoot() async {
@@ -1589,6 +1714,17 @@ class AppController extends ChangeNotifier {
     final preferredProvider = excluded.contains(usablePreferredProvider)
         ? null
         : usablePreferredProvider;
+    _debugRemotePlayback(
+      'resolve start episode="${episode.displayName}" '
+      'episodeProvider=${episode.provider?.id ?? 'none'} '
+      'preferred=${preferredProvider?.id ?? 'none'} '
+      'requestedPreferred=${requestedPreferredProvider?.id ?? 'none'} '
+      'excludedProviders=${excluded.map((p) => p.id).join(',')} '
+      'excludedServersProvider=${excludedRemoteServersProvider?.id ?? 'none'} '
+      'excludedServers=${excludedRemoteServers.join(',')} '
+      'animeAv1Mode=${animeAv1PlaybackModeFromId(preference.animeAv1Mode).id} '
+      'jkServer=${jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id}',
+    );
     final effectiveEpisode = _resolvePreferredRemoteEpisode(
       episode,
       preferredProvider,
@@ -1600,8 +1736,16 @@ class AppController extends ChangeNotifier {
       final playbackTarget = _normalizeRemoteEpisodeForPlayback(target);
       final provider = playbackTarget.provider;
       if (provider != null && excluded.contains(provider)) {
+        _debugRemotePlayback(
+          'skip provider=${provider.id} because it is excluded',
+        );
         return null;
       }
+      _debugRemotePlayback(
+        'resolve provider=${provider?.id ?? 'none'} '
+        'file=${_debugRemoteUrlLabel(playbackTarget.filePath)} '
+        'watch=${_debugRemoteUrlLabel(playbackTarget.watchUrl)}',
+      );
       final stream = await _remoteCatalog.resolveDirectStream(
         playbackTarget,
         preferredMode: animeAv1PlaybackModeFromId(preference.animeAv1Mode).id,
@@ -1617,7 +1761,12 @@ class AppController extends ChangeNotifier {
                 ? excludedRemoteServers
                 : const {},
       );
-      return _tagDirectStreamProvider(stream, provider);
+      final tagged = _tagDirectStreamProvider(stream, provider);
+      _debugRemotePlayback(
+        'resolve result provider=${provider?.id ?? 'none'} '
+        '${_debugStreamLabel(tagged)}',
+      );
+      return tagged;
     }
 
     final shouldLookupProvider = episode.isRemote &&
@@ -1632,6 +1781,7 @@ class AppController extends ChangeNotifier {
       if (series != null) {
         for (final provider in _dynamicRemoteProviderOrder(preferredProvider)
             .where((provider) => !excluded.contains(provider))) {
+          _debugRemotePlayback('lookup provider candidate ${provider.id}');
           final libraryEpisode = _resolvePreferredRemoteEpisode(
             episode,
             provider,
@@ -1644,16 +1794,26 @@ class AppController extends ChangeNotifier {
                   provider: provider,
                 );
           if (providerEpisode == null) {
+            _debugRemotePlayback(
+                'provider ${provider.id} has no episode match');
             continue;
           }
           final stream = await resolve(providerEpisode);
           if (stream != null) {
-            return _tagDirectStreamProvider(stream, provider);
+            final tagged = _tagDirectStreamProvider(stream, provider);
+            _debugRemotePlayback(
+              'lookup selected provider=${provider.id} '
+              '${_debugStreamLabel(tagged)}',
+            );
+            return tagged;
           }
+          _debugRemotePlayback('provider ${provider.id} returned null stream');
         }
       }
     }
-    return resolve(effectiveEpisode);
+    final resolved = await resolve(effectiveEpisode);
+    _debugRemotePlayback('resolve finished ${_debugStreamLabel(resolved)}');
+    return resolved;
   }
 
   EpisodeItem _normalizeRemoteEpisodeForPlayback(EpisodeItem episode) {
@@ -2506,9 +2666,8 @@ class AppController extends ChangeNotifier {
       progress: nextProgress,
       lastPlayedSeriesName: key,
     );
-    final matchingKeys = completedSeries
-        ? _matchingSeriesKeysForState(series)
-        : <String>{key};
+    final matchingKeys =
+        completedSeries ? _matchingSeriesKeysForState(series) : <String>{key};
     if (completedSeries) {
       playlist = playlist.copyWith(
         selectedSeries: {...playlist.selectedSeries}..removeAll(matchingKeys),

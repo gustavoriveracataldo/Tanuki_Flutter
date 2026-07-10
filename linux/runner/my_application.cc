@@ -19,6 +19,50 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
+static bool can_create_opengl_context() {
+  GtkWidget* probe_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+  gtk_window_set_default_size(GTK_WINDOW(probe_window), 1, 1);
+  gtk_widget_realize(probe_window);
+
+  GdkWindow* window = gtk_widget_get_window(probe_window);
+  if (window == nullptr) {
+    g_warning("OpenGL renderer unavailable; using software renderer: no GDK window");
+    gtk_widget_destroy(probe_window);
+    return false;
+  }
+
+  g_autoptr(GError) error = nullptr;
+  g_autoptr(GdkGLContext) context =
+      gdk_window_create_gl_context(window, &error);
+  if (context == nullptr) {
+    g_warning("OpenGL renderer unavailable; using software renderer: %s",
+              error != nullptr ? error->message : "unknown error");
+    gtk_widget_destroy(probe_window);
+    return false;
+  }
+
+  if (!gdk_gl_context_realize(context, &error)) {
+    g_warning("OpenGL renderer unavailable; using software renderer: %s",
+              error != nullptr ? error->message : "unknown error");
+    gtk_widget_destroy(probe_window);
+    return false;
+  }
+
+  gtk_widget_destroy(probe_window);
+  return true;
+}
+
+static void configure_flutter_linux_renderer() {
+  const gchar* renderer = g_getenv("FLUTTER_LINUX_RENDERER");
+  if (renderer != nullptr && renderer[0] != '\0') {
+    return;
+  }
+
+  if (!can_create_opengl_context()) {
+    g_setenv("FLUTTER_LINUX_RENDERER", "software", TRUE);
+  }
+}
+
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
@@ -53,6 +97,7 @@ static void my_application_activate(GApplication* application) {
   }
 
   gtk_window_set_default_size(window, 1280, 720);
+  configure_flutter_linux_renderer();
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(

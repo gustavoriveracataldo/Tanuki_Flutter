@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -37,6 +38,7 @@ class RemoteWebResolver(private val activity: Activity) {
         val provider = readString(args["provider"])
         val pageUrl = readString(args["pageUrl"])
         if (pageUrl.isBlank()) {
+            Log.w(logTag, "resolveRemoteStream ignored: empty pageUrl")
             result.success(null)
             return
         }
@@ -48,6 +50,12 @@ class RemoteWebResolver(private val activity: Activity) {
             .filter { it.isNotBlank() }
             .toSet()
         val timeoutMs = readLong(args["timeoutMs"]).coerceIn(8_000L, 45_000L)
+        Log.d(
+            logTag,
+            "resolveRemoteStream start provider=$provider page=${shortUrl(pageUrl)} " +
+                "referer=${shortUrl(referer)} preferredServer=$preferredServer " +
+                "excluded=$excludedServers timeoutMs=$timeoutMs",
+        )
         val currentPage = AtomicReference(pageUrl)
         val completed = AtomicBoolean(false)
         val userAgent = defaultUserAgent()
@@ -60,7 +68,8 @@ class RemoteWebResolver(private val activity: Activity) {
 
         val webView = try {
             WebView(activity)
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            Log.w(logTag, "resolveRemoteStream failed creating WebView", error)
             result.success(null)
             return
         }
@@ -79,6 +88,16 @@ class RemoteWebResolver(private val activity: Activity) {
         fun finish(payload: Map<String, Any?>?) {
             if (!completed.compareAndSet(false, true)) {
                 return
+            }
+            if (payload == null) {
+                Log.d(logTag, "resolveRemoteStream finish: null")
+            } else {
+                Log.d(
+                    logTag,
+                    "resolveRemoteStream finish: kind=${payload["playbackKind"]} " +
+                        "server=${payload["server"]} url=${shortUrl(readString(payload["playbackUrl"]))} " +
+                        "page=${shortUrl(readString(payload["pageUrl"]))}",
+                )
             }
             handler.removeCallbacks(timeoutRunnable)
             pendingCandidateRunnable?.let(handler::removeCallbacks)
@@ -132,6 +151,11 @@ class RemoteWebResolver(private val activity: Activity) {
                 pendingCandidate = current + ("subtitleTracks" to subtitleTracks.toList())
                 schedulePendingCandidate()
             }
+            Log.d(
+                logTag,
+                "subtitle-track detected label=${label.ifBlank { "Subtitulos" }} " +
+                    "language=$language url=${shortUrl(subtitleUrl)}",
+            )
         }
 
         fun completeCandidate(rawUrl: String, rawKind: String = "", rawPageUrl: String = "", rawServer: String = "") {
@@ -143,12 +167,14 @@ class RemoteWebResolver(private val activity: Activity) {
             val playbackUrl = normalizeZillaPlayUrl(normalizedUrl).ifBlank { normalizedUrl }
             val playbackKind = inferPlaybackKind(playbackUrl, rawKind)
             if (playbackKind.isBlank()) {
+                Log.d(logTag, "candidate ignored: unsupported url=${shortUrl(playbackUrl)}")
                 return
             }
             val server = normalizeServer(rawServer).ifBlank {
                 normalizeServer(normalizedUrl).ifBlank { normalizeServer(page) }
             }
             if (server.isNotBlank() && excludedServers.contains(server)) {
+                Log.d(logTag, "candidate ignored: excluded server=$server url=${shortUrl(playbackUrl)}")
                 return
             }
             if (server.isNotBlank()) {
@@ -176,8 +202,18 @@ class RemoteWebResolver(private val activity: Activity) {
                 preferredServer = preferredServer,
             )
             if (score < pendingCandidateScore && pendingCandidate != null) {
+                Log.d(
+                    logTag,
+                    "candidate ignored: lower score=$score current=$pendingCandidateScore " +
+                        "server=$server kind=$playbackKind url=${shortUrl(playbackUrl)}",
+                )
                 return
             }
+            Log.d(
+                logTag,
+                "candidate accepted: score=$score kind=$playbackKind server=$server " +
+                    "url=${shortUrl(playbackUrl)} page=${shortUrl(page)} headers=${headers.keys}",
+            )
             pendingCandidate = payload
             pendingCandidateScore = score
             schedulePendingCandidate()
@@ -185,6 +221,11 @@ class RemoteWebResolver(private val activity: Activity) {
 
         timeoutRunnable = Runnable {
             val failedServer = normalizeServer(lastAttemptedServer)
+            Log.w(
+                logTag,
+                "resolveRemoteStream timeout page=${shortUrl(currentPage.get().ifBlank { pageUrl })} " +
+                    "lastServer=$failedServer",
+            )
             if (failedServer.isBlank()) {
                 finish(null)
             } else {
@@ -277,10 +318,12 @@ class RemoteWebResolver(private val activity: Activity) {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 currentPage.set(url?.trim().orEmpty().ifBlank { currentPage.get() })
+                Log.d(logTag, "WebView page started ${shortUrl(currentPage.get())}")
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 currentPage.set(url?.trim().orEmpty().ifBlank { currentPage.get() })
+                Log.d(logTag, "WebView page finished ${shortUrl(currentPage.get())}")
                 injectAutomation()
                 handler.postDelayed({ injectAutomation() }, 900L)
                 handler.postDelayed({ injectAutomation() }, 2_200L)
@@ -289,6 +332,7 @@ class RemoteWebResolver(private val activity: Activity) {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): android.webkit.WebResourceResponse? {
                 val url = request?.url?.toString().orEmpty()
                 if (url.isNotBlank() && isSubtitleLikeUrl(url)) {
+                    Log.d(logTag, "intercept subtitle ${shortUrl(url)}")
                     handler.post {
                         addSubtitleTrack(
                             rawUrl = url,
@@ -306,6 +350,7 @@ class RemoteWebResolver(private val activity: Activity) {
                     }
                 }
                 if (url.isNotBlank() && isPlaybackLikeUrl(url)) {
+                    Log.d(logTag, "intercept playback ${shortUrl(url)}")
                     handler.post {
                         completeCandidate(
                             rawUrl = url,
@@ -331,8 +376,10 @@ class RemoteWebResolver(private val activity: Activity) {
         webView.onResume()
         webView.resumeTimers()
         if (headers.isEmpty()) {
+            Log.d(logTag, "WebView loadUrl ${shortUrl(pageUrl)}")
             webView.loadUrl(pageUrl)
         } else {
+            Log.d(logTag, "WebView loadUrl ${shortUrl(pageUrl)} headers=${headers.keys}")
             webView.loadUrl(pageUrl, headers)
         }
     }
@@ -1037,7 +1084,16 @@ class RemoteWebResolver(private val activity: Activity) {
         }
     }
 
+    private fun shortUrl(url: String): String {
+        val normalized = url.trim()
+        if (normalized.length <= 180) {
+            return normalized
+        }
+        return normalized.take(120) + "..." + normalized.takeLast(36)
+    }
+
     private companion object {
+        private const val logTag = "TanukiRemoteResolver"
         private const val defaultRemoteUserAgent =
             "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
         private const val defaultCandidateSettleDelayMs = 420L

@@ -55,23 +55,28 @@ class _HomeScreenState extends State<HomeScreen> {
   int _detailSimilarRequest = 0;
   int _homeTrendingVisualRequest = 0;
   int _homeMovieVisualRequest = 0;
+  int _handledTrailerDetailRequestId = 0;
   String _similarStatus = '';
   String _detailSimilarStatus = '';
   bool _profilePickerVisible = false;
+  bool _handlingTrailerDetailRequest = false;
 
   @override
   void initState() {
     super.initState();
+    widget.controller.addListener(_handlePendingTrailerDetailRequest);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         unawaited(_loadHomeTrending());
         unawaited(_loadHomeMovies());
+        _handlePendingTrailerDetailRequest();
       }
     });
   }
 
   @override
   void dispose() {
+    widget.controller.removeListener(_handlePendingTrailerDetailRequest);
     _searchController.dispose();
     super.dispose();
   }
@@ -414,6 +419,119 @@ class _HomeScreenState extends State<HomeScreen> {
     _selectSeries(series, returnSection: origin);
   }
 
+  void _handlePendingTrailerDetailRequest() {
+    final request = widget.controller.pendingTrailerDetailRequest;
+    if (request == null ||
+        request.id == _handledTrailerDetailRequestId ||
+        _handlingTrailerDetailRequest) {
+      return;
+    }
+    _handledTrailerDetailRequestId = request.id;
+    _handlingTrailerDetailRequest = true;
+    widget.controller.clearPendingTrailerDetailRequest(request.id);
+    unawaited(_openTrailerDetailRequest(request).whenComplete(() {
+      _handlingTrailerDetailRequest = false;
+    }));
+  }
+
+  Future<void> _openTrailerDetailRequest(TrailerDetailRequest request) async {
+    final existingSeries = _seriesForTrailerDetailRequest(request);
+    if (existingSeries != null) {
+      if (!mounted) {
+        return;
+      }
+      _selectSeries(existingSeries, returnSection: _Section.anime);
+      return;
+    }
+    final candidate = _candidateForTrailerDetailRequest(request) ??
+        request.toRemoteCandidate();
+    if (candidate == null) {
+      widget.controller
+          .setStatusMessage('No pude abrir el detalle del trailer.');
+      return;
+    }
+    try {
+      final series = await widget.controller.importRemoteCandidate(candidate);
+      if (!mounted) {
+        return;
+      }
+      _selectSeries(series, returnSection: _Section.anime);
+    } catch (_) {
+      widget.controller
+          .setStatusMessage('No pude abrir el detalle de ${request.title}.');
+    }
+  }
+
+  SeriesItem? _seriesForTrailerDetailRequest(TrailerDetailRequest request) {
+    for (final series in widget.controller.library) {
+      if (_matchesSeriesTrailerDetailRequest(series, request)) {
+        return series;
+      }
+    }
+    return null;
+  }
+
+  bool _matchesSeriesTrailerDetailRequest(
+    SeriesItem series,
+    TrailerDetailRequest request,
+  ) {
+    final seriesKey = request.seriesKey.trim();
+    if (seriesKey.isNotEmpty && series.stableKey == seriesKey) {
+      return true;
+    }
+    if (request.catalogId > 0 && series.catalogId == request.catalogId) {
+      return true;
+    }
+    final provider = request.provider;
+    if (provider != null &&
+        request.slug.trim().isNotEmpty &&
+        series.provider == provider &&
+        series.slug == request.slug.trim()) {
+      return true;
+    }
+    return normalizeSeriesKey(series.name) == normalizeSeriesKey(request.title);
+  }
+
+  RemoteSearchCandidate? _candidateForTrailerDetailRequest(
+    TrailerDetailRequest request,
+  ) {
+    final candidates = <RemoteSearchCandidate>[
+      ..._homeTrendingResults,
+      ..._homeMovieResults,
+      ...widget.controller.remoteResults,
+      ..._similarResults,
+      ..._detailSimilarResults,
+    ];
+    for (final candidate in candidates) {
+      if (_matchesCandidateTrailerDetailRequest(candidate, request)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  bool _matchesCandidateTrailerDetailRequest(
+    RemoteSearchCandidate candidate,
+    TrailerDetailRequest request,
+  ) {
+    if (request.catalogId > 0 && candidate.catalogId == request.catalogId) {
+      return true;
+    }
+    final provider = request.provider;
+    if (provider != null &&
+        request.slug.trim().isNotEmpty &&
+        candidate.provider == provider &&
+        candidate.slug == request.slug.trim()) {
+      return true;
+    }
+    if (request.trailerUrl.trim().isNotEmpty &&
+        candidate.trailerUrl.trim() == request.trailerUrl.trim()) {
+      return true;
+    }
+    return normalizeSeriesKey(candidate.title) ==
+        normalizeSeriesKey(request.title);
+  }
+
   Future<void> _loadHomeTrending() async {
     if (_homeTrendingLoading) {
       return;
@@ -610,6 +728,12 @@ class _HomeScreenState extends State<HomeScreen> {
         TrailerQueueEntry(
           title: series.name,
           trailerUrl: series.trailerUrl,
+          seriesKey: series.stableKey,
+          providerId: series.provider?.id ?? '',
+          slug: series.slug,
+          watchUrl: series.watchUrl,
+          seriesUrl: series.watchUrl,
+          catalogId: series.catalogId,
         ),
       ],
       emptyMessage: 'No hay trailer disponible para esta serie.',
@@ -643,6 +767,11 @@ class _HomeScreenState extends State<HomeScreen> {
           (candidate) => TrailerQueueEntry(
             title: candidate.title,
             trailerUrl: candidate.trailerUrl,
+            providerId: candidate.provider.id,
+            slug: candidate.slug,
+            watchUrl: candidate.watchUrl,
+            seriesUrl: candidate.seriesUrl,
+            catalogId: candidate.catalogId,
           ),
         )
         .where((entry) =>
@@ -670,14 +799,20 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) {
       return;
     }
-    await Navigator.of(context).push(
+    final detailLink = await Navigator.of(context).push<String>(
       MaterialPageRoute(
         builder: (_) => TrailerQueueScreen(
           title: title,
           entries: playable,
+          onDetailLink: (link) {
+            unawaited(widget.controller.handleInternalDeepLink(link));
+          },
         ),
       ),
     );
+    if (detailLink != null && detailLink.trim().isNotEmpty) {
+      await widget.controller.handleInternalDeepLink(detailLink);
+    }
   }
 }
 
@@ -1608,7 +1743,8 @@ class _ProfileActionButton extends StatelessWidget {
         alignment: Alignment.center,
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final maxButtonWidth = (constraints.maxWidth * 0.85).clamp(220.0, 360.0);
+            final maxButtonWidth =
+                (constraints.maxWidth * 0.85).clamp(220.0, 360.0);
             return ConstrainedBox(
               constraints: BoxConstraints(maxWidth: maxButtonWidth),
               child: SizedBox(
@@ -1934,7 +2070,8 @@ class _AnimePanel extends StatelessWidget {
     final screenHeight = MediaQuery.sizeOf(context).height;
     final heroHeight = (screenHeight * 0.36).clamp(320.0, 480.0);
     final topPadding = heroHeight + 18;
-    final sectionHeight = (screenHeight * 0.3525).clamp(320.0, 480.0);
+    final baseSectionHeight = (screenHeight * 0.3525).clamp(320.0, 480.0);
+    final sectionHeight = baseSectionHeight * _homePosterScale;
     const sectionGap = 28.0;
     const fadeDistance = 80.0;
 
@@ -1954,7 +2091,7 @@ class _AnimePanel extends StatelessWidget {
     }
 
     final panelChildren = <Widget>[];
-    final sectionPadding = (sectionHeight * 0.5).clamp(180.0, 240.0);
+    final sectionPadding = (baseSectionHeight * 0.5).clamp(180.0, 240.0);
     panelChildren.add(SizedBox(height: sectionPadding));
     double nextSectionTop = sectionPadding;
     if (continueWatching.isNotEmpty) {
@@ -2204,12 +2341,36 @@ class _RandomLoadingPanel extends StatelessWidget {
   }
 }
 
+const double _homePosterScale = 1.5;
+
+double _homeShelfPosterHeight(
+  BuildContext context, {
+  double screenFactor = 0.24,
+}) {
+  final screenHeight = MediaQuery.sizeOf(context).height;
+  return (screenHeight * screenFactor).clamp(220.0, 280.0) * _homePosterScale;
+}
+
 double _homeResponsiveValue(BuildContext context, double base,
     {double min = 0, double max = double.infinity}) {
   final width = MediaQuery.sizeOf(context).width;
   final scale = (width / 960).clamp(0.88, 1.24);
   final value = base * scale;
   return value.clamp(min == 0 ? base * 0.8 : min, max);
+}
+
+class _HorizontalFocusShelf extends StatelessWidget {
+  const _HorizontalFocusShelf({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return FocusTraversalGroup(
+      policy: WidgetOrderTraversalPolicy(),
+      child: child,
+    );
+  }
 }
 
 double _heroButtonSide(BuildContext context) =>
@@ -2495,7 +2656,8 @@ class _SeriesDetailPanel extends StatelessWidget {
         final screenHeight = MediaQuery.sizeOf(context).height;
         final wide = constraints.maxWidth >= 900;
         final episodePanelHeight = (screenHeight * 0.55).clamp(320.0, 560.0);
-        final episodePanelWidth = (constraints.maxWidth * 0.34).clamp(320.0, 480.0);
+        final episodePanelWidth =
+            (constraints.maxWidth * 0.34).clamp(320.0, 480.0);
         final info = _SeriesDetailInfo(
           controller: controller,
           series: series,
@@ -2758,7 +2920,8 @@ class _SeriesDetailInfo extends StatelessWidget {
               final horizontal =
                   posterUrl.isNotEmpty && constraints.maxWidth >= 680;
               if (!horizontal) {
-                final posterWidth = (constraints.maxWidth * 0.62).clamp(150.0, 220.0);
+                final posterWidth =
+                    (constraints.maxWidth * 0.62).clamp(150.0, 220.0);
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -2770,7 +2933,8 @@ class _SeriesDetailInfo extends StatelessWidget {
                   ],
                 );
               }
-              final posterWidth = (constraints.maxWidth * 0.24).clamp(160.0, 250.0);
+              final posterWidth =
+                  (constraints.maxWidth * 0.24).clamp(160.0, 250.0);
               final posterHeight = posterWidth * 1.5;
               return Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -2872,27 +3036,29 @@ class _DetailSimilarCarousel extends StatelessWidget {
                       message:
                           'No encontre series relacionadas para esta ficha.',
                     )
-                  : ListView.separated(
-                      clipBehavior: Clip.none,
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-                      itemBuilder: (context, index) {
-                        final candidate = candidates[index];
-                        return SizedBox(
-                          width: posterWidth,
-                          height: posterHeight,
-                          child: _SearchResultPosterCard(
-                            candidate: candidate,
-                            imported: controller.findRemoteSeriesForCandidate(
-                                  candidate,
-                                ) !=
-                                null,
-                            onTap: () => onCandidateSelected(candidate),
-                          ),
-                        );
-                      },
-                      separatorBuilder: (_, __) => const SizedBox(width: 8),
-                      itemCount: candidates.length,
+                  : _HorizontalFocusShelf(
+                      child: ListView.separated(
+                        clipBehavior: Clip.none,
+                        scrollDirection: Axis.horizontal,
+                        padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                        itemBuilder: (context, index) {
+                          final candidate = candidates[index];
+                          return SizedBox(
+                            width: posterWidth,
+                            height: posterHeight,
+                            child: _SearchResultPosterCard(
+                              candidate: candidate,
+                              imported: controller.findRemoteSeriesForCandidate(
+                                    candidate,
+                                  ) !=
+                                  null,
+                              onTap: () => onCandidateSelected(candidate),
+                            ),
+                          );
+                        },
+                        separatorBuilder: (_, __) => const SizedBox(width: 8),
+                        itemCount: candidates.length,
+                      ),
                     ),
         ),
       ],
@@ -3502,8 +3668,7 @@ class _TrendingPosterShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final posterHeight = (screenHeight * 0.24).clamp(220.0, 280.0);
+    final posterHeight = _homeShelfPosterHeight(context);
     final posterWidth = posterHeight * 0.7;
     final visibleCandidates = candidates.take(14).toList(growable: false);
     void focusCandidate(RemoteSearchCandidate candidate) {
@@ -3542,25 +3707,28 @@ class _TrendingPosterShelf extends StatelessWidget {
           height: posterHeight + 16,
           child: loading && visibleCandidates.isEmpty
               ? _PosterShelfSkeleton(width: posterWidth, height: posterHeight)
-              : ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  clipBehavior: Clip.none,
-                  padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-                  itemBuilder: (context, index) {
-                    final candidate = visibleCandidates[index];
-                    return _RemotePosterCard(
-                      width: posterWidth,
-                      height: posterHeight,
-                      candidate: candidate,
-                      imported:
-                          controller.findRemoteSeriesForCandidate(candidate) !=
-                              null,
-                      onTap: () => onCandidateSelected(candidate),
-                      onFocused: () => focusCandidate(candidate),
-                    );
-                  },
-                  separatorBuilder: (_, __) => const SizedBox(width: 8),
-                  itemCount: visibleCandidates.length,
+              : _HorizontalFocusShelf(
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    clipBehavior: Clip.none,
+                    padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                    itemBuilder: (context, index) {
+                      final candidate = visibleCandidates[index];
+                      return _RemotePosterCard(
+                        width: posterWidth,
+                        height: posterHeight,
+                        candidate: candidate,
+                        imported: controller.findRemoteSeriesForCandidate(
+                              candidate,
+                            ) !=
+                            null,
+                        onTap: () => onCandidateSelected(candidate),
+                        onFocused: () => focusCandidate(candidate),
+                      );
+                    },
+                    separatorBuilder: (_, __) => const SizedBox(width: 8),
+                    itemCount: visibleCandidates.length,
+                  ),
                 ),
         ),
       ],
@@ -3653,8 +3821,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final posterHeight = (screenHeight * 0.24).clamp(220.0, 280.0);
+    final posterHeight = _homeShelfPosterHeight(context);
     final posterWidth = posterHeight * 0.7;
 
     void focusCandidate(RemoteSearchCandidate candidate) {
@@ -3674,25 +3841,28 @@ class _UpcomingPosterShelf extends StatelessWidget {
           height: posterHeight + 16,
           child: loading && candidates.isEmpty
               ? _PosterShelfSkeleton(width: posterWidth, height: posterHeight)
-              : ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  clipBehavior: Clip.none,
-                  padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-                  itemBuilder: (context, index) {
-                    final candidate = candidates[index];
-                    return _RemotePosterCard(
-                      width: posterWidth,
-                      height: posterHeight,
-                      candidate: candidate,
-                      imported:
-                          controller.findRemoteSeriesForCandidate(candidate) !=
-                              null,
-                      onTap: () => onCandidateSelected(candidate),
-                      onFocused: () => focusCandidate(candidate),
-                    );
-                  },
-                  separatorBuilder: (_, __) => const SizedBox(width: 8),
-                  itemCount: candidates.length,
+              : _HorizontalFocusShelf(
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    clipBehavior: Clip.none,
+                    padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                    itemBuilder: (context, index) {
+                      final candidate = candidates[index];
+                      return _RemotePosterCard(
+                        width: posterWidth,
+                        height: posterHeight,
+                        candidate: candidate,
+                        imported: controller.findRemoteSeriesForCandidate(
+                              candidate,
+                            ) !=
+                            null,
+                        onTap: () => onCandidateSelected(candidate),
+                        onFocused: () => focusCandidate(candidate),
+                      );
+                    },
+                    separatorBuilder: (_, __) => const SizedBox(width: 8),
+                    itemCount: candidates.length,
+                  ),
                 ),
         ),
       ],
@@ -3711,19 +3881,21 @@ class _PosterShelfSkeleton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListView.separated(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-      itemBuilder: (_, __) => Container(
-        width: width,
-        height: height,
-        decoration: BoxDecoration(
-          color: const Color(0xFF233445),
-          borderRadius: BorderRadius.circular(8),
+    return _HorizontalFocusShelf(
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+        itemBuilder: (_, __) => Container(
+          width: width,
+          height: height,
+          decoration: BoxDecoration(
+            color: const Color(0xFF233445),
+            borderRadius: BorderRadius.circular(8),
+          ),
         ),
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemCount: 6,
       ),
-      separatorBuilder: (_, __) => const SizedBox(width: 8),
-      itemCount: 6,
     );
   }
 }
@@ -3847,8 +4019,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final posterHeight = (screenHeight * 0.235).clamp(220.0, 280.0);
+    final posterHeight = _homeShelfPosterHeight(context, screenFactor: 0.235);
     final posterWidth = posterHeight * 0.7;
 
     void focusEntry(_ContinueWatchingEntry entry) {
@@ -3869,28 +4040,30 @@ class _ContinueWatchingShelf extends StatelessWidget {
         const SizedBox(height: 4),
         SizedBox(
           height: posterHeight + 16,
-          child: ListView.separated(
-            clipBehavior: Clip.none,
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-            itemBuilder: (context, index) {
-              final entry = entries[index];
-              return _ContinueWatchingPosterCard(
-                width: posterWidth,
-                height: posterHeight,
-                entry: entry,
-                onTap: () => onPlayEpisode(entry.episode),
-                onGoToSeries: entry.series == null
-                    ? null
-                    : () => onGoToSeries(entry.series!),
-                onStopWatching: entry.series == null
-                    ? null
-                    : () => onStopWatchingSeries(entry.series!),
-                onFocused: () => focusEntry(entry),
-              );
-            },
-            separatorBuilder: (_, __) => const SizedBox(width: 8),
-            itemCount: entries.length,
+          child: _HorizontalFocusShelf(
+            child: ListView.separated(
+              clipBehavior: Clip.none,
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+              itemBuilder: (context, index) {
+                final entry = entries[index];
+                return _ContinueWatchingPosterCard(
+                  width: posterWidth,
+                  height: posterHeight,
+                  entry: entry,
+                  onTap: () => onPlayEpisode(entry.episode),
+                  onGoToSeries: entry.series == null
+                      ? null
+                      : () => onGoToSeries(entry.series!),
+                  onStopWatching: entry.series == null
+                      ? null
+                      : () => onStopWatchingSeries(entry.series!),
+                  onFocused: () => focusEntry(entry),
+                );
+              },
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemCount: entries.length,
+            ),
           ),
         ),
       ],
@@ -4092,12 +4265,12 @@ class _PlaylistPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final entries = controller.buildNextEntries(limit: 12);
-    final selected =
-        _dedupeSeriesForDisplay(controller.library.where(controller.isSelected));
+    final selected = _dedupeSeriesForDisplay(
+        controller.library.where(controller.isSelected));
     final current =
         controller.currentEntry ?? (entries.isEmpty ? null : entries.first);
-    final playlistOrder =
-        PlaylistPlaybackOrder.normalize(controller.activePlaylist.playbackOrder);
+    final playlistOrder = PlaylistPlaybackOrder.normalize(
+        controller.activePlaylist.playbackOrder);
     return Padding(
       padding: const EdgeInsets.only(left: 20, bottom: 16),
       child: Column(
@@ -4208,7 +4381,8 @@ class _PlaylistPanel extends StatelessWidget {
                 if (!wide) {
                   final screenHeight = MediaQuery.sizeOf(context).height;
                   final queueHeight = (screenHeight * 0.45).clamp(250.0, 420.0);
-                  final seriesHeight = (screenHeight * 0.38).clamp(220.0, 360.0);
+                  final seriesHeight =
+                      (screenHeight * 0.38).clamp(220.0, 360.0);
                   return ListView(
                     children: [
                       SizedBox(height: queueHeight, child: queue),
@@ -4780,21 +4954,23 @@ class _SpaceSection extends StatelessWidget {
           const SizedBox(height: 4),
           SizedBox(
             height: posterHeight + 16,
-            child: ListView.separated(
-              clipBehavior: Clip.none,
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-              itemBuilder: (context, index) {
-                final item = series[index];
-                return _SpacePosterCard(
-                  width: posterWidth,
-                  height: posterHeight,
-                  series: item,
-                  onTap: () => onSeriesSelected(item),
-                );
-              },
-              separatorBuilder: (_, __) => const SizedBox(width: 8),
-              itemCount: series.length,
+            child: _HorizontalFocusShelf(
+              child: ListView.separated(
+                clipBehavior: Clip.none,
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                itemBuilder: (context, index) {
+                  final item = series[index];
+                  return _SpacePosterCard(
+                    width: posterWidth,
+                    height: posterHeight,
+                    series: item,
+                    onTap: () => onSeriesSelected(item),
+                  );
+                },
+                separatorBuilder: (_, __) => const SizedBox(width: 8),
+                itemCount: series.length,
+              ),
             ),
           ),
         ],
@@ -4821,79 +4997,72 @@ class _SpacePosterCard extends StatelessWidget {
     return SizedBox(
       width: width,
       height: height,
-      child: Material(
-        color: Colors.transparent,
-        elevation: 6,
-        shadowColor: const Color(0x77000000),
-        borderRadius: BorderRadius.circular(8),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              _Poster(imageUrl: series.imageUrl, title: series.name),
-              Positioned(
-                left: 5,
-                top: 5,
-                child: Container(
-                  width: 28,
-                  height: 28,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: const Color(0xD6101822),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: TanukiColors.orangeHot, width: 2),
+      child: _FocusablePosterSurface(
+        onTap: onTap,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _Poster(imageUrl: series.imageUrl, title: series.name),
+            Positioned(
+              left: 5,
+              top: 5,
+              child: Container(
+                width: 28,
+                height: 28,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: const Color(0xD6101822),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: TanukiColors.orangeHot, width: 2),
+                ),
+                child: Text(
+                  series.episodeCount > 0 ? '${series.episodeCount}' : '?',
+                  maxLines: 1,
+                  overflow: TextOverflow.fade,
+                  style: const TextStyle(
+                    color: TanukiColors.text,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w900,
                   ),
-                  child: Text(
-                    series.episodeCount > 0 ? '${series.episodeCount}' : '?',
-                    maxLines: 1,
-                    overflow: TextOverflow.fade,
-                    style: const TextStyle(
-                      color: TanukiColors.text,
-                      fontSize: 9,
-                      fontWeight: FontWeight.w900,
+                ),
+              ),
+            ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
+                color: const Color(0xB010161D),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      series.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: TanukiColors.text,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
-                  ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _formatSpaceSeriesMeta(series),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Color(0xFFB1C0CF),
+                        fontSize: 9,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: Container(
-                  padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
-                  color: const Color(0xB010161D),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        series.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: TanukiColors.text,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        _formatSpaceSeriesMeta(series),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFFB1C0CF),
-                          fontSize: 9,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
@@ -4913,7 +5082,8 @@ class _SettingsPanel extends StatelessWidget {
     final media = MediaQuery.of(context);
     final logicalSize = media.size;
     final dpr = media.devicePixelRatio;
-    final physicalSize = Size(logicalSize.width * dpr, logicalSize.height * dpr);
+    final physicalSize =
+        Size(logicalSize.width * dpr, logicalSize.height * dpr);
     final aspectRatio = logicalSize.width / logicalSize.height;
     const targetAspectRatio = 16 / 9;
     final aspectDiff = (aspectRatio - targetAspectRatio).abs();
@@ -4972,12 +5142,18 @@ class _SettingsPanel extends StatelessWidget {
               label: const Text('Actualizar relleno'),
             ),
             const _SettingsSectionTitle('Debug de pantalla'),
-            _SettingsStatusText('Resolución lógica: ${logicalSize.width.toStringAsFixed(0)} x ${logicalSize.height.toStringAsFixed(0)}'),
-            _SettingsStatusText('Resolución física: ${physicalSize.width.toStringAsFixed(0)} x ${physicalSize.height.toStringAsFixed(0)}'),
-            _SettingsStatusText('DPI de dispositivo: ${dpr.toStringAsFixed(2)}'),
-            _SettingsStatusText('Aspect ratio: ${aspectRatio.toStringAsFixed(3)}'),
-            _SettingsStatusText('Cerca de 16:9: ${isSixteenByNine ? 'Sí' : 'No'}'),
-            _SettingsStatusText('Safe area: top ${safePadding.top.toStringAsFixed(0)}, bottom ${safePadding.bottom.toStringAsFixed(0)}, left ${safePadding.left.toStringAsFixed(0)}, right ${safePadding.right.toStringAsFixed(0)}'),
+            _SettingsStatusText(
+                'Resolución lógica: ${logicalSize.width.toStringAsFixed(0)} x ${logicalSize.height.toStringAsFixed(0)}'),
+            _SettingsStatusText(
+                'Resolución física: ${physicalSize.width.toStringAsFixed(0)} x ${physicalSize.height.toStringAsFixed(0)}'),
+            _SettingsStatusText(
+                'DPI de dispositivo: ${dpr.toStringAsFixed(2)}'),
+            _SettingsStatusText(
+                'Aspect ratio: ${aspectRatio.toStringAsFixed(3)}'),
+            _SettingsStatusText(
+                'Cerca de 16:9: ${isSixteenByNine ? 'Sí' : 'No'}'),
+            _SettingsStatusText(
+                'Safe area: top ${safePadding.top.toStringAsFixed(0)}, bottom ${safePadding.bottom.toStringAsFixed(0)}, left ${safePadding.left.toStringAsFixed(0)}, right ${safePadding.right.toStringAsFixed(0)}'),
             const SizedBox(height: 16),
             const _SettingsSectionTitle('MyAnimeList'),
             Wrap(
@@ -5847,66 +6023,63 @@ class _MiniSeriesTile extends StatelessWidget {
     final watched = controller.watchedCountFor(series);
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Material(
+      child: _FocusableEpisodeSurface(
+        onTap: onTap,
         color: const Color(0xFF10151C),
         elevation: 8,
-        borderRadius: BorderRadius.circular(10),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: SizedBox(
-            height: 76,
-            child: Padding(
-              padding: const EdgeInsets.all(10),
-              child: Row(
-                children: [
-                  SizedBox(
-                    width: 50,
-                    height: 56,
-                    child:
-                        _Poster(imageUrl: series.imageUrl, title: series.name),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          series.name,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: TanukiColors.text,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w800,
-                          ),
+        activeElevation: 10,
+        borderRadius: 10,
+        child: SizedBox(
+          height: 76,
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 50,
+                  height: 56,
+                  child: _Poster(imageUrl: series.imageUrl, title: series.name),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        series.name,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: TanukiColors.text,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w800,
                         ),
-                        const SizedBox(height: 3),
-                        Text(
-                          '$watched / ${series.episodeCount}',
-                          style: const TextStyle(
-                            color: TanukiColors.muted,
-                            fontSize: 12,
-                          ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        '$watched / ${series.episodeCount}',
+                        style: const TextStyle(
+                          color: TanukiColors.muted,
+                          fontSize: 12,
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                  IconButton(
-                    onPressed: () => controller.toggleSeriesSelection(series),
-                    icon: const Icon(Icons.close),
-                    style: IconButton.styleFrom(
-                      fixedSize: const Size(40, 40),
-                      backgroundColor: const Color(0xFF1A2332),
-                      foregroundColor: TanukiColors.text,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8)),
-                    ),
-                    tooltip: 'Quitar',
+                ),
+                IconButton(
+                  onPressed: () => controller.toggleSeriesSelection(series),
+                  icon: const Icon(Icons.close),
+                  style: IconButton.styleFrom(
+                    fixedSize: const Size(40, 40),
+                    backgroundColor: const Color(0xFF1A2332),
+                    foregroundColor: TanukiColors.text,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8)),
                   ),
-                ],
-              ),
+                  tooltip: 'Quitar',
+                ),
+              ],
             ),
           ),
         ),
@@ -5928,60 +6101,58 @@ class _QueueRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Material(
+      child: _FocusableEpisodeSurface(
+        onTap: onPlay,
         color: const Color(0xFF10151C),
         elevation: 8,
-        borderRadius: BorderRadius.circular(10),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onPlay,
-          child: SizedBox(
-            height: 84,
-            child: Padding(
-              padding: const EdgeInsets.all(10),
-              child: Row(
-                children: [
-                  SizedBox(
-                    width: 60,
-                    height: 64,
-                    child: _Poster(
-                      imageUrl: episode.imageUrl,
-                      title: episode.displayName,
-                    ),
+        activeElevation: 10,
+        borderRadius: 10,
+        child: SizedBox(
+          height: 84,
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 60,
+                  height: 64,
+                  child: _Poster(
+                    imageUrl: episode.imageUrl,
+                    title: episode.displayName,
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          episode.seriesName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: TanukiColors.text,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w800,
-                          ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        episode.seriesName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: TanukiColors.text,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w800,
                         ),
-                        const SizedBox(height: 4),
-                        Text(
-                          episode.displayName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: TanukiColors.muted,
-                            fontSize: 12,
-                          ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        episode.displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: TanukiColors.muted,
+                          fontSize: 12,
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  _QueueStatusChip(episode: episode),
-                ],
-              ),
+                ),
+                const SizedBox(width: 8),
+                _QueueStatusChip(episode: episode),
+              ],
             ),
           ),
         ),
@@ -6107,32 +6278,33 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   }
 
   KeyEventResult _handleRemoteKeyEvent(FocusNode node, KeyEvent event) {
-    if (widget.onLongPress == null) {
-      return KeyEventResult.ignored;
-    }
-    if (event is! KeyDownEvent && event is! KeyUpEvent) {
+    if (event is! KeyDownEvent &&
+        event is! KeyRepeatEvent &&
+        event is! KeyUpEvent) {
       return KeyEventResult.ignored;
     }
 
-    final key = event.logicalKey;
-    final isSelectKey = key == LogicalKeyboardKey.select ||
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.gameButtonA;
-    if (!isSelectKey) {
+    if (!_isRemoteActivateKey(event.logicalKey)) {
       return KeyEventResult.ignored;
+    }
+
+    if (event is KeyRepeatEvent) {
+      return KeyEventResult.handled;
     }
 
     if (event is KeyDownEvent) {
       if (_remoteKeyDown) {
-        return KeyEventResult.ignored;
+        return KeyEventResult.handled;
       }
       _remoteKeyDown = true;
       _remoteLongPressTriggered = false;
       _remoteLongPressTimer?.cancel();
-      _remoteLongPressTimer = Timer(
-        const Duration(milliseconds: 450),
-        _triggerRemoteLongPress,
-      );
+      if (widget.onLongPress != null) {
+        _remoteLongPressTimer = Timer(
+          const Duration(milliseconds: 450),
+          _triggerRemoteLongPress,
+        );
+      }
     } else if (event is KeyUpEvent) {
       _remoteKeyDown = false;
       _remoteLongPressTimer?.cancel();
@@ -6141,9 +6313,10 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
         _remoteLongPressTriggered = false;
         return KeyEventResult.handled;
       }
+      widget.onTap();
     }
 
-    return KeyEventResult.ignored;
+    return KeyEventResult.handled;
   }
 
   void _triggerRemoteLongPress() {
@@ -6159,6 +6332,15 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
     return Focus(
       focusNode: _focusNode,
       onKeyEvent: _handleRemoteKeyEvent,
+      onFocusChange: (value) {
+        if (_focused != value) {
+          setState(() => _focused = value);
+        }
+        if (value) {
+          widget.onFocused?.call();
+          _ensureFocusableVisible(context, alignment: 0.54);
+        }
+      },
       child: AnimatedScale(
         scale: _active ? 1.015 : 1,
         duration: const Duration(milliseconds: 120),
@@ -6170,6 +6352,7 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
           borderRadius: BorderRadius.circular(8),
           clipBehavior: Clip.antiAlias,
           child: InkWell(
+            canRequestFocus: false,
             onTap: () {
               if (_remoteLongPressTriggered) {
                 _remoteLongPressTriggered = false;
@@ -6178,25 +6361,6 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
               widget.onTap();
             },
             onLongPress: widget.onLongPress,
-            onFocusChange: (value) {
-              if (_focused != value) {
-                setState(() => _focused = value);
-              }
-              if (value) {
-                widget.onFocused?.call();
-                final scrollable = Scrollable.maybeOf(context);
-                final renderObject = context.findRenderObject();
-                if (scrollable != null && renderObject != null) {
-                  scrollable.position.ensureVisible(
-                    renderObject,
-                    duration: const Duration(milliseconds: 160),
-                    curve: Curves.easeOutCubic,
-                    alignment: 0.54,
-                    alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
-                  );
-                }
-              }
-            },
             onHover: (value) {
               if (_hovered != value) {
                 setState(() => _hovered = value);
@@ -6223,12 +6387,20 @@ class _FocusableEpisodeSurface extends StatefulWidget {
   const _FocusableEpisodeSurface({
     required this.child,
     required this.onTap,
-    required this.onLongPress,
+    this.onLongPress,
+    this.color = const Color(0xFF11161D),
+    this.elevation = 6,
+    this.activeElevation = 9,
+    this.borderRadius = 7,
   });
 
   final Widget child;
   final VoidCallback onTap;
-  final VoidCallback onLongPress;
+  final VoidCallback? onLongPress;
+  final Color color;
+  final double elevation;
+  final double activeElevation;
+  final double borderRadius;
 
   @override
   State<_FocusableEpisodeSurface> createState() =>
@@ -6253,29 +6425,33 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
   }
 
   KeyEventResult _handleRemoteKeyEvent(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent && event is! KeyUpEvent) {
+    if (event is! KeyDownEvent &&
+        event is! KeyRepeatEvent &&
+        event is! KeyUpEvent) {
       return KeyEventResult.ignored;
     }
 
-    final key = event.logicalKey;
-    final isSelectKey = key == LogicalKeyboardKey.select ||
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.gameButtonA;
-    if (!isSelectKey) {
+    if (!_isRemoteActivateKey(event.logicalKey)) {
       return KeyEventResult.ignored;
+    }
+
+    if (event is KeyRepeatEvent) {
+      return KeyEventResult.handled;
     }
 
     if (event is KeyDownEvent) {
       if (_remoteKeyDown) {
-        return KeyEventResult.ignored;
+        return KeyEventResult.handled;
       }
       _remoteKeyDown = true;
       _remoteLongPressTriggered = false;
       _remoteLongPressTimer?.cancel();
-      _remoteLongPressTimer = Timer(
-        const Duration(milliseconds: 450),
-        _triggerRemoteLongPress,
-      );
+      if (widget.onLongPress != null) {
+        _remoteLongPressTimer = Timer(
+          const Duration(milliseconds: 450),
+          _triggerRemoteLongPress,
+        );
+      }
     } else if (event is KeyUpEvent) {
       _remoteKeyDown = false;
       _remoteLongPressTimer?.cancel();
@@ -6284,9 +6460,10 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
         _remoteLongPressTriggered = false;
         return KeyEventResult.handled;
       }
+      widget.onTap();
     }
 
-    return KeyEventResult.ignored;
+    return KeyEventResult.handled;
   }
 
   void _triggerRemoteLongPress() {
@@ -6294,7 +6471,7 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
       return;
     }
     _remoteLongPressTriggered = true;
-    widget.onLongPress();
+    widget.onLongPress?.call();
   }
 
   @override
@@ -6302,16 +6479,25 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
     return Focus(
       focusNode: _focusNode,
       onKeyEvent: _handleRemoteKeyEvent,
+      onFocusChange: (value) {
+        if (_focused != value) {
+          setState(() => _focused = value);
+        }
+        if (value) {
+          _ensureFocusableVisible(context, alignment: 0.48);
+        }
+      },
       child: AnimatedScale(
         scale: _active ? 1.004 : 1,
         duration: const Duration(milliseconds: 90),
         curve: Curves.easeOut,
         child: Material(
-          color: const Color(0xFF11161D),
-          elevation: _active ? 9 : 6,
-          borderRadius: BorderRadius.circular(7),
+          color: widget.color,
+          elevation: _active ? widget.activeElevation : widget.elevation,
+          borderRadius: BorderRadius.circular(widget.borderRadius),
           clipBehavior: Clip.antiAlias,
           child: InkWell(
+            canRequestFocus: false,
             onTap: () {
               if (_remoteLongPressTriggered) {
                 _remoteLongPressTriggered = false;
@@ -6320,11 +6506,6 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
               widget.onTap();
             },
             onLongPress: widget.onLongPress,
-            onFocusChange: (value) {
-              if (_focused != value) {
-                setState(() => _focused = value);
-              }
-            },
             onHover: (value) {
               if (_hovered != value) {
                 setState(() => _hovered = value);
@@ -6332,7 +6513,7 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
             },
             child: Container(
               foregroundDecoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(7),
+                borderRadius: BorderRadius.circular(widget.borderRadius),
                 border: Border.all(
                   color: _active ? TanukiColors.orange : Colors.transparent,
                   width: 3,
@@ -6345,6 +6526,32 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
       ),
     );
   }
+}
+
+bool _isRemoteActivateKey(LogicalKeyboardKey key) {
+  return key == LogicalKeyboardKey.select ||
+      key == LogicalKeyboardKey.enter ||
+      key == LogicalKeyboardKey.numpadEnter ||
+      key == LogicalKeyboardKey.space ||
+      key == LogicalKeyboardKey.gameButtonA;
+}
+
+void _ensureFocusableVisible(
+  BuildContext context, {
+  required double alignment,
+}) {
+  final scrollable = Scrollable.maybeOf(context);
+  final renderObject = context.findRenderObject();
+  if (scrollable == null || renderObject == null) {
+    return;
+  }
+  scrollable.position.ensureVisible(
+    renderObject,
+    duration: const Duration(milliseconds: 160),
+    curve: Curves.easeOutCubic,
+    alignment: alignment,
+    alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
+  );
 }
 
 class _Poster extends StatelessWidget {
@@ -6448,8 +6655,8 @@ class _ScheduleChip extends StatelessWidget {
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: TextStyle(
-          color: Color(0xFFF9FCFF),
-          fontSize: 8,
+          color: const Color(0xFFF9FCFF),
+          fontSize: fontSize,
           fontWeight: FontWeight.w900,
         ),
       ),
@@ -6515,7 +6722,8 @@ class _SectionHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final titleFontSize = _homeResponsiveValue(context, 22, min: 18, max: 28);
-    final trailingFontSize = _homeResponsiveValue(context, 13, min: 11, max: 16);
+    final trailingFontSize =
+        _homeResponsiveValue(context, 13, min: 11, max: 16);
     return Row(
       children: [
         Expanded(

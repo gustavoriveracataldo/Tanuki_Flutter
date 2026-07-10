@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../build_config.dart';
@@ -53,6 +54,36 @@ class RemoteCatalogService {
       return fromDefine;
     }
     return (io.Platform.environment[envKey] ?? '').trim();
+  }
+
+  void _debugResolver(String message) {
+    assert(() {
+      debugPrint('RemoteCatalogResolver: $message');
+      return true;
+    }());
+  }
+
+  String _debugUrlLabel(String value) {
+    final uri = Uri.tryParse(value);
+    if (uri == null || !uri.hasScheme) {
+      return value;
+    }
+    final path =
+        uri.path.length > 52 ? '${uri.path.substring(0, 52)}...' : uri.path;
+    return '${uri.scheme}://${uri.host}$path';
+  }
+
+  String _debugStreamLabel(RemoteDirectStream? stream) {
+    if (stream == null) {
+      return 'null';
+    }
+    return 'provider=${stream.provider?.id ?? 'none'} '
+        'kind=${stream.playbackKind} mode=${stream.selectedMode} '
+        'server=${stream.server} url=${_debugUrlLabel(stream.playbackUrl)} '
+        'page=${_debugUrlLabel(stream.pageUrl)} '
+        'modes=${stream.availableModes.join(',')} '
+        'subs=${stream.subtitleTracks.length} '
+        'headers=${stream.httpHeaders.keys.join(',')}';
   }
 
   Future<List<RemoteSearchCandidate>> search(String query) async {
@@ -1073,7 +1104,15 @@ class RemoteCatalogService {
     String preferredServer = '',
     Set<String> excludedServers = const {},
   }) async {
+    _debugResolver(
+      'resolve start provider=${entry.provider?.id ?? 'none'} '
+      'episode="${entry.displayName}" preferredMode=$preferredMode '
+      'preferredFacebookMode=$preferredFacebookMode '
+      'preferredServer=$preferredServer excludedServers=${excludedServers.join(',')} '
+      'file=${_debugUrlLabel(entry.filePath)} watch=${_debugUrlLabel(entry.watchUrl)}',
+    );
     if (entry.provider == RemoteProvider.animeKai) {
+      _debugResolver('resolve skipped animekai provider');
       return null;
     }
     if (entry.provider != RemoteProvider.animeAv1) {
@@ -1084,38 +1123,57 @@ class RemoteCatalogService {
         excludedServers: excludedServers,
       );
       if (resolved != null) {
+        _debugResolver('generic resolved ${_debugStreamLabel(resolved)}');
         return resolved;
       }
-      return _resolvePlatformWebDirectStream(
+      final webResolved = await _resolvePlatformWebDirectStream(
         entry,
         preferredServer: preferredServer,
         excludedServers: excludedServers,
       );
+      _debugResolver('generic web fallback ${_debugStreamLabel(webResolved)}');
+      return webResolved;
     }
     final seriesUrl = _normalizeAnimeAv1SeriesUrl(
         entry.watchUrl.isNotEmpty ? entry.watchUrl : entry.filePath);
     if (seriesUrl.isEmpty) {
-      return _resolvePlatformWebDirectStream(
+      _debugResolver('animeav1 empty series url, using platform web');
+      final webResolved = await _resolvePlatformWebDirectStream(
         entry,
         preferredServer: preferredServer,
         excludedServers: excludedServers,
       );
+      _debugResolver(
+          'animeav1 empty series web ${_debugStreamLabel(webResolved)}');
+      return webResolved;
     }
     final episodeUrl = _buildAnimeAv1EpisodeUrl(seriesUrl, entry.episodeNumber);
     if (episodeUrl.isEmpty) {
-      return _resolvePlatformWebDirectStream(
+      _debugResolver('animeav1 empty episode url, using platform web');
+      final webResolved = await _resolvePlatformWebDirectStream(
         entry,
         preferredServer: preferredServer,
         excludedServers: excludedServers,
       );
+      _debugResolver(
+        'animeav1 empty episode web ${_debugStreamLabel(webResolved)}',
+      );
+      return webResolved;
     }
+    _debugResolver('animeav1 fetch ${_debugUrlLabel(episodeUrl)}');
     final response = await _get(Uri.parse(episodeUrl));
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      return _resolvePlatformWebDirectStream(
+      print('RemoteCatalogService: animeav1 episode fetch failed '
+          '(${response.statusCode}) for $episodeUrl');
+      print('RemoteCatalogService: response body snippet: '
+          "${response.body.substring(0, response.body.length.clamp(0, 400))}");
+      final webResolved = await _resolvePlatformWebDirectStream(
         entry,
         preferredServer: preferredServer,
         excludedServers: excludedServers,
       );
+      _debugResolver('animeav1 fetch web ${_debugStreamLabel(webResolved)}');
+      return webResolved;
     }
 
     final playbackByMode = <String, String>{};
@@ -1125,14 +1183,26 @@ class RemoteCatalogService {
     if (subHls.isNotEmpty) {
       playbackByMode[_animeAv1ModeSubHls] = subHls;
       playPageByMode[_animeAv1ModeSubHls] = subPlayUrl;
+      _debugResolver(
+        'animeav1 SUB play=${_debugUrlLabel(subPlayUrl)} '
+        'hls=${_debugUrlLabel(subHls)}',
+      );
     }
     final dubPlayUrl = _extractAnimeAv1PlayUrl(response.body, 'DUB');
     final dubHls = _buildAnimeAv1HlsUrl(dubPlayUrl);
     if (dubHls.isNotEmpty) {
       playbackByMode[_animeAv1ModeDubHls] = dubHls;
       playPageByMode[_animeAv1ModeDubHls] = dubPlayUrl;
+      _debugResolver(
+        'animeav1 DUB play=${_debugUrlLabel(dubPlayUrl)} '
+        'hls=${_debugUrlLabel(dubHls)}',
+      );
     }
     if (playbackByMode.isEmpty) {
+      print(
+          'RemoteCatalogService: animeav1 no playback modes found for $episodeUrl');
+      print('RemoteCatalogService: response body snippet: '
+          "${response.body.substring(0, response.body.length.clamp(0, 400))}");
       for (final playUrl
           in _extractAnimeAv1PlayUrls(response.body, episodeUrl)) {
         final hlsUrl = _buildAnimeAv1HlsUrl(playUrl);
@@ -1141,15 +1211,21 @@ class RemoteCatalogService {
         }
         playbackByMode['iframe-hls'] = hlsUrl;
         playPageByMode['iframe-hls'] = playUrl;
+        _debugResolver(
+          'animeav1 iframe fallback play=${_debugUrlLabel(playUrl)} '
+          'hls=${_debugUrlLabel(hlsUrl)}',
+        );
         break;
       }
     }
     if (playbackByMode.isEmpty) {
-      return _resolvePlatformWebDirectStream(
+      final webResolved = await _resolvePlatformWebDirectStream(
         entry,
         preferredServer: preferredServer,
         excludedServers: excludedServers,
       );
+      _debugResolver('animeav1 no modes web ${_debugStreamLabel(webResolved)}');
+      return webResolved;
     }
     final selectedMode = playbackByMode.containsKey(preferredMode)
         ? preferredMode
@@ -1158,15 +1234,18 @@ class RemoteCatalogService {
             : playbackByMode.keys.first;
     final playbackUrl = playbackByMode[selectedMode] ?? '';
     if (playbackUrl.isEmpty) {
+      _debugResolver('animeav1 selected mode $selectedMode has empty url');
       return null;
     }
-    return RemoteDirectStream(
+    final resolved = RemoteDirectStream(
       playbackUrl: playbackUrl,
       playbackKind: 'hls',
       pageUrl: playPageByMode[selectedMode] ?? episodeUrl,
       availableModes: playbackByMode.keys.toSet(),
       selectedMode: selectedMode,
     );
+    _debugResolver('animeav1 resolved ${_debugStreamLabel(resolved)}');
+    return resolved;
   }
 
   Future<RemoteDirectStream?> _resolvePlatformWebDirectStream(
@@ -1176,12 +1255,21 @@ class RemoteCatalogService {
   }) async {
     final provider = entry.provider;
     if (!_shouldUsePlatformWebResolver(provider)) {
+      _debugResolver(
+        'platform web skipped provider=${provider?.id ?? 'none'} available=${_webResolver.isAvailable}',
+      );
       return null;
     }
     final pageUrl = _buildRemoteEpisodePageUrl(entry);
     if (pageUrl.isEmpty) {
+      _debugResolver('platform web skipped empty page url');
       return null;
     }
+    _debugResolver(
+      'platform web start provider=${provider?.id ?? 'none'} '
+      'page=${_debugUrlLabel(pageUrl)} preferredServer=$preferredServer '
+      'excludedServers=${excludedServers.join(',')}',
+    );
     final resolved = await _webResolver.resolveDirectStream(
       entry: entry,
       pageUrl: pageUrl,
@@ -1190,6 +1278,7 @@ class RemoteCatalogService {
       excludedServers: excludedServers,
     );
     if (resolved == null) {
+      _debugResolver('platform web returned null');
       return null;
     }
     final server = resolved.server.trim().isNotEmpty
@@ -1199,7 +1288,9 @@ class RemoteCatalogService {
                 ? resolved.pageUrl
                 : resolved.playbackUrl,
           );
-    return resolved.copyWith(provider: provider, server: server);
+    final tagged = resolved.copyWith(provider: provider, server: server);
+    _debugResolver('platform web resolved ${_debugStreamLabel(tagged)}');
+    return tagged;
   }
 
   bool _shouldUsePlatformWebResolver(RemoteProvider? provider) {
@@ -1220,28 +1311,40 @@ class RemoteCatalogService {
   }) async {
     final pageUrl = _buildRemoteEpisodePageUrl(entry);
     if (pageUrl.isEmpty) {
+      _debugResolver('generic skipped empty page url');
       return null;
     }
     final directKind = _inferPlaybackKind(pageUrl);
     if (directKind.isNotEmpty) {
-      return RemoteDirectStream(
+      final direct = RemoteDirectStream(
         playbackUrl: pageUrl,
         playbackKind: directKind,
         pageUrl: pageUrl,
         availableModes: const {'direct'},
         selectedMode: 'direct',
       );
+      _debugResolver('generic direct ${_debugStreamLabel(direct)}');
+      return direct;
     }
 
     final uri = Uri.tryParse(pageUrl);
     if (uri == null || !uri.hasScheme) {
+      _debugResolver('generic invalid page url $pageUrl');
       return null;
     }
+    _debugResolver(
+      'generic fetch page=${_debugUrlLabel(pageUrl)} '
+      'referer=${_debugUrlLabel(entry.watchUrl)}',
+    );
     final response = await _get(uri, referer: entry.watchUrl);
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      _debugResolver(
+        'generic fetch failed status=${response.statusCode} '
+        'page=${_debugUrlLabel(pageUrl)}',
+      );
       return null;
     }
-    return _resolveDirectStreamFromHtml(
+    final resolved = await _resolveDirectStreamFromHtml(
       html: response.body,
       pageUrl: pageUrl,
       referer: entry.watchUrl,
@@ -1250,6 +1353,8 @@ class RemoteCatalogService {
       preferredServer: preferredServer,
       excludedServers: excludedServers,
     );
+    _debugResolver('generic html resolved ${_debugStreamLabel(resolved)}');
+    return resolved;
   }
 
   Future<RemoteDirectStream?> _resolveDirectStreamFromHtml({
@@ -1665,12 +1770,63 @@ class RemoteCatalogService {
   String _jikanTrailerUrl(Map trailer) {
     final youtubeId = _readString(trailer['youtube_id']);
     if (youtubeId.isNotEmpty) {
-      return 'https://www.youtube.com/watch?v=$youtubeId';
+      return _youtubeWatchUrl(youtubeId);
     }
-    return _firstNonEmpty([
+    return _normalizeYoutubeTrailerUrl(_firstNonEmpty([
       _readString(trailer['url']),
       _readString(trailer['embed_url']),
-    ]);
+    ]));
+  }
+
+  String _normalizeYoutubeTrailerUrl(String value) {
+    final videoId = _youtubeVideoIdFromUrl(value);
+    if (videoId.isEmpty) {
+      return value;
+    }
+    return _youtubeWatchUrl(videoId);
+  }
+
+  String _youtubeWatchUrl(String videoId) {
+    return 'https://www.youtube.com/watch?v=$videoId';
+  }
+
+  String _youtubeVideoIdFromUrl(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null) {
+      return '';
+    }
+    final host = uri.host.toLowerCase();
+    final isYoutube = host == 'youtube.com' ||
+        host.endsWith('.youtube.com') ||
+        host == 'youtube-nocookie.com' ||
+        host.endsWith('.youtube-nocookie.com') ||
+        host == 'youtu.be' ||
+        host.endsWith('.youtu.be');
+    if (!isYoutube) {
+      return '';
+    }
+    final queryId = uri.queryParameters['v'];
+    if (_isYoutubeVideoId(queryId)) {
+      return queryId!;
+    }
+    final segments = uri.pathSegments;
+    if ((host == 'youtu.be' || host.endsWith('.youtu.be')) &&
+        segments.isNotEmpty &&
+        _isYoutubeVideoId(segments.first)) {
+      return segments.first;
+    }
+    for (var index = 0; index < segments.length - 1; index += 1) {
+      final marker = segments[index].toLowerCase();
+      if ((marker == 'embed' || marker == 'shorts' || marker == 'live') &&
+          _isYoutubeVideoId(segments[index + 1])) {
+        return segments[index + 1];
+      }
+    }
+    return '';
+  }
+
+  bool _isYoutubeVideoId(String? value) {
+    return value != null && RegExp(r'^[0-9A-Za-z_-]{11}$').hasMatch(value);
   }
 
   Future<RemoteSearchCandidate> _enrichCandidateVisuals(
@@ -1985,9 +2141,8 @@ class RemoteCatalogService {
     final tmdbPosterAssetUrl =
         _pickTmdbImageAsset(images, 'posters', preferJapanese: true);
     final tmdbBackdropAssetUrl = _pickTmdbImageAsset(images, 'backdrops');
-    final explicitSeasonNumber = mediaType == 'tv'
-        ? _explicitSeasonNumberForCandidate(candidate)
-        : 0;
+    final explicitSeasonNumber =
+        mediaType == 'tv' ? _explicitSeasonNumberForCandidate(candidate) : 0;
     final seasonNumber = mediaType == 'tv'
         ? _pickBestTmdbSeasonNumber(
             details,
@@ -4847,6 +5002,9 @@ class RemoteCatalogService {
     if (normalized.isEmpty) {
       return '';
     }
+    if (_isBlockedDirectMediaAsset(normalized)) {
+      return '';
+    }
     if (_isKnownEmbedWrapperUrl(normalized)) {
       return '';
     }
@@ -4867,6 +5025,28 @@ class RemoteCatalogService {
       return 'mp4';
     }
     return '';
+  }
+
+  bool _isBlockedDirectMediaAsset(String value) {
+    final uri = Uri.tryParse(value);
+    if (uri == null) {
+      return false;
+    }
+    final host = uri.host.toLowerCase();
+    final path = uri.path.toLowerCase();
+    final query = uri.query.toLowerCase();
+    final combined = '$host $path $query';
+    if (host == 'pbs.twimg.com' ||
+        host.endsWith('.twimg.com') ||
+        host.contains('twitter.com') ||
+        host == 'x.com' ||
+        host.endsWith('.x.com')) {
+      return true;
+    }
+    return combined.contains('x-card') ||
+        combined.contains('tweet_video') ||
+        combined.contains('/static/money/') ||
+        combined.contains('twitter_card');
   }
 
   bool _isKnownEmbedWrapperUrl(String value) {
