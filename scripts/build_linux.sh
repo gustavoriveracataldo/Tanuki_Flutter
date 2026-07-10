@@ -64,7 +64,9 @@ ensure_linux_build_deps() {
   if ! pkg-config --exists gtk+-3.0 2>/dev/null; then
     packages="$packages libgtk-3-dev"
   fi
-  if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+  if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null &&
+     ! pkg-config --exists webkit2gtk-4.2 2>/dev/null &&
+     ! pkg-config --exists webkit2gtk-4.3 2>/dev/null; then
     packages="$packages libwebkit2gtk-4.1-dev"
   fi
   if ! pkg-config --exists libsoup-3.0 2>/dev/null; then
