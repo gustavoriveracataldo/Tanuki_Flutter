@@ -25,6 +25,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.13.1"
+  audio_video_progress_bar:
+    dependency: "direct overridden"
+    description:
+      name: audio_video_progress_bar
+      sha256: "552b1f73c56c4c88407999e0a8507176f60c56de3e6d63bc20a0eab48467d4c9"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.3"
   boolean_selector:
     dependency: transitive
     description:
@@ -89,6 +97,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.2"
+  dart_vlc:
+    dependency: "direct main"
+    description:
+      name: dart_vlc
+      sha256: f93499b938fbb6ce9eb3fb0368878cd18eac4e18ed45956731a0d6e758d75a34
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.4.0"
+  dart_vlc_ffi:
+    dependency: transitive
+    description:
+      name: dart_vlc_ffi
+      sha256: "670d4b27296935e4e4b8d903d6833c222fc94133bbd3e9fa36d8a2e7751a63d0"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.2.0+1"
   dbus:
     dependency: transitive
     description:
@@ -173,35 +197,11 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
-  freezed_annotation:
-    dependency: transitive
-    description:
-      name: freezed_annotation
-      sha256: "7294967ff0a6d98638e7acb774aac3af2550777accd8149c90af5b014e6d44d8"
-      url: "https://pub.dev"
-    source: hosted
-    version: "3.1.0"
   fuchsia_remote_debug_protocol:
     dependency: transitive
     description: flutter
     source: sdk
     version: "0.0.0"
-  fullscreen_window:
-    dependency: transitive
-    description:
-      name: fullscreen_window
-      sha256: "262a19366157542c3e1fa07232ee7e8a5c82e5223d912b04a2771c47aa6a048d"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.2.1"
-  fvp:
-    dependency: "direct main"
-    description:
-      name: fvp
-      sha256: ac06c5ecdf65abb2ce413c9ca6c73fd74bff7c394879c17a98d6b94056b71c52
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.37.3"
   hooks:
     dependency: transitive
     description:
@@ -263,14 +263,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.1"
-  json_annotation:
-    dependency: transitive
-    description:
-      name: json_annotation
-      sha256: "2a743920d81b7910627f68ee2c9ac1fc0bfee32b9fc3403587d7c6791ca12f80"
-      url: "https://pub.dev"
-    source: hosted
-    version: "4.12.0"
   leak_tracker:
     dependency: transitive
     description:
@@ -551,14 +543,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.0.4"
-  simple_sparse_list:
-    dependency: transitive
-    description:
-      name: simple_sparse_list
-      sha256: aa648fd240fa39b49dcd11c19c266990006006de6699a412de485695910fbc1f
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.1.4"
   sky_engine:
     dependency: transitive
     description: flutter
@@ -636,14 +620,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.4.0"
-  unicode:
-    dependency: transitive
-    description:
-      name: unicode
-      sha256: a6f7bcfc8ea1d5ce1f6c0b1c39117a9919f4953edd9fd7a64090a9796c499b57
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.1.9"
   universal_platform:
     dependency: transitive
     description:
@@ -820,6 +796,46 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.1.0"
+  webview_all:
+    dependency: "direct main"
+    description:
+      name: webview_all
+      sha256: "618828779774dfc4cf726bbdcb323dd4b2482b81e7df2cb4218c5bb916369019"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.1"
+  webview_all_linux:
+    dependency: transitive
+    description:
+      name: webview_all_linux
+      sha256: "8303b57455ed4ac646102cbdb46a5f69c23cca0d1bd6e27adb76b5afc4dec679"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.1"
+  webview_all_ohos:
+    dependency: transitive
+    description:
+      name: webview_all_ohos
+      sha256: a5601f843d7d6fffc41ffe6946d435220496c755a72f1a4014cdbd614991d444
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.1"
+  webview_all_web:
+    dependency: transitive
+    description:
+      name: webview_all_web
+      sha256: fd5d2a3f35a76e5e8e8819a9c41cf243a8bd875b1b3814798946f512c9b258fe
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.1"
+  webview_all_windows:
+    dependency: transitive
+    description:
+      name: webview_all_windows
+      sha256: "95e7b0abdd893d4c2b186b21a2fb8a383a909044a10190e9d94b199cb0a6a46c"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.1"
   webview_flutter:
     dependency: "direct main"
     description:
@@ -852,14 +868,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.25.1"
-  webview_win_floating:
-    dependency: "direct main"
-    description:
-      name: webview_win_floating
-      sha256: "40b4f6c66554d3eb9c486952b5c072e2478f9471f64e6d63e92ddc4e527b7aa8"
-      url: "https://pub.dev"
-    source: hosted
-    version: "3.0.3"
   win32:
     dependency: transitive
     description:
@@ -892,14 +900,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.1.3"
-  youtube_explode_dart:
-    dependency: "direct main"
-    description:
-      name: youtube_explode_dart
-      sha256: "10134a53989b2f3dc576121735aec8fc6d88784956f4a2ad1a2525b006373a76"
-      url: "https://pub.dev"
-    source: hosted
-    version: "3.1.0"
 sdks:
   dart: ">=3.11.0 <4.0.0"
   flutter: ">=3.38.4"

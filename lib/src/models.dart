@@ -10,6 +10,7 @@ enum RemoteProvider {
   latAnime,
   animeFlv,
   facebook,
+  bilibili,
   catalog,
 }
 
@@ -31,6 +32,7 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.latAnime => 'latanime',
       RemoteProvider.animeFlv => 'animeflv',
       RemoteProvider.facebook => 'facebook',
+      RemoteProvider.bilibili => 'bilibili',
       RemoteProvider.catalog => 'catalog',
     };
   }
@@ -43,6 +45,7 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.latAnime => 'LatAnime',
       RemoteProvider.animeFlv => 'AnimeFLV',
       RemoteProvider.facebook => 'Facebook',
+      RemoteProvider.bilibili => 'BiliBili',
       RemoteProvider.catalog => 'Catalogo',
     };
   }
@@ -1139,7 +1142,7 @@ class UserProfileState {
   const UserProfileState({
     this.id = 'principal',
     this.name = 'Principal',
-    this.avatarPresetId = 'sunrise',
+    this.avatarPresetId = 'avatar_01',
     this.playlists = const [
       PlaylistState(id: 'default', name: 'Playlist principal')
     ],
@@ -1199,7 +1202,8 @@ class UserProfileState {
     return UserProfileState(
       id: _readString(json['id'], fallback: 'principal'),
       name: _readString(json['name'], fallback: 'Principal'),
-      avatarPresetId: _readString(json['avatarPresetId'], fallback: 'sunrise'),
+      avatarPresetId:
+          _readString(json['avatarPresetId'], fallback: 'avatar_01'),
       playlists: normalizedPlaylists,
       activePlaylistId:
           normalizedPlaylists.any((playlist) => playlist.id == activeId)

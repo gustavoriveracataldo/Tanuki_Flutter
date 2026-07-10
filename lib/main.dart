@@ -1,8 +1,8 @@
 import 'dart:io';
 
+import 'package:dart_vlc/dart_vlc.dart' as vlc;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:fvp/fvp.dart' as fvp;
 
 import 'src/app_controller.dart';
 import 'src/services/playback_backend.dart';
@@ -11,7 +11,7 @@ import 'src/ui/toonami_app.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (Platform.isLinux || Platform.isWindows) {
-    fvp.registerWith();
+    vlc.DartVLC.initialize();
   }
   PlaybackBackend.ensureInitialized();
   await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);

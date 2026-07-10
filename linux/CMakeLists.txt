@@ -56,6 +56,24 @@ pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 pkg_check_modules(MEDIA_KIT_LINUX_MPV QUIET mpv)
 pkg_check_modules(MEDIA_KIT_LINUX_EPOXY QUIET epoxy)
 
+# dart_vlc links with -lvlc, while Debian keeps the unversioned libvlc.so
+# symlink in the optional development package. Link through a build-local
+# alias to the runtime library that Tanuki actually needs.
+find_file(VLC_RUNTIME_LIBRARY
+  NAMES libvlc.so.5
+  PATHS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
+)
+if(VLC_RUNTIME_LIBRARY)
+  set(VLC_RUNTIME_LINK_DIR "${CMAKE_BINARY_DIR}/vlc-runtime")
+  file(MAKE_DIRECTORY "${VLC_RUNTIME_LINK_DIR}")
+  file(CREATE_LINK
+    "${VLC_RUNTIME_LIBRARY}"
+    "${VLC_RUNTIME_LINK_DIR}/libvlc.so"
+    SYMBOLIC
+  )
+  link_directories("${VLC_RUNTIME_LINK_DIR}")
+endif()
+
 function(_media_kit_linux_has_valid_paths result_var prefix)
   set(_valid TRUE)
   foreach(_path IN LISTS ${prefix}_INCLUDE_DIRS)
@@ -71,10 +89,8 @@ function(_media_kit_linux_has_valid_paths result_var prefix)
   set(${result_var} "${_valid}" PARENT_SCOPE)
 endfunction()
 
-# Keep Linux builds reproducible on machines without valid libmpv-dev/epoxy
-# development files. When mpv and epoxy are present and their pkg-config paths
-# resolve to real directories, media_kit_video builds the embedded player;
-# otherwise Dart falls back to the system default player.
+# media_kit is kept for local/non-remote playback paths. Remote series playback
+# on Linux uses VLC, so missing mpv development files must not block the build.
 set(_media_kit_linux_mpv_valid FALSE)
 set(_media_kit_linux_epoxy_valid FALSE)
 if(MEDIA_KIT_LINUX_MPV_FOUND)
@@ -87,7 +103,8 @@ endif()
 if(MEDIA_KIT_LINUX_MPV_FOUND AND MEDIA_KIT_LINUX_EPOXY_FOUND AND _media_kit_linux_mpv_valid AND _media_kit_linux_epoxy_valid)
   set(MEDIA_KIT_LIBS_AVAILABLE ON CACHE BOOL "Build media_kit with mpv video output on Linux" FORCE)
 else()
-  set(MEDIA_KIT_LIBS_AVAILABLE OFF CACHE BOOL "Build media_kit without mpv headers on Linux" FORCE)
+  set(MEDIA_KIT_LIBS_AVAILABLE OFF CACHE BOOL "Build media_kit with mpv video output on Linux" FORCE)
+  message(STATUS "media_kit/mpv development files not available; Linux remote series playback uses VLC")
 endif()
 
 # Application build; see runner/CMakeLists.txt.

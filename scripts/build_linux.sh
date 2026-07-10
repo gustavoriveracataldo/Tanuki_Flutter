@@ -3,6 +3,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
+export TANUKI_PROJECT_ROOT="$PROJECT_ROOT"
 
 FLUTTER_BIN="${FLUTTER_BIN:-flutter}"
 if ! command -v "$FLUTTER_BIN" >/dev/null 2>&1 && [ -x "$HOME/.codex/sdks/flutter/bin/flutter" ]; then
@@ -33,9 +34,9 @@ if [ -f "$CMAKE_CACHE" ] && grep -q '^MEDIA_KIT_LIBS_AVAILABLE:BOOL=OFF$' "$CMAK
   rm -rf "$LINUX_RELEASE_DIR"
 fi
 
-ensure_linux_media_kit_build_deps() {
+ensure_linux_build_deps() {
   if [ "${TANUKI_SKIP_MEDIA_KIT_DEPS:-0}" = "1" ]; then
-    printf 'Skipping automatic Linux media_kit dependency installation.\n'
+    printf 'Skipping automatic Linux dependency installation.\n'
     return
   fi
 
@@ -63,6 +64,12 @@ ensure_linux_media_kit_build_deps() {
   if ! pkg-config --exists gtk+-3.0 2>/dev/null; then
     packages="$packages libgtk-3-dev"
   fi
+  if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+    packages="$packages libwebkit2gtk-4.1-dev"
+  fi
+  if ! pkg-config --exists libsoup-3.0 2>/dev/null; then
+    packages="$packages libsoup-3.0-dev"
+  fi
   if ! command -v cmake >/dev/null 2>&1; then
     packages="$packages cmake"
   fi
@@ -85,20 +92,15 @@ ensure_linux_media_kit_build_deps() {
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y $packages
   else
-    printf 'Unable to install Linux media_kit dependencies automatically because apt-get is not available.\n'
+    printf 'Unable to install Linux build dependencies automatically because apt-get is not available.\n'
     printf 'Please install: %s\n' "$packages"
   fi
 }
 
-ensure_linux_media_kit_build_deps
+ensure_linux_build_deps
 
-FLUTTER_DART_DEFINES=""
-for key in TMDB_BEARER_TOKEN TMDB_API_KEY FANART_API_KEY SIMKL_CLIENT_ID MYANIMELIST_CLIENT_ID MYANIMELIST_CLIENT_SECRET; do
-  value="$(eval "printf '%s' \"\${$key:-}\"")"
-  if [ -n "$value" ]; then
-    FLUTTER_DART_DEFINES="$FLUTTER_DART_DEFINES --dart-define=$key=$value"
-  fi
-done
+. "$PROJECT_ROOT/scripts/load_flutter_secrets.sh"
+FLUTTER_DART_DEFINES="$(tanuki_flutter_dart_defines)"
 
 "$FLUTTER_BIN" pub get
 # shellcheck disable=SC2086

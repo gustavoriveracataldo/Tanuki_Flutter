@@ -4,15 +4,9 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:media_kit/media_kit.dart';
-import 'package:media_kit_video/media_kit_video.dart';
-import 'package:video_player/video_player.dart' as vp;
-import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_all/webview_all.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
-import 'package:webview_win_floating/webview_plugin.dart' as desktop_webview;
-import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
 
-import '../services/playback_backend.dart';
 import 'toonami_theme.dart';
 
 const _trailerUserAgent =
@@ -63,17 +57,13 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   int _index = 0;
   String _status = 'Preparando trailer...';
   String _error = '';
-  Player? _player;
-  VideoController? _videoController;
-  StreamSubscription<bool>? _playerCompletedSubscription;
-  vp.VideoPlayerController? _fallbackVideoController;
   WebViewController? _webViewController;
-  yt.YoutubeExplode? _youtube;
   bool _openedInApp = false;
   bool _opening = false;
   bool _usingWebView = false;
-  bool _usingFallbackVideo = false;
   int _openTicket = 0;
+  final FocusNode _trailerRootFocusNode = FocusNode(debugLabel: 'trailerRoot');
+  final FocusNode _trailerBackFocusNode = FocusNode(debugLabel: 'trailerBack');
 
   TrailerQueueEntry? get _current {
     if (widget.entries.isEmpty ||
@@ -134,9 +124,10 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     }
     setState(() {
       _opening = false;
-      _status = 'Probando trailer web...';
+      _status = 'Reproductor nativo no disponible.';
+      _error = 'No se pudo iniciar el reproductor de trailers de Android.';
     });
-    return false;
+    return true;
   }
 
   Future<void> _openCurrentTrailer() async {
@@ -163,215 +154,16 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
       'youtubeId=${youtubeId.isEmpty ? '<none>' : youtubeId} '
       'url=$trailerUrl',
     );
-    if (shouldOpenTrailerInWebViewFirst(
-      trailerUrl,
-      platform: defaultTargetPlatform,
-      isWeb: kIsWeb,
-    )) {
+    if (_canUseWebTrailer) {
       await _openCurrentTrailerInWebView(trailerUrl, ticket);
-      return;
-    }
-    if (_canUseWebTrailer &&
-        youtubeId.isEmpty &&
-        !isYouTubeTrailerUrl(trailerUrl)) {
-      await _openCurrentTrailerInWebView(trailerUrl, ticket);
-      return;
-    }
-    final previousWebViewController = _webViewController;
-    setState(() {
-      _openedInApp = false;
-      _opening = true;
-      _usingWebView = false;
-      _usingFallbackVideo = false;
-      _webViewController = null;
-      _error = '';
-      _status = 'Cargando trailer en la app...';
-    });
-    _disposeDesktopWebViewController(previousWebViewController);
-    await _disposeFallbackVideoController();
-    try {
-      final playableUrl = await _resolvePlayableTrailerUrl(trailerUrl)
-          .timeout(const Duration(seconds: 16));
-      if (!mounted || ticket != _openTicket) {
-        return;
-      }
-      if (canUseFallbackTrailerVideoPlayer(
-        platform: defaultTargetPlatform,
-        isWeb: kIsWeb,
-      )) {
-        final openedWithFallback =
-            await _openWithFallbackVideoPlayer(playableUrl, ticket);
-        if (openedWithFallback || !mounted || ticket != _openTicket) {
-          return;
-        }
-      } else if (mounted && ticket == _openTicket) {
-        setState(() {
-          _status = 'Probando media_kit...';
-        });
-      }
-      if (!await _ensureMediaKitTrailerBackend()) {
-        throw StateError(PlaybackBackend.initializationError.isNotEmpty
-            ? PlaybackBackend.initializationError
-            : 'media_kit no esta disponible.');
-      }
-      final player = _player;
-      final videoController = _videoController;
-      if (player == null || videoController == null) {
-        throw StateError(PlaybackBackend.initializationError.isNotEmpty
-            ? PlaybackBackend.initializationError
-            : 'media_kit no esta disponible.');
-      }
-      await _openWithMediaKit(player, videoController, playableUrl, ticket);
-    } catch (error) {
-      if (!mounted || ticket != _openTicket) {
-        return;
-      }
-      try {
-        final player = _player;
-        if (player != null) {
-          await player.stop();
-        }
-      } catch (_) {}
-      if (!mounted || ticket != _openTicket) {
-        return;
-      }
-      debugPrint('TrailerQueueScreen: native trailer playback failed: $error');
-      if (shouldFallbackTrailerToWebView(
-        trailerUrl,
-        platform: defaultTargetPlatform,
-        isWeb: kIsWeb,
-      )) {
-        setState(() {
-          _status = 'Probando trailer web...';
-        });
-        await _openCurrentTrailerInWebView(trailerUrl, ticket);
-        return;
-      }
-      setState(() {
-        _openedInApp = false;
-        _opening = false;
-        _usingWebView = false;
-        _usingFallbackVideo = false;
-        _status = 'No se pudo reproducir en app.';
-        _error = _trailerPlaybackFailureMessage(trailerUrl, error);
-      });
-    }
-  }
-
-  Future<bool> _ensureMediaKitTrailerBackend() async {
-    if (_player != null && _videoController != null) {
-      return true;
-    }
-    try {
-      PlaybackBackend.ensureInitialized();
-    } catch (error) {
-      if (mounted) {
-        setState(() {
-          _status = 'Reproductor embebido no disponible.';
-          _error = error.toString();
-        });
-      }
-      return false;
-    }
-    if (!PlaybackBackend.mediaKitAvailable) {
-      return false;
-    }
-    final player = Player();
-    _player = player;
-    _videoController = VideoController(player);
-    _playerCompletedSubscription = player.stream.completed.listen((completed) {
-      if (completed && mounted) {
-        _handleTrailerEnded();
-      }
-    });
-    return true;
-  }
-
-  Future<bool> _openWithFallbackVideoPlayer(
-    String playableUrl,
-    int ticket,
-  ) async {
-    vp.VideoPlayerController? controller;
-    try {
-      setState(() {
-        _status = 'Probando reproductor alternativo...';
-      });
-      controller = vp.VideoPlayerController.networkUrl(
-        Uri.parse(playableUrl),
-        httpHeaders: _trailerPlaybackHeaders(playableUrl),
-      );
-      await controller.initialize().timeout(const Duration(seconds: 14));
-      var handledCompletion = false;
-      controller.addListener(() {
-        if (handledCompletion || !mounted || ticket != _openTicket) {
-          return;
-        }
-        final value = controller!.value;
-        if (!value.isInitialized || value.duration <= Duration.zero) {
-          return;
-        }
-        final remaining = value.duration - value.position;
-        if (remaining <= const Duration(milliseconds: 700)) {
-          handledCompletion = true;
-          _handleTrailerEnded();
-        }
-      });
-      await controller.play().timeout(const Duration(seconds: 6));
-      if (!mounted || ticket != _openTicket) {
-        await controller.dispose();
-        return true;
-      }
-      setState(() {
-        _fallbackVideoController = controller;
-        _openedInApp = true;
-        _opening = false;
-        _usingFallbackVideo = true;
-        _usingWebView = false;
-        _status = 'Trailer en reproductor alternativo';
-      });
-      return true;
-    } catch (_) {
-      try {
-        await controller?.dispose();
-      } catch (_) {}
-      if (mounted && ticket == _openTicket) {
-        setState(() {
-          _status = 'Probando media_kit...';
-        });
-      }
-      return false;
-    }
-  }
-
-  Future<void> _openWithMediaKit(
-    Player player,
-    VideoController videoController,
-    String playableUrl,
-    int ticket,
-  ) async {
-    await videoController.platform.future;
-    await player.stop();
-    if (!mounted || ticket != _openTicket) {
-      return;
-    }
-    await player
-        .open(
-          Media(
-            playableUrl,
-            httpHeaders: _trailerPlaybackHeaders(playableUrl),
-          ),
-          play: true,
-        )
-        .timeout(const Duration(seconds: 12));
-    if (!mounted || ticket != _openTicket) {
       return;
     }
     setState(() {
-      _openedInApp = true;
+      _openedInApp = false;
       _opening = false;
       _usingWebView = false;
-      _usingFallbackVideo = false;
-      _status = 'Trailer en media_kit';
+      _status = 'Reproductor de trailers no disponible.';
+      _error = 'Esta plataforma no ofrece un WebView compatible.';
     });
   }
 
@@ -379,20 +171,16 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     String trailerUrl,
     int ticket,
   ) async {
-    await _disposeFallbackVideoController();
     final previousWebViewController = _webViewController;
     _disposeDesktopWebViewController(previousWebViewController);
     final uri = Uri.parse(trailerUrl);
-    final isDesktopWebView = canUseFloatingDesktopTrailerWebView(
-      platform: defaultTargetPlatform,
-      isWeb: kIsWeb,
-    );
     final controller = _createTrailerWebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(Colors.black)
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (_) {
+            debugPrint('TrailerQueueScreen: WebView page started');
             if (!mounted || ticket != _openTicket) {
               return;
             }
@@ -400,11 +188,11 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               _openedInApp = true;
               _opening = true;
               _usingWebView = true;
-              _usingFallbackVideo = false;
               _status = 'Cargando trailer web...';
             });
           },
           onPageFinished: (_) {
+            debugPrint('TrailerQueueScreen: WebView page finished');
             if (!mounted || ticket != _openTicket) {
               return;
             }
@@ -412,12 +200,16 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               _openedInApp = true;
               _opening = false;
               _usingWebView = true;
-              _usingFallbackVideo = false;
               _status = 'Trailer web en app';
             });
           },
           onWebResourceError: (error) {
             final isMainFrame = error.isForMainFrame ?? true;
+            debugPrint(
+              'TrailerQueueScreen: WebView resource error '
+              'main=$isMainFrame code=${error.errorCode} '
+              'url=${error.url ?? '<unknown>'} ${error.description}',
+            );
             if (!isMainFrame || !mounted || ticket != _openTicket) {
               return;
             }
@@ -425,7 +217,6 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               _openedInApp = false;
               _opening = false;
               _usingWebView = false;
-              _usingFallbackVideo = false;
               _status = 'No se pudo reproducir en app.';
               _error = error.description;
             });
@@ -439,11 +230,11 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
           .setMixedContentMode(MixedContentMode.alwaysAllow);
       await platformController.setUseWideViewPort(true);
       await platformController.setUserAgent(_trailerUserAgent);
-    } else if (platformController
-        is desktop_webview.WindowsPlatformWebViewController) {
+    } else if (canUseFloatingDesktopTrailerWebView(
+      platform: defaultTargetPlatform,
+      isWeb: kIsWeb,
+    )) {
       await controller.setUserAgent(_trailerUserAgent);
-      await platformController.controller.enableZoom(false);
-      await platformController.controller.setVisibility(true);
     }
     await controller.addJavaScriptChannel(
       'TanukiTrailerPlayer',
@@ -452,10 +243,17 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         if (!mounted || ticket != _openTicket) {
           return;
         }
-        final Object? decoded;
+        Object? decoded;
         try {
           decoded = jsonDecode(message.message);
+          if (decoded is String) {
+            decoded = jsonDecode(decoded);
+          }
         } catch (_) {
+          debugPrint(
+            'TrailerQueueScreen: ignored malformed YouTube event '
+            '${message.message}',
+          );
           return;
         }
         if (decoded is! Map) {
@@ -467,7 +265,6 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
             _openedInApp = true;
             _opening = false;
             _usingWebView = true;
-            _usingFallbackVideo = false;
             _status = 'Trailer web en app';
           });
         } else if (type == 'index') {
@@ -497,7 +294,6 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     setState(() {
       _webViewController = controller;
       _usingWebView = true;
-      _usingFallbackVideo = false;
       _openedInApp = true;
       _opening = true;
       _error = '';
@@ -512,7 +308,10 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
           'videoId=$youtubeId baseUrl=https://www.youtube-nocookie.com',
         );
         await controller.loadHtmlString(
-          isDesktopWebView
+          canUseFloatingDesktopTrailerWebView(
+            platform: defaultTargetPlatform,
+            isWeb: kIsWeb,
+          )
               ? desktopYouTubeTrailerQueueHtml(
                   title: widget.title,
                   entries: widget.entries,
@@ -545,48 +344,6 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     }
   }
 
-  Future<String> _resolvePlayableTrailerUrl(String trailerUrl) async {
-    final videoId = _extractYouTubeVideoId(trailerUrl);
-    if (videoId.isEmpty) {
-      if (isYouTubeTrailerUrl(trailerUrl)) {
-        throw StateError('No pude detectar el ID del trailer de YouTube.');
-      }
-      return trailerUrl;
-    }
-    if (mounted) {
-      setState(() {
-        _status = 'Resolviendo trailer de YouTube...';
-      });
-    }
-    final youtube = _youtube ??= yt.YoutubeExplode();
-    final manifest = await youtube.videos.streams.getManifest(
-      videoId,
-      ytClients: [
-        yt.YoutubeApiClient.androidSdkless,
-        yt.YoutubeApiClient.ios,
-        yt.YoutubeApiClient.safari,
-        yt.YoutubeApiClient.tv,
-        yt.YoutubeApiClient.mweb,
-      ],
-    );
-    final hlsMuxed = manifest.hls.whereType<yt.HlsMuxedStreamInfo>().toList()
-      ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
-    if (hlsMuxed.isNotEmpty) {
-      return hlsMuxed.first.url.toString();
-    }
-    if (manifest.muxed.isNotEmpty) {
-      final muxed = manifest.muxed.toList()
-        ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
-      return muxed.first.url.toString();
-    }
-    if (manifest.hls.isNotEmpty) {
-      final hls = manifest.hls.toList()
-        ..sort((left, right) => right.bitrate.compareTo(left.bitrate));
-      return hls.first.url.toString();
-    }
-    throw StateError('YouTube no entrego un stream reproducible.');
-  }
-
   void _move(int delta) {
     if (widget.entries.isEmpty) {
       return;
@@ -605,17 +362,6 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     setState(() {
       _status = 'Cola terminada';
     });
-  }
-
-  Future<void> _disposeFallbackVideoController() async {
-    final controller = _fallbackVideoController;
-    _fallbackVideoController = null;
-    _usingFallbackVideo = false;
-    if (controller != null) {
-      try {
-        await controller.dispose();
-      } catch (_) {}
-    }
   }
 
   void _setCurrentTrailerIndexFromWebView(Object? rawIndex) {
@@ -658,29 +404,55 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   @override
   void dispose() {
     _openTicket += 1;
-    final player = _player;
-    final playerCompletedSubscription = _playerCompletedSubscription;
-    final fallbackVideo = _fallbackVideoController;
     final webViewController = _webViewController;
-    final youtube = _youtube;
-    _player = null;
-    _videoController = null;
-    _playerCompletedSubscription = null;
-    _fallbackVideoController = null;
     _webViewController = null;
-    _youtube = null;
-    if (player != null) {
-      unawaited(player.dispose());
-    }
-    if (playerCompletedSubscription != null) {
-      unawaited(playerCompletedSubscription.cancel());
-    }
-    if (fallbackVideo != null) {
-      unawaited(fallbackVideo.dispose());
-    }
     _disposeDesktopWebViewController(webViewController);
-    youtube?.close();
+    _trailerRootFocusNode.dispose();
+    _trailerBackFocusNode.dispose();
     super.dispose();
+  }
+
+  KeyEventResult _handleTrailerRootKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.browserBack ||
+        key == LogicalKeyboardKey.escape) {
+      unawaited(_closeTrailerQueue());
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.mediaTrackPrevious) {
+      if (_index > 0) {
+        _move(-1);
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.arrowRight ||
+        key == LogicalKeyboardKey.mediaTrackNext) {
+      if (_index < widget.entries.length - 1) {
+        _move(1);
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown) {
+      _trailerBackFocusNode.requestFocus();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.gameButtonA) {
+      if (!_trailerBackFocusNode.hasFocus) {
+        _trailerBackFocusNode.requestFocus();
+        return KeyEventResult.handled;
+      }
+    }
+    return KeyEventResult.ignored;
   }
 
   @override
@@ -691,203 +463,185 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         : widget.title;
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (_usingWebView && _webViewController != null)
-            Positioned.fill(
-                child: WebViewWidget(controller: _webViewController!))
-          else if (_usingFallbackVideo && _fallbackVideoController != null)
-            Positioned.fill(
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: _fallbackVideoController!.value.aspectRatio > 0
-                      ? _fallbackVideoController!.value.aspectRatio
-                      : 16 / 9,
-                  child: vp.VideoPlayer(_fallbackVideoController!),
-                ),
+      body: Focus(
+        focusNode: _trailerRootFocusNode,
+        autofocus: true,
+        onKeyEvent: _handleTrailerRootKey,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (_usingWebView && _webViewController != null)
+              Positioned.fill(
+                  child: WebViewWidget(controller: _webViewController!)),
+            if (!_openedInApp || _opening)
+              const Positioned.fill(
+                child: ColoredBox(color: Colors.black),
               ),
-            )
-          else if (_videoController != null)
-            Positioned.fill(
-              child: Video(
-                controller: _videoController!,
-                fit: BoxFit.contain,
-              ),
-            ),
-          if (!_openedInApp || _opening)
-            const Positioned.fill(
-              child: ColoredBox(color: Colors.black),
-            ),
-          if (!_openedInApp || _opening)
-            Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 620),
-                child: Padding(
-                  padding: const EdgeInsets.all(32),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Image.asset(
-                        'assets/images/tanuki_brand_logo.png',
-                        height: 76,
-                        fit: BoxFit.contain,
-                      ),
-                      const SizedBox(height: 24),
-                      Text(
-                        title,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.headlineMedium,
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        widget.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: TanukiColors.muted,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
+            if (!_openedInApp || _opening)
+              Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 620),
+                  child: Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Image.asset(
+                          'assets/images/tanuki_brand_logo.png',
+                          height: 76,
+                          fit: BoxFit.contain,
                         ),
-                      ),
-                      if (_error.isNotEmpty) ...[
-                        const SizedBox(height: 12),
+                        const SizedBox(height: 24),
                         Text(
-                          _error,
+                          title,
                           maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                          style: Theme.of(context).textTheme.headlineMedium,
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          widget.title,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           textAlign: TextAlign.center,
                           style: const TextStyle(
                             color: TanukiColors.muted,
-                            fontSize: 12,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
                           ),
                         ),
-                      ],
-                      const SizedBox(height: 24),
-                      Wrap(
-                        alignment: WrapAlignment.center,
-                        spacing: 12,
-                        runSpacing: 10,
-                        children: [
-                          FilledButton.icon(
-                            onPressed: _opening ? null : _openCurrentTrailer,
-                            icon: Icon(_opening
-                                ? Icons.hourglass_top
-                                : Icons.play_arrow),
-                            label: Text(
-                              _opening ? 'Cargando...' : 'Reintentar en app',
+                        if (_error.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            _error,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: TanukiColors.muted,
+                              fontSize: 12,
                             ),
                           ),
-                          OutlinedButton.icon(
-                            onPressed: () => unawaited(_openTrailerDetail()),
-                            icon: const Icon(Icons.info_outline),
-                            label: const Text('Ver detalle'),
-                          ),
                         ],
+                        const SizedBox(height: 24),
+                        Wrap(
+                          alignment: WrapAlignment.center,
+                          spacing: 12,
+                          runSpacing: 10,
+                          children: [
+                            FilledButton.icon(
+                              onPressed: _opening ? null : _openCurrentTrailer,
+                              icon: Icon(_opening
+                                  ? Icons.hourglass_top
+                                  : Icons.play_arrow),
+                              label: Text(
+                                _opening ? 'Cargando...' : 'Reintentar en app',
+                              ),
+                            ),
+                            OutlinedButton.icon(
+                              onPressed: () => unawaited(_openTrailerDetail()),
+                              icon: const Icon(Icons.info_outline),
+                              label: const Text('Ver detalle'),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            Align(
+              alignment: Alignment.topCenter,
+              child: FocusTraversalGroup(
+                policy: OrderedTraversalPolicy(),
+                child: Container(
+                  color: const Color(0x96000000),
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      FocusTraversalOrder(
+                        order: const NumericFocusOrder(1),
+                        child: _TrailerIconButton(
+                          icon: Icons.arrow_back,
+                          tooltip: 'Volver',
+                          focusNode: _trailerBackFocusNode,
+                          onPressed: () => unawaited(_closeTrailerQueue()),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      FocusTraversalOrder(
+                        order: const NumericFocusOrder(2),
+                        child: _TrailerIconButton(
+                          icon: Icons.skip_previous,
+                          tooltip: 'Trailer anterior',
+                          onPressed: _index <= 0 ? null : () => _move(-1),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      FocusTraversalOrder(
+                        order: const NumericFocusOrder(3),
+                        child: _TrailerIconButton(
+                          icon: Icons.skip_next,
+                          tooltip: 'Trailer siguiente',
+                          onPressed: _index >= widget.entries.length - 1
+                              ? null
+                              : () => _move(1),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.titleMedium,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${_index + 1}/${widget.entries.length} | $_status',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.bodyMedium,
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      FocusTraversalOrder(
+                        order: const NumericFocusOrder(4),
+                        child: _TrailerIconButton(
+                          icon: Icons.refresh,
+                          tooltip: 'Reintentar en app',
+                          onPressed: _opening ? null : _openCurrentTrailer,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      FocusTraversalOrder(
+                        order: const NumericFocusOrder(5),
+                        child: _TrailerIconButton(
+                          icon: Icons.info_outline,
+                          tooltip: 'Ver detalle',
+                          onPressed: () => unawaited(_openTrailerDetail()),
+                        ),
                       ),
                     ],
                   ),
                 ),
               ),
             ),
-          Align(
-            alignment: Alignment.topCenter,
-            child: Container(
-              color: const Color(0x96000000),
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  _TrailerIconButton(
-                    icon: Icons.arrow_back,
-                    tooltip: 'Volver',
-                    onPressed: () => unawaited(_closeTrailerQueue()),
-                  ),
-                  const SizedBox(width: 10),
-                  _TrailerIconButton(
-                    icon: Icons.skip_previous,
-                    tooltip: 'Trailer anterior',
-                    onPressed: _index <= 0 ? null : () => _move(-1),
-                  ),
-                  const SizedBox(width: 10),
-                  _TrailerIconButton(
-                    icon: Icons.skip_next,
-                    tooltip: 'Trailer siguiente',
-                    onPressed: _index >= widget.entries.length - 1
-                        ? null
-                        : () => _move(1),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          '${_index + 1}/${widget.entries.length} | $_status',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  _TrailerIconButton(
-                    icon: Icons.refresh,
-                    tooltip: 'Reintentar en app',
-                    onPressed: _opening ? null : _openCurrentTrailer,
-                  ),
-                  const SizedBox(width: 10),
-                  _TrailerIconButton(
-                    icon: Icons.info_outline,
-                    tooltip: 'Ver detalle',
-                    onPressed: () => unawaited(_openTrailerDetail()),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 }
 
-String _trailerPlaybackFailureMessage(String trailerUrl, Object error) {
-  if (isYouTubeTrailerUrl(trailerUrl)) {
-    return 'YouTube no entrego un stream reproducible para este trailer. '
-        'Prueba Ver detalle.';
-  }
-  return error.toString();
-}
-
-Map<String, String> _trailerPlaybackHeaders(String url) {
-  final uri = Uri.tryParse(url);
-  if (uri == null || !uri.host.contains('googlevideo.com')) {
-    return const {};
-  }
-  return const {
-    'User-Agent': _trailerUserAgent,
-    'Origin': 'https://www.youtube.com',
-    'Referer': 'https://www.youtube.com/',
-  };
-}
-
 String _extractYouTubeVideoId(String trailerUrl) {
-  final parsed = yt.VideoId.parseVideoId(trailerUrl);
-  if (parsed != null) {
-    return parsed;
-  }
   final uri = Uri.tryParse(trailerUrl.trim());
   if (uri == null || !isYouTubeTrailerUrl(trailerUrl)) {
     return '';
@@ -954,6 +708,7 @@ bool canUseEmbeddedTrailerWebView({
   }
   return platform == TargetPlatform.android ||
       platform == TargetPlatform.iOS ||
+      platform == TargetPlatform.linux ||
       platform == TargetPlatform.windows;
 }
 
@@ -1043,69 +798,23 @@ Uri trailerDetailUri(TrailerQueueEntry entry) {
   );
 }
 
-bool shouldOpenTrailerInWebViewFirst(
-  String trailerUrl, {
-  required TargetPlatform platform,
-  bool isWeb = kIsWeb,
-}) {
-  return canUseEmbeddedTrailerWebView(platform: platform, isWeb: isWeb) &&
-      isYouTubeTrailerUrl(trailerUrl) &&
-      _extractYouTubeVideoId(trailerUrl).isNotEmpty;
-}
-
-bool shouldFallbackTrailerToWebView(
-  String trailerUrl, {
-  required TargetPlatform platform,
-  bool isWeb = kIsWeb,
-}) {
-  return canUseEmbeddedTrailerWebView(platform: platform, isWeb: isWeb);
-}
-
-bool canUseFallbackTrailerVideoPlayer({
-  required TargetPlatform platform,
-  bool isWeb = kIsWeb,
-}) {
-  return !isWeb && platform != TargetPlatform.linux;
-}
-
 bool canUseFloatingDesktopTrailerWebView({
   required TargetPlatform platform,
   bool isWeb = kIsWeb,
 }) {
-  return !isWeb && platform == TargetPlatform.windows;
+  return !isWeb &&
+      (platform == TargetPlatform.linux || platform == TargetPlatform.windows);
 }
 
 WebViewController _createTrailerWebViewController() {
-  if (canUseFloatingDesktopTrailerWebView(
-    platform: defaultTargetPlatform,
-    isWeb: kIsWeb,
-  )) {
-    return WebViewController.fromPlatformCreationParams(
-      const desktop_webview.WindowsWebViewControllerCreationParams(
-        suspendDuringDeactive: false,
-      ),
-    );
-  }
   return WebViewController();
 }
 
 Future<void> _hideDesktopWebViewController(
   WebViewController? controller,
-) async {
-  final platformController = controller?.platform;
-  if (platformController is desktop_webview.WindowsPlatformWebViewController) {
-    try {
-      await platformController.controller.setVisibility(false);
-    } catch (_) {}
-  }
-}
+) async {}
 
-void _disposeDesktopWebViewController(WebViewController? controller) {
-  final platformController = controller?.platform;
-  if (platformController is desktop_webview.WindowsPlatformWebViewController) {
-    unawaited(platformController.controller.dispose());
-  }
-}
+void _disposeDesktopWebViewController(WebViewController? controller) {}
 
 String youtubeWebTrailerEmbedHtml(String videoId) {
   final jsVideoId = jsonEncode(videoId);
@@ -1149,16 +858,37 @@ String youtubeWebTrailerEmbedHtml(String videoId) {
   <div id="player"></div>
   <script>
     const sessionId = $jsSessionId;
-    function notify(type, detail) {
-      try {
-        if (window.TanukiTrailerPlayer && TanukiTrailerPlayer.postMessage) {
-          TanukiTrailerPlayer.postMessage(JSON.stringify({
-            type: type,
-            detail: detail || '',
-            sessionId: sessionId
-          }));
+    const pendingNotifications = [];
+    function flushNotifications() {
+      for (let i = 0; i < pendingNotifications.length;) {
+        const message = pendingNotifications[i];
+        let sent = false;
+        try {
+          if (window.TanukiTrailerPlayer && TanukiTrailerPlayer.postMessage) {
+            TanukiTrailerPlayer.postMessage(message);
+            sent = true;
+          } else if (typeof window.TanukiTrailerPlayer === 'function') {
+            window.TanukiTrailerPlayer(message, '');
+            sent = true;
+          }
+        } catch (error) {}
+        if (sent) {
+          pendingNotifications.splice(i, 1);
+        } else {
+          i += 1;
         }
-      } catch (error) {}
+      }
+    }
+    window.__tanukiFlushNotifications = flushNotifications;
+    function notify(type, detail) {
+      pendingNotifications.push(JSON.stringify({
+        type: type,
+        detail: detail || '',
+        sessionId: sessionId
+      }));
+      flushNotifications();
+      window.setTimeout(flushNotifications, 250);
+      window.setTimeout(flushNotifications, 1000);
     }
     function playWhenReady(player) {
       const delays = [0, 250, 900, 1800];
@@ -1307,10 +1037,14 @@ String desktopYouTubeTrailerQueueHtml({
       opacity: 0.35;
       cursor: default;
     }
-    .icon-button:focus-visible {
-      outline: 3px solid #ff8a2a;
-      background: rgba(36, 56, 76, 0.67);
-    }
+	    .icon-button:focus-visible {
+	      outline: 3px solid #ff8a2a;
+	      background: rgba(36, 56, 76, 0.67);
+	    }
+	    .icon-button:focus {
+	      outline: 3px solid #ff8a2a;
+	      background: rgba(36, 56, 76, 0.67);
+	    }
     .icon-button svg {
       width: 24px;
       height: 24px;
@@ -1365,22 +1099,46 @@ String desktopYouTubeTrailerQueueHtml({
     const entries = Array.isArray(payload.entries) ? payload.entries : [];
     let index = Math.max(0, Math.min(Number(payload.initialIndex) || 0, Math.max(entries.length - 1, 0)));
     let player = null;
+    const pendingNotifications = [];
 
-    const titleEl = document.getElementById('title');
-    const statusEl = document.getElementById('status');
-    const previousButton = document.getElementById('previous');
-    const nextButton = document.getElementById('next');
+	    const titleEl = document.getElementById('title');
+	    const statusEl = document.getElementById('status');
+	    const backButton = document.getElementById('back');
+	    const previousButton = document.getElementById('previous');
+	    const nextButton = document.getElementById('next');
+	    const detailButton = document.getElementById('detail');
+	    const focusableButtons = [backButton, previousButton, nextButton, detailButton];
 
-    function notify(type, detail) {
-      try {
-        if (window.TanukiTrailerPlayer && TanukiTrailerPlayer.postMessage) {
-          TanukiTrailerPlayer.postMessage(JSON.stringify({
-            type: type,
-            detail: detail || '',
-            sessionId: sessionId
-          }));
+    function flushNotifications() {
+      for (let i = 0; i < pendingNotifications.length;) {
+        const message = pendingNotifications[i];
+        let sent = false;
+        try {
+          if (window.TanukiTrailerPlayer && TanukiTrailerPlayer.postMessage) {
+            TanukiTrailerPlayer.postMessage(message);
+            sent = true;
+          } else if (typeof window.TanukiTrailerPlayer === 'function') {
+            window.TanukiTrailerPlayer(message, '');
+            sent = true;
+          }
+        } catch (error) {}
+        if (sent) {
+          pendingNotifications.splice(i, 1);
+        } else {
+          i += 1;
         }
-      } catch (error) {}
+      }
+    }
+    window.__tanukiFlushNotifications = flushNotifications;
+    function notify(type, detail) {
+      pendingNotifications.push(JSON.stringify({
+        type: type,
+        detail: detail || '',
+        sessionId: sessionId
+      }));
+      flushNotifications();
+      window.setTimeout(flushNotifications, 250);
+      window.setTimeout(flushNotifications, 1000);
     }
     function currentEntry() {
       return entries[index] || null;
@@ -1439,17 +1197,37 @@ String desktopYouTubeTrailerQueueHtml({
         notify('error', String(error || 'youtube'));
       }
     }
-    function move(delta) {
-      if (entries.length === 0) {
-        return;
-      }
+	    function move(delta) {
+	      if (entries.length === 0) {
+	        return;
+	      }
       const nextIndex = Math.max(0, Math.min(index + delta, entries.length - 1));
       if (nextIndex === index) {
         return;
       }
-      index = nextIndex;
-      loadCurrent();
-    }
+	      index = nextIndex;
+	      loadCurrent();
+	    }
+	    function firstEnabledButton() {
+	      for (const button of focusableButtons) {
+	        if (button && !button.disabled) {
+	          return button;
+	        }
+	      }
+	      return null;
+	    }
+	    function moveFocus(delta) {
+	      const enabled = focusableButtons.filter(function(button) {
+	        return button && !button.disabled;
+	      });
+	      if (enabled.length === 0) {
+	        return;
+	      }
+	      const activeIndex = enabled.indexOf(document.activeElement);
+	      const baseIndex = activeIndex < 0 ? 0 : activeIndex;
+	      const nextIndex = Math.max(0, Math.min(baseIndex + delta, enabled.length - 1));
+	      enabled[nextIndex].focus();
+	    }
     function handleEnded() {
       if (index < entries.length - 1) {
         index += 1;
@@ -1458,19 +1236,59 @@ String desktopYouTubeTrailerQueueHtml({
         notify('ended');
       }
     }
-    document.getElementById('back').addEventListener('click', function() {
-      notify('close');
-    });
+	    backButton.addEventListener('click', function() {
+	      notify('close');
+	    });
     previousButton.addEventListener('click', function() {
       move(-1);
     });
     nextButton.addEventListener('click', function() {
       move(1);
     });
-    document.getElementById('detail').addEventListener('click', function() {
-      const entry = currentEntry();
-      notify('detail', entry ? entry.detailUrl : '');
-    });
+	    detailButton.addEventListener('click', function() {
+	      const entry = currentEntry();
+	      notify('detail', entry ? entry.detailUrl : '');
+	    });
+	    document.addEventListener('keydown', function(event) {
+	      const key = event.key;
+	      if (key === 'Escape' || key === 'BrowserBack' || key === 'Backspace') {
+	        event.preventDefault();
+	        notify('close');
+	        return;
+	      }
+	      if (key === 'ArrowLeft') {
+	        event.preventDefault();
+	        if (document.activeElement && document.activeElement.classList.contains('icon-button')) {
+	          moveFocus(-1);
+	        } else {
+	          move(-1);
+	        }
+	        return;
+	      }
+	      if (key === 'ArrowRight') {
+	        event.preventDefault();
+	        if (document.activeElement && document.activeElement.classList.contains('icon-button')) {
+	          moveFocus(1);
+	        } else {
+	          move(1);
+	        }
+	        return;
+	      }
+	      if (key === 'ArrowUp' || key === 'ArrowDown') {
+	        event.preventDefault();
+	        const button = firstEnabledButton();
+	        if (button) {
+	          button.focus();
+	        }
+	        return;
+	      }
+	      if (key === 'Enter' || key === ' ') {
+	        if (document.activeElement && document.activeElement.classList.contains('icon-button')) {
+	          event.preventDefault();
+	          document.activeElement.click();
+	        }
+	      }
+	    });
     function onYouTubeIframeAPIReady() {
       const entry = currentEntry();
       updateUi();
@@ -1577,17 +1395,20 @@ class _TrailerIconButton extends StatelessWidget {
     required this.icon,
     required this.tooltip,
     required this.onPressed,
+    this.focusNode,
   });
 
   final IconData icon;
   final String tooltip;
   final VoidCallback? onPressed;
+  final FocusNode? focusNode;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
       message: tooltip,
       child: IconButton(
+        focusNode: focusNode,
         onPressed: onPressed,
         icon: Icon(icon),
         style: IconButton.styleFrom(

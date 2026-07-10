@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/foundation.dart';
 import 'package:media_kit/media_kit.dart';
 
@@ -27,9 +25,7 @@ class PlaybackBackend {
       _initializationError = error;
       debugPrint('media_kit unavailable: $error');
 
-      if (!Platform.isLinux) {
-        rethrow;
-      }
+      rethrow;
     } finally {
       _initialized = true;
     }

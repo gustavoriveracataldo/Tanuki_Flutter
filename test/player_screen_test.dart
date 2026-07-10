@@ -264,6 +264,28 @@ void main() {
     );
   });
 
+  test('rejects early remote completion with full BiliBili duration', () {
+    expect(
+      shouldAcceptPlaybackCompletion(
+        isRemote: true,
+        position: const Duration(milliseconds: 500),
+        duration: const Duration(minutes: 22, seconds: 55),
+      ),
+      isFalse,
+    );
+  });
+
+  test('accepts remote completion only near the real end', () {
+    expect(
+      shouldAcceptPlaybackCompletion(
+        isRemote: true,
+        position: const Duration(minutes: 22, seconds: 30),
+        duration: const Duration(minutes: 22, seconds: 55),
+      ),
+      isTrue,
+    );
+  });
+
   test('starts a remote resume slightly before saved progress', () {
     expect(
       initialMediaStartPosition(

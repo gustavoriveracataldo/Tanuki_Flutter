@@ -7,6 +7,7 @@ environment:
   sdk: ">=3.4.0 <4.0.0"
 
 dependencies:
+  dart_vlc: ^0.4.0
   file_picker: ^11.0.2
   flutter:
     sdk: flutter
@@ -15,20 +16,21 @@ dependencies:
   media_kit_libs_linux: ^1.2.1
   media_kit_libs_video: ^1.0.7
   media_kit_video: ^2.0.1
-  fvp: ^0.37.3
   path_provider: ^2.1.5
   url_launcher: ^6.3.1
   video_player: ^2.11.1
+  webview_all: ^1.2.1
   webview_flutter: ^4.14.0
   webview_flutter_android: ^4.12.0
-  youtube_explode_dart: ^3.1.0
-  webview_win_floating: ^3.0.3
 dev_dependencies:
   flutter_lints: ^5.0.0
   flutter_test:
     sdk: flutter
   integration_test:
     sdk: flutter
+
+dependency_overrides:
+  audio_video_progress_bar: ^2.0.3
 
 flutter:
   uses-material-design: true

@@ -1864,6 +1864,7 @@ class AppController extends ChangeNotifier {
       RemoteProvider.animeAv1,
       RemoteProvider.jkAnime,
       RemoteProvider.latAnime,
+      RemoteProvider.bilibili,
     ];
     if (preferredProvider == null ||
         _isDisabledRemoteProvider(preferredProvider) ||
@@ -2528,7 +2529,8 @@ class AppController extends ChangeNotifier {
   bool _isSelectablePreferredRemoteProvider(RemoteProvider? provider) {
     return provider == RemoteProvider.animeAv1 ||
         provider == RemoteProvider.jkAnime ||
-        provider == RemoteProvider.latAnime;
+        provider == RemoteProvider.latAnime ||
+        provider == RemoteProvider.bilibili;
   }
 
   Future<void> setAnimeAv1ModeForEpisode(

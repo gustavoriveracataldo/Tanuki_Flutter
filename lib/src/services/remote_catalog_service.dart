@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:math';
@@ -25,28 +26,39 @@ class RemoteCatalogService {
       'FANART_API_KEY',
       defaultValue: buildDefaultFanartApiKey,
     ),
+    String myAnimeListClientId = const String.fromEnvironment(
+      'MYANIMELIST_CLIENT_ID',
+      defaultValue: buildDefaultMyAnimeListClientId,
+    ),
   })  : _client = client ?? http.Client(),
         _webResolver = webResolver ?? const RemoteWebResolver(),
         _tmdbBearerToken =
             _runtimeConfigValue(tmdbBearerToken, 'TMDB_BEARER_TOKEN'),
         _tmdbApiKey = _runtimeConfigValue(tmdbApiKey, 'TMDB_API_KEY'),
-        _fanartApiKey = _runtimeConfigValue(fanartApiKey, 'FANART_API_KEY');
+        _fanartApiKey = _runtimeConfigValue(fanartApiKey, 'FANART_API_KEY'),
+        _myAnimeListClientId =
+            _runtimeConfigValue(myAnimeListClientId, 'MYANIMELIST_CLIENT_ID');
 
   static const _animeAv1BaseUrl = 'https://animeav1.com';
   static const _jkAnimeBaseUrl = 'https://jkanime.net';
   static const _latAnimeBaseUrl = 'https://latanime.org';
   static const _animeFlvBaseUrl = 'https://www4.animeflv.net';
+  static const _bilibiliBaseUrl = 'https://www.bilibili.tv';
+  static const _myAnimeListApiBaseUrl = 'https://api.myanimelist.net/v2';
   static const _tmdbImageBaseUrl = 'https://image.tmdb.org/t/p';
   static const _defaultFetchUserAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
   static const _animeAv1ModeSubHls = 'sub-hls';
   static const _animeAv1ModeDubHls = 'dub-hls';
+  static const _bilibiliEpisodeOptionsPrefix = 'tanuki:bilibili-options:';
 
   final http.Client _client;
   final RemoteWebResolver _webResolver;
   final String _tmdbBearerToken;
   final String _tmdbApiKey;
   final String _fanartApiKey;
+  final String _myAnimeListClientId;
+  final List<_BiliBiliDashProxy> _bilibiliDashProxies = <_BiliBiliDashProxy>[];
 
   static String _runtimeConfigValue(String dartDefineValue, String envKey) {
     final fromDefine = dartDefineValue.trim();
@@ -111,13 +123,29 @@ class RemoteCatalogService {
     String query, {
     int limit = 25,
     int page = 1,
-  }) {
-    return _safeSearchJikan(
-      query.trim(),
-      limit: limit,
-      page: page,
-    );
+  }) async {
+    final normalized = query.trim();
+    try {
+      return await _safeSearchJikan(
+        normalized,
+        limit: limit,
+        page: page,
+      );
+    } catch (jikanError) {
+      if (normalized.isEmpty || !_hasMyAnimeListClientId) {
+        rethrow;
+      }
+      _debugResolver(
+          'Jikan catalog failed; trying MyAnimeList v2: $jikanError');
+      return searchMyAnimeListCatalog(
+        normalized,
+        limit: limit,
+        page: page,
+      );
+    }
   }
+
+  bool get _hasMyAnimeListClientId => _myAnimeListClientId.trim().isNotEmpty;
 
   Future<List<RemoteSearchCandidate>> discoverCatalogMovies({
     int limit = 25,
@@ -257,6 +285,62 @@ class RemoteCatalogService {
         .toList();
   }
 
+  Future<List<RemoteSearchCandidate>> searchMyAnimeListCatalog(
+    String query, {
+    int limit = 25,
+    int page = 1,
+  }) async {
+    final normalized = query.trim();
+    if (normalized.isEmpty || !_hasMyAnimeListClientId) {
+      return const [];
+    }
+    final normalizedLimit = limit.clamp(1, 100).toInt();
+    final normalizedPage = page < 1 ? 1 : page;
+    final offset = (normalizedPage - 1) * normalizedLimit;
+    final uri = Uri.parse('$_myAnimeListApiBaseUrl/anime').replace(
+      queryParameters: {
+        'q': normalized,
+        'limit': '$normalizedLimit',
+        if (offset > 0) 'offset': '$offset',
+        'fields': [
+          'id',
+          'title',
+          'main_picture',
+          'alternative_titles',
+          'start_date',
+          'media_type',
+          'num_episodes',
+          'synopsis',
+          'mean',
+        ].join(','),
+      },
+    );
+    final response = await _getMyAnimeList(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'MyAnimeList respondio ${response.statusCode}',
+      );
+    }
+    return _parseMyAnimeListCandidateList(response.body);
+  }
+
+  List<RemoteSearchCandidate> _parseMyAnimeListCandidateList(String payload) {
+    final decoded = jsonDecode(payload);
+    final data = decoded is Map ? decoded['data'] : null;
+    if (data is! List) {
+      return const [];
+    }
+    return data
+        .whereType<Map>()
+        .map((entry) => entry['node'])
+        .whereType<Map>()
+        .map((entry) => _candidateFromMyAnimeListNode(
+              Map<String, dynamic>.from(entry),
+            ))
+        .where((candidate) => candidate.title.isNotEmpty)
+        .toList();
+  }
+
   String _normalizeCatalogType(String value) {
     final normalized = value.trim().toLowerCase();
     return switch (normalized) {
@@ -357,6 +441,41 @@ class RemoteCatalogService {
     return _parseAnimeFlvResults(response.body, releaseYear);
   }
 
+  Future<List<RemoteSearchCandidate>> searchBiliBili(String query) async {
+    final normalized = query.trim();
+    if (normalized.isEmpty) {
+      return const [];
+    }
+    final uri = Uri.https('www.bilibili.tv', '/en/search-result', {
+      'q': normalized,
+    });
+    final response = await _get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException('BiliBili respondio ${response.statusCode}');
+    }
+    return _parseBiliBiliResults(response.body);
+  }
+
+  Future<List<_BiliBiliVideoResult>> _searchBiliBiliEpisodeOptions(
+    String query, {
+    int limit = 2,
+  }) async {
+    final normalized = _cleanBiliBiliSearchQuery(query);
+    if (normalized.isEmpty) {
+      return const [];
+    }
+    final uri = Uri.https('www.bilibili.tv', '/en/search-result', {
+      'q': normalized,
+    });
+    final response = await _get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException('BiliBili respondio ${response.statusCode}');
+    }
+    return _parseBiliBiliVideoResults(response.body)
+        .take(limit.clamp(1, 8).toInt())
+        .toList(growable: false);
+  }
+
   Future<List<RemoteSearchCandidate>> discoverCatalogBySeason({
     required String season,
     required int year,
@@ -440,6 +559,8 @@ class RemoteCatalogService {
           existingNames: existingNames),
       RemoteProvider.animeFlv => await _buildAnimeFlvSeries(enrichedCandidate,
           existingNames: existingNames),
+      RemoteProvider.bilibili =>
+        _buildBiliBiliSeries(enrichedCandidate, existingNames: existingNames),
       _ => enrichedCandidate.toSeries(existingNames: existingNames),
     };
   }
@@ -461,6 +582,9 @@ class RemoteCatalogService {
         provider == RemoteProvider.catalog ||
         provider == RemoteProvider.facebook) {
       return null;
+    }
+    if (provider == RemoteProvider.bilibili) {
+      return _resolveBiliBiliProviderEpisode(series: series, episode: episode);
     }
     final queries = _seriesProviderLookupQueries(series, episode).take(4);
     final candidates = <RemoteSearchCandidate>[];
@@ -505,8 +629,66 @@ class RemoteCatalogService {
         searchLatAnime(query, releaseYear: releaseYear),
       RemoteProvider.animeFlv =>
         searchAnimeFlv(query, releaseYear: releaseYear),
+      RemoteProvider.bilibili => searchBiliBili(query),
       _ => Future.value(const <RemoteSearchCandidate>[]),
     };
+  }
+
+  Future<EpisodeItem?> _resolveBiliBiliProviderEpisode({
+    required SeriesItem series,
+    required EpisodeItem episode,
+  }) async {
+    final title = _bilibiliLookupTitle(series);
+    if (title.isEmpty || episode.episodeNumber <= 0) {
+      return null;
+    }
+    final query = '$title episode ${episode.episodeNumber}';
+    final options = await _searchBiliBiliEpisodeOptions(query, limit: 2);
+    if (options.isEmpty) {
+      _debugResolver('bilibili lookup no options query="$query"');
+      return null;
+    }
+    final first = options.first;
+    final stateKey = episode.seriesStateKey.trim().isNotEmpty
+        ? episode.seriesStateKey
+        : series.stableKey;
+    final imageUrl =
+        first.imageUrl.isNotEmpty ? first.imageUrl : episode.imageUrl;
+    return EpisodeItem(
+      seriesName: episode.seriesName,
+      seriesStateKey: stateKey,
+      episodeIndex: episode.episodeIndex,
+      episodeNumber: episode.episodeNumber,
+      displayName: episode.displayName,
+      relativePath: 'BiliBili / Capitulo ${episode.episodeNumber}',
+      filePath: first.url,
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.bilibili,
+      slug: first.videoId,
+      watchUrl: first.url,
+      releaseYear:
+          episode.releaseYear > 0 ? episode.releaseYear : series.releaseYear,
+      imageUrl: imageUrl,
+      description: _encodeBiliBiliEpisodeOptions(options),
+      durationLabel: first.durationLabel.isNotEmpty
+          ? first.durationLabel
+          : episode.durationLabel,
+    );
+  }
+
+  String _bilibiliLookupTitle(SeriesItem series) {
+    final candidates = [
+      series.name,
+      ...series.aliases,
+      series.japaneseTitle,
+    ];
+    for (final candidate in candidates) {
+      final cleaned = _cleanBiliBiliSearchQuery(candidate);
+      if (cleaned.isNotEmpty) {
+        return cleaned;
+      }
+    }
+    return '';
   }
 
   RemoteSearchCandidate? _pickBestProviderCandidate({
@@ -1041,6 +1223,94 @@ class RemoteCatalogService {
     );
   }
 
+  SeriesItem _buildBiliBiliSeries(
+    RemoteSearchCandidate candidate, {
+    required Iterable<String> existingNames,
+  }) {
+    final title = _cleanRemoteText(candidate.title).isNotEmpty
+        ? _cleanRemoteText(candidate.title)
+        : 'Serie BiliBili';
+    final name = uniqueSeriesName(title, existingNames, 'BiliBili');
+    final stateKey = normalizeSeriesKey(name);
+    final seriesUrl = candidate.seriesUrl.isNotEmpty
+        ? candidate.seriesUrl
+        : candidate.watchUrl.isNotEmpty
+            ? candidate.watchUrl
+            : _bilibiliSearchUrl(title);
+    final imageUrl = _cleanRemoteUrl(candidate.imageUrl);
+    final details = [
+      ...candidate.episodeDetails
+    ]..sort((left, right) => left.episodeNumber.compareTo(right.episodeNumber));
+    final episodes = <EpisodeItem>[];
+    for (final detail in details) {
+      if (detail.episodeNumber <= 0 || detail.description.trim().isEmpty) {
+        continue;
+      }
+      final episode = EpisodeItem(
+        seriesName: name,
+        seriesStateKey: stateKey,
+        episodeIndex: episodes.length,
+        episodeNumber: detail.episodeNumber,
+        displayName: '$name - Capitulo ${detail.episodeNumber}',
+        relativePath: 'BiliBili / Capitulo ${detail.episodeNumber}',
+        filePath: detail.description.trim(),
+        sourceType: SourceType.remote,
+        provider: RemoteProvider.bilibili,
+        slug: candidate.slug,
+        watchUrl: detail.description.trim(),
+        releaseYear: candidate.releaseYear,
+        imageUrl: detail.imageUrl.isNotEmpty ? detail.imageUrl : imageUrl,
+        durationLabel: detail.durationLabel,
+      );
+      episodes.add(episode);
+    }
+    final fallbackEpisodeUrl = candidate.watchUrl.trim().isNotEmpty
+        ? candidate.watchUrl.trim()
+        : seriesUrl;
+    final normalizedEpisodes = episodes.isNotEmpty
+        ? episodes
+        : [
+            EpisodeItem(
+              seriesName: name,
+              seriesStateKey: stateKey,
+              episodeIndex: 0,
+              episodeNumber: 1,
+              displayName: '$name - Capitulo 1',
+              relativePath: 'BiliBili / Capitulo 1',
+              filePath: fallbackEpisodeUrl,
+              sourceType: SourceType.remote,
+              provider: RemoteProvider.bilibili,
+              slug: candidate.slug,
+              watchUrl: fallbackEpisodeUrl,
+              releaseYear: candidate.releaseYear,
+              imageUrl: imageUrl,
+            ),
+          ];
+
+    return SeriesItem(
+      name: name,
+      seriesStateKey: stateKey,
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.bilibili,
+      slug: candidate.slug,
+      watchUrl: seriesUrl,
+      episodeCount: normalizedEpisodes.length,
+      imageUrl: imageUrl,
+      backgroundUrl: candidate.backgroundUrl,
+      logoUrl: candidate.logoUrl,
+      trailerUrl: candidate.trailerUrl,
+      description: candidate.description,
+      rating: candidate.rating,
+      episodes: normalizedEpisodes,
+      releaseYear: candidate.releaseYear,
+      format: candidate.format.isNotEmpty ? candidate.format : 'UGC',
+      catalogId: candidate.catalogId,
+      japaneseTitle: candidate.japaneseTitle,
+      aliases: candidate.aliases,
+      cast: candidate.cast,
+    );
+  }
+
   List<EpisodeItem> _completeImportedEpisodes(
     List<EpisodeItem> parsedEpisodes, {
     required RemoteSearchCandidate candidate,
@@ -1114,6 +1384,15 @@ class RemoteCatalogService {
     if (entry.provider == RemoteProvider.animeKai) {
       _debugResolver('resolve skipped animekai provider');
       return null;
+    }
+    if (entry.provider == RemoteProvider.bilibili) {
+      final resolved = await _resolveBiliBiliDirectStream(
+        entry,
+        preferredServer: preferredServer,
+        excludedServers: excludedServers,
+      );
+      _debugResolver('bilibili resolved ${_debugStreamLabel(resolved)}');
+      return resolved;
     }
     if (entry.provider != RemoteProvider.animeAv1) {
       final resolved = await _resolveGenericDirectStream(
@@ -1291,6 +1570,282 @@ class RemoteCatalogService {
     final tagged = resolved.copyWith(provider: provider, server: server);
     _debugResolver('platform web resolved ${_debugStreamLabel(tagged)}');
     return tagged;
+  }
+
+  Future<RemoteDirectStream?> _resolveBiliBiliDirectStream(
+    EpisodeItem entry, {
+    String preferredServer = '',
+    Set<String> excludedServers = const {},
+  }) async {
+    final options = _bilibiliPlaybackOptionsFor(entry);
+    if (options.isEmpty) {
+      _debugResolver('bilibili skipped empty playback options');
+      return null;
+    }
+    final selectedOption = _selectBiliBiliPlaybackOption(
+      options,
+      preferredServer: preferredServer,
+      excludedServers: excludedServers,
+    );
+    if (selectedOption == null) {
+      _debugResolver(
+        'bilibili skipped all options excluded=${excludedServers.join(',')}',
+      );
+      return null;
+    }
+    final pageUrl = selectedOption.url;
+    if (pageUrl.isEmpty) {
+      _debugResolver('bilibili skipped empty page url');
+      return null;
+    }
+
+    final response = await _get(
+      Uri.parse(pageUrl),
+      referer: _bilibiliBaseUrl,
+      headers: const {
+        'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+      },
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'BiliBili respondio ${response.statusCode}',
+      );
+    }
+    final html = _decodeJavaScriptEscapes(response.body);
+    final mediaUrls = _extractBiliBiliMediaUrls(html);
+    final videoUrl = _selectBiliBiliVideoUrl(mediaUrls);
+    final audioUrl = _selectBiliBiliAudioUrl(mediaUrls);
+    if (videoUrl.isEmpty || audioUrl.isEmpty) {
+      _debugResolver(
+        'bilibili missing dash media video=${videoUrl.isNotEmpty} '
+        'audio=${audioUrl.isNotEmpty}',
+      );
+      return null;
+    }
+
+    final durationSeconds = _extractBiliBiliDurationSeconds(html);
+    final proxy = await _BiliBiliDashProxy.start(
+      client: _client,
+      pageUrl: pageUrl,
+      videoUrl: videoUrl,
+      audioUrl: audioUrl,
+      durationSeconds: durationSeconds,
+      userAgent: _defaultFetchUserAgent,
+    );
+    _bilibiliDashProxies.add(proxy);
+    return RemoteDirectStream(
+      playbackUrl: proxy.manifestUrl,
+      playbackKind: 'dash',
+      pageUrl: pageUrl,
+      availableModes: options.map((option) => option.server).toSet(),
+      selectedMode: selectedOption.server,
+      provider: RemoteProvider.bilibili,
+      server: selectedOption.server,
+      httpHeaders: {
+        'User-Agent': _defaultFetchUserAgent,
+        'Referer': pageUrl,
+        'Origin': _bilibiliBaseUrl,
+        if (durationSeconds > 0)
+          'X-Tanuki-Duration-Seconds': '$durationSeconds',
+        'X-Tanuki-Vlc-Hls-Url': proxy.vlcHlsUrl,
+        'X-Tanuki-Vlc-Video-Url': proxy.vlcVideoUrl,
+        'X-Tanuki-Vlc-Audio-Url': proxy.vlcAudioUrl,
+        'X-Tanuki-Vlc-Playlist-Url': proxy.vlcPlaylistUrl,
+        'X-Tanuki-Vlc-Playlist-Path': proxy.vlcPlaylistPath,
+      },
+    );
+  }
+
+  List<String> _extractBiliBiliMediaUrls(String html) {
+    final urls = <String>[];
+    final seen = <String>{};
+    final pattern = RegExp(
+      r'https?://[^"\\\s<>]+?\.m4s[^"\\\s<>]*',
+      caseSensitive: false,
+    );
+    for (final match in pattern.allMatches(html)) {
+      final url = _decodeHtml(match.group(0) ?? '').trim();
+      if (url.isEmpty || !seen.add(url)) {
+        continue;
+      }
+      urls.add(url);
+    }
+    return urls;
+  }
+
+  String _selectBiliBiliAudioUrl(List<String> urls) {
+    return urls.firstWhere(
+      (url) => RegExp(r'-1a\d+', caseSensitive: false).hasMatch(url),
+      orElse: () => urls.firstWhere(
+        (url) => url.toLowerCase().contains('audio'),
+        orElse: () => '',
+      ),
+    );
+  }
+
+  String _selectBiliBiliVideoUrl(List<String> urls) {
+    final videoUrls = urls
+        .where((url) =>
+            !RegExp(r'-1a\d+', caseSensitive: false).hasMatch(url) &&
+            !url.toLowerCase().contains('audio'))
+        .toList();
+    for (final preferred in const ['-111210', '-1e121', '-1f121']) {
+      final match = videoUrls.firstWhere(
+        (url) => url.toLowerCase().contains(preferred),
+        orElse: () => '',
+      );
+      if (match.isNotEmpty) {
+        return match;
+      }
+    }
+    for (final fallback in videoUrls) {
+      if (!RegExp(r'-1[ef]122|-111220', caseSensitive: false)
+          .hasMatch(fallback)) {
+        return fallback;
+      }
+    }
+    return videoUrls.isNotEmpty ? videoUrls.first : '';
+  }
+
+  int _extractBiliBiliDurationSeconds(String html) {
+    final duration = int.tryParse(
+      RegExp(r'\bduration\s*:\s*(\d{2,5})', caseSensitive: false)
+              .firstMatch(html)
+              ?.group(1) ??
+          '',
+    );
+    if (duration != null && duration > 0) {
+      return duration;
+    }
+    final label = RegExp(r'"duration"\s*:\s*(\d{2,5})', caseSensitive: false)
+        .firstMatch(html)
+        ?.group(1);
+    return int.tryParse(label ?? '') ?? 0;
+  }
+
+  String _decodeJavaScriptEscapes(String value) {
+    return value
+        .replaceAll(r'\/', '/')
+        .replaceAll(r'\u002F', '/')
+        .replaceAll(r'\u002f', '/')
+        .replaceAll(r'\u003A', ':')
+        .replaceAll(r'\u003a', ':')
+        .replaceAll(r'\u003D', '=')
+        .replaceAll(r'\u003d', '=')
+        .replaceAll(r'\u0026', '&')
+        .replaceAll(r'\u0026amp;', '&')
+        .replaceAll(r'\u003F', '?')
+        .replaceAll(r'\u003f', '?');
+  }
+
+  List<_BiliBiliPlaybackOption> _bilibiliPlaybackOptionsFor(
+    EpisodeItem entry,
+  ) {
+    final decoded = _decodeBiliBiliEpisodeOptions(entry.description);
+    if (decoded.isNotEmpty) {
+      return decoded;
+    }
+    final pageUrl = _buildRemoteEpisodePageUrl(entry);
+    if (pageUrl.isEmpty) {
+      return const [];
+    }
+    return [
+      _BiliBiliPlaybackOption(
+        server: 'bilibili-1',
+        url: pageUrl,
+        title: entry.displayName,
+        imageUrl: entry.imageUrl,
+        durationLabel: entry.durationLabel,
+      ),
+    ];
+  }
+
+  _BiliBiliPlaybackOption? _selectBiliBiliPlaybackOption(
+    List<_BiliBiliPlaybackOption> options, {
+    required String preferredServer,
+    required Set<String> excludedServers,
+  }) {
+    final excluded =
+        excludedServers.map((entry) => entry.toLowerCase()).toSet();
+    final preferred = preferredServer.trim().toLowerCase();
+    if (preferred.isNotEmpty && !excluded.contains(preferred)) {
+      for (final option in options) {
+        if (option.server.toLowerCase() == preferred) {
+          return option;
+        }
+      }
+    }
+    for (final option in options) {
+      if (!excluded.contains(option.server.toLowerCase())) {
+        return option;
+      }
+    }
+    return null;
+  }
+
+  String _encodeBiliBiliEpisodeOptions(List<_BiliBiliVideoResult> options) {
+    final payload = [
+      for (final entry in options.indexed)
+        {
+          'server': 'bilibili-${entry.$1 + 1}',
+          'url': entry.$2.url,
+          'title': entry.$2.title,
+          'imageUrl': entry.$2.imageUrl,
+          'durationLabel': entry.$2.durationLabel,
+        },
+    ];
+    return '$_bilibiliEpisodeOptionsPrefix${jsonEncode(payload)}';
+  }
+
+  List<_BiliBiliPlaybackOption> _decodeBiliBiliEpisodeOptions(String value) {
+    final trimmed = value.trim();
+    if (!trimmed.startsWith(_bilibiliEpisodeOptionsPrefix)) {
+      return const [];
+    }
+    try {
+      final raw = trimmed.substring(_bilibiliEpisodeOptionsPrefix.length);
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) {
+        return const [];
+      }
+      final options = <_BiliBiliPlaybackOption>[];
+      for (final entry in decoded.whereType<Map>()) {
+        final url = _readString(entry['url']);
+        final server = _readString(entry['server']);
+        if (url.isEmpty || server.isEmpty) {
+          continue;
+        }
+        options.add(
+          _BiliBiliPlaybackOption(
+            server: server,
+            url: url,
+            title: _readString(entry['title']),
+            imageUrl: _readString(entry['imageUrl']),
+            durationLabel: _readString(entry['durationLabel']),
+          ),
+        );
+      }
+      return options;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  String _cleanBiliBiliSearchQuery(String value) {
+    final buffer = StringBuffer();
+    var previousWasSpace = true;
+    for (final rune in value.runes) {
+      final char = String.fromCharCode(rune);
+      final keep = RegExp(r'[A-Za-z0-9]').hasMatch(char);
+      if (keep) {
+        buffer.write(char);
+        previousWasSpace = false;
+      } else if (!previousWasSpace) {
+        buffer.write(' ');
+        previousWasSpace = true;
+      }
+    }
+    return buffer.toString().trim().replaceAll(RegExp(r'\s+'), ' ');
   }
 
   bool _shouldUsePlatformWebResolver(RemoteProvider? provider) {
@@ -1765,6 +2320,66 @@ class RemoteCatalogService {
       airDateIso: _airedIso(entry['aired']),
       catalogId: malId,
     );
+  }
+
+  RemoteSearchCandidate _candidateFromMyAnimeListNode(
+    Map<String, dynamic> node,
+  ) {
+    final malId = _readInt(node['id']);
+    final alternativeTitles = node['alternative_titles'] is Map
+        ? Map<String, dynamic>.from(node['alternative_titles'] as Map)
+        : const <String, dynamic>{};
+    final title = _firstNonEmpty([
+      _readString(node['title']),
+      _readString(alternativeTitles['en']),
+      _readString(alternativeTitles['ja']),
+      malId > 0 ? 'Anime $malId' : '',
+    ]);
+    final mainPicture = node['main_picture'] is Map
+        ? Map<String, dynamic>.from(node['main_picture'] as Map)
+        : const <String, dynamic>{};
+    final synonyms = alternativeTitles['synonyms'];
+    final aliases = <String>{
+      _readString(alternativeTitles['en']),
+      _readString(alternativeTitles['ja']),
+      if (synonyms is List) ...synonyms.map(_readString),
+    }..removeWhere((value) => value.isEmpty || value == title);
+    final startDate = _readString(node['start_date']);
+    final mean = _readDouble(node['mean']);
+    return RemoteSearchCandidate(
+      provider: RemoteProvider.catalog,
+      slug: malId > 0 ? '$malId' : normalizeSeriesKey(title),
+      title: title,
+      watchUrl: malId > 0 ? 'https://myanimelist.net/anime/$malId' : '',
+      seriesUrl: malId > 0 ? 'https://myanimelist.net/anime/$malId' : '',
+      imageUrl: _firstNonEmpty([
+        _readString(mainPicture['large']),
+        _readString(mainPicture['medium']),
+      ]),
+      backgroundUrl: _readString(mainPicture['large']),
+      description: _readString(node['synopsis']),
+      rating: mean > 0 ? mean.toStringAsFixed(1) : '',
+      episodeCount: _readInt(node['num_episodes']),
+      format: _formatMyAnimeListMediaType(_readString(node['media_type'])),
+      japaneseTitle: _readString(alternativeTitles['ja']),
+      aliases: aliases.toList(),
+      releaseYear: _extractYearFromText(startDate),
+      airDateIso: startDate,
+      catalogId: malId,
+    );
+  }
+
+  String _formatMyAnimeListMediaType(String value) {
+    final normalized = value.trim().toLowerCase();
+    return switch (normalized) {
+      'tv' => 'TV',
+      'movie' => 'Movie',
+      'ova' => 'OVA',
+      'ona' => 'ONA',
+      'special' => 'Special',
+      'music' => 'Music',
+      _ => value,
+    };
   }
 
   String _jikanTrailerUrl(Map trailer) {
@@ -3258,6 +3873,10 @@ class RemoteCatalogService {
   }
 
   void close() {
+    for (final proxy in _bilibiliDashProxies) {
+      unawaited(proxy.close());
+    }
+    _bilibiliDashProxies.clear();
     _client.close();
   }
 
@@ -3275,6 +3894,14 @@ class RemoteCatalogService {
       if (normalizedReferer.isNotEmpty)
         'Origin': _baseOrigin(normalizedReferer),
       ...headers,
+    }).timeout(const Duration(seconds: 14));
+  }
+
+  Future<http.Response> _getMyAnimeList(Uri uri) {
+    return _client.get(uri, headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'TanukiFlutter/1.0',
+      'X-MAL-CLIENT-ID': _myAnimeListClientId,
     }).timeout(const Duration(seconds: 14));
   }
 
@@ -6089,6 +6716,137 @@ class RemoteCatalogService {
     }
     return '$baseUrl/$value';
   }
+
+  List<RemoteSearchCandidate> _parseBiliBiliResults(String html) {
+    final videos = _parseBiliBiliVideoResults(html);
+    final accumulators = <String, _BiliBiliSeriesAccumulator>{};
+    for (final video in videos) {
+      final episodeNumber = video.episodeNumber;
+      if (video.title.isEmpty || episodeNumber <= 0) {
+        continue;
+      }
+
+      final seriesTitle = _bilibiliSeriesTitleFromEpisodeTitle(video.title);
+      final key = _normalizeMatchText(seriesTitle);
+      if (seriesTitle.isEmpty || key.isEmpty) {
+        continue;
+      }
+
+      final accumulator = accumulators.putIfAbsent(
+        key,
+        () => _BiliBiliSeriesAccumulator(
+          key: key,
+          title: seriesTitle,
+          slug: video.videoId,
+          imageUrl: video.imageUrl,
+        ),
+      );
+      accumulator.add(
+        SeriesEpisodeMetadata(
+          episodeNumber: episodeNumber,
+          title: video.title,
+          description: video.url,
+          imageUrl: video.imageUrl,
+          durationLabel: video.durationLabel,
+        ),
+      );
+    }
+
+    final results = accumulators.values
+        .where((entry) => entry.episodes.isNotEmpty)
+        .map((entry) => entry.toCandidate())
+        .toList();
+    results.sort((left, right) {
+      final countCompare = right.episodeCount.compareTo(left.episodeCount);
+      if (countCompare != 0) {
+        return countCompare;
+      }
+      return left.title.compareTo(right.title);
+    });
+    return results;
+  }
+
+  List<_BiliBiliVideoResult> _parseBiliBiliVideoResults(String html) {
+    final cards = RegExp(
+      r'<a[^>]+href="([^"]*/en/video/[^"]+)"[^>]*class="bstar-video-card__cover-link"[\s\S]*?<img[^>]+src="([^"]+)"[^>]*alt="([^"]*)"[\s\S]*?(?:<span[^>]+class="bstar-video-card__cover-mask-text[^"]*"[^>]*>([^<]*)</span>)?',
+      caseSensitive: false,
+    );
+    final results = <_BiliBiliVideoResult>[];
+    final seenVideoIds = <String>{};
+    for (final match in cards.allMatches(html)) {
+      final episodeUrl = _normalizeUrl(
+        match.group(1) ?? '',
+        _bilibiliBaseUrl,
+      ).split('?').first.split('#').first;
+      final videoId = _extractBiliBiliVideoId(episodeUrl);
+      if (episodeUrl.isEmpty || videoId.isEmpty || !seenVideoIds.add(videoId)) {
+        continue;
+      }
+
+      final rawTitle = _cleanRemoteText(match.group(3) ?? '');
+      final episodeNumber = _extractBiliBiliEpisodeNumber(rawTitle);
+      if (rawTitle.isEmpty) {
+        continue;
+      }
+
+      final imageUrl = _normalizeUrl(
+        _decodeHtml(match.group(2) ?? ''),
+        _bilibiliBaseUrl,
+      );
+      final duration = _cleanRemoteText(match.group(4) ?? '');
+      results.add(
+        _BiliBiliVideoResult(
+          videoId: videoId,
+          url: episodeUrl,
+          title: rawTitle,
+          imageUrl: imageUrl,
+          durationLabel: duration,
+          episodeNumber: episodeNumber,
+        ),
+      );
+    }
+    return results;
+  }
+
+  String _bilibiliSearchUrl(String query) {
+    final normalized = query.trim();
+    if (normalized.isEmpty) {
+      return '$_bilibiliBaseUrl/en/search-result';
+    }
+    return Uri.https('www.bilibili.tv', '/en/search-result', {
+      'q': normalized,
+    }).toString();
+  }
+
+  String _extractBiliBiliVideoId(String value) {
+    return RegExp(r'/video/(\d+)', caseSensitive: false)
+            .firstMatch(value)
+            ?.group(1) ??
+        '';
+  }
+
+  int _extractBiliBiliEpisodeNumber(String value) {
+    return int.tryParse(
+          RegExp(
+                r'\b(?:ep(?:isode)?\.?|cap(?:itulo)?\.?)\s*(\d+)\b',
+                caseSensitive: false,
+              ).firstMatch(value)?.group(1) ??
+              '',
+        ) ??
+        0;
+  }
+
+  String _bilibiliSeriesTitleFromEpisodeTitle(String value) {
+    return _cleanRemoteText(
+      value.replaceFirst(
+        RegExp(
+          r'\s*(?:ep(?:isode)?\.?|cap(?:itulo)?\.?)\s*\d+.*$',
+          caseSensitive: false,
+        ),
+        '',
+      ),
+    );
+  }
 }
 
 class RemoteCatalogException implements Exception {
@@ -6098,6 +6856,283 @@ class RemoteCatalogException implements Exception {
 
   @override
   String toString() => message;
+}
+
+class _BiliBiliDashProxy {
+  _BiliBiliDashProxy._({
+    required this.manifestUrl,
+    required this.vlcHlsUrl,
+    required this.vlcVideoUrl,
+    required this.vlcAudioUrl,
+    required this.vlcPlaylistUrl,
+    required this.vlcPlaylistPath,
+    required http.Client client,
+    required io.HttpServer server,
+    required io.File vlcPlaylistFile,
+    required String pageUrl,
+    required String videoUrl,
+    required String audioUrl,
+    required int durationSeconds,
+    required String userAgent,
+  })  : _client = client,
+        _server = server,
+        _vlcPlaylistFile = vlcPlaylistFile,
+        _pageUrl = pageUrl,
+        _videoUrl = videoUrl,
+        _audioUrl = audioUrl,
+        _durationSeconds = durationSeconds,
+        _userAgent = userAgent {
+    _expiryTimer = Timer(const Duration(hours: 3), () {
+      unawaited(close());
+    });
+    _server.listen(_handleRequest);
+  }
+
+  final String manifestUrl;
+  final String vlcHlsUrl;
+  final String vlcVideoUrl;
+  final String vlcAudioUrl;
+  final String vlcPlaylistUrl;
+  final String vlcPlaylistPath;
+  final http.Client _client;
+  final io.HttpServer _server;
+  final io.File _vlcPlaylistFile;
+  final String _pageUrl;
+  final String _videoUrl;
+  final String _audioUrl;
+  final int _durationSeconds;
+  final String _userAgent;
+  Timer? _expiryTimer;
+  bool _closed = false;
+
+  static Future<_BiliBiliDashProxy> start({
+    required http.Client client,
+    required String pageUrl,
+    required String videoUrl,
+    required String audioUrl,
+    required int durationSeconds,
+    required String userAgent,
+  }) async {
+    final server = await io.HttpServer.bind(io.InternetAddress.loopbackIPv4, 0);
+    final playlistFile = io.File(
+      '${io.Directory.systemTemp.path}'
+      '${io.Platform.pathSeparator}'
+      'tanuki-bilibili-${server.port}-${DateTime.now().microsecondsSinceEpoch}.m3u',
+    );
+    final proxy = _BiliBiliDashProxy._(
+      manifestUrl: 'http://127.0.0.1:${server.port}/manifest.mpd',
+      vlcHlsUrl: 'http://127.0.0.1:${server.port}/vlc-master.m3u8',
+      vlcVideoUrl: 'http://127.0.0.1:${server.port}/video.m4s',
+      vlcAudioUrl: 'http://127.0.0.1:${server.port}/audio.m4s',
+      vlcPlaylistUrl: 'http://127.0.0.1:${server.port}/vlc.m3u',
+      vlcPlaylistPath: playlistFile.path,
+      client: client,
+      server: server,
+      vlcPlaylistFile: playlistFile,
+      pageUrl: pageUrl,
+      videoUrl: videoUrl,
+      audioUrl: audioUrl,
+      durationSeconds: durationSeconds,
+      userAgent: userAgent,
+    );
+    await proxy._writeLocalVlcPlaylist();
+    return proxy;
+  }
+
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _expiryTimer?.cancel();
+    _expiryTimer = null;
+    try {
+      if (await _vlcPlaylistFile.exists()) {
+        await _vlcPlaylistFile.delete();
+      }
+    } catch (_) {
+      // The temp playlist is best-effort cleanup only.
+    }
+    await _server.close(force: true);
+  }
+
+  Future<void> _handleRequest(io.HttpRequest request) async {
+    final path = request.uri.path;
+    if (path == '/manifest.mpd') {
+      await _writeManifest(request);
+      return;
+    }
+    if (path == '/vlc.m3u') {
+      await _writeVlcPlaylist(request);
+      return;
+    }
+    if (path == '/vlc-master.m3u8') {
+      await _writeVlcHlsMaster(request);
+      return;
+    }
+    if (path == '/video.m3u8') {
+      await _writeVlcHlsMedia(request, mediaPath: 'video.m4s');
+      return;
+    }
+    if (path == '/audio.m3u8') {
+      await _writeVlcHlsMedia(request, mediaPath: 'audio.m4s');
+      return;
+    }
+    if (path == '/video.m4s') {
+      await _proxyMedia(request, _videoUrl);
+      return;
+    }
+    if (path == '/audio.m4s') {
+      await _proxyMedia(request, _audioUrl);
+      return;
+    }
+    request.response.statusCode = io.HttpStatus.notFound;
+    await request.response.close();
+  }
+
+  Future<void> _writeManifest(io.HttpRequest request) async {
+    final duration = _durationSeconds > 0 ? _durationSeconds : 24 * 60 * 60;
+    final xml = '''
+<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" minBufferTime="PT1.5S" mediaPresentationDuration="PT${duration}S">
+  <Period id="0" duration="PT${duration}S">
+    <AdaptationSet id="1" contentType="video" mimeType="video/mp4" segmentAlignment="true">
+      <Representation id="video" bandwidth="800000" codecs="avc1.64001F" width="640" height="360">
+        <BaseURL>video.m4s</BaseURL>
+        <SegmentList timescale="1" duration="$duration">
+          <SegmentURL media="video.m4s" />
+        </SegmentList>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet id="2" contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
+      <Representation id="audio" bandwidth="128000" codecs="mp4a.40.2" audioSamplingRate="48000">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2" />
+        <BaseURL>audio.m4s</BaseURL>
+        <SegmentList timescale="1" duration="$duration">
+          <SegmentURL media="audio.m4s" />
+        </SegmentList>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+''';
+    request.response
+      ..statusCode = io.HttpStatus.ok
+      ..headers.contentType =
+          io.ContentType('application', 'dash+xml', charset: 'utf-8')
+      ..write(xml);
+    await request.response.close();
+  }
+
+  Future<void> _writeVlcHlsMaster(io.HttpRequest request) async {
+    final baseUrl = 'http://127.0.0.1:${_server.port}';
+    final playlist = '''
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="bilibili-audio",NAME="BiliBili",DEFAULT=YES,AUTOSELECT=YES,URI="$baseUrl/audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=640x360,CODECS="avc1.64001f,mp4a.40.2",AUDIO="bilibili-audio"
+$baseUrl/video.m3u8
+''';
+    request.response
+      ..statusCode = io.HttpStatus.ok
+      ..headers.contentType =
+          io.ContentType('application', 'vnd.apple.mpegurl', charset: 'utf-8')
+      ..write(playlist);
+    await request.response.close();
+  }
+
+  Future<void> _writeVlcHlsMedia(
+    io.HttpRequest request, {
+    required String mediaPath,
+  }) async {
+    final baseUrl = 'http://127.0.0.1:${_server.port}';
+    final duration = _durationSeconds > 0 ? _durationSeconds : 24 * 60 * 60;
+    final playlist = '''
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:$duration
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:$duration.000,
+$baseUrl/$mediaPath
+#EXT-X-ENDLIST
+''';
+    request.response
+      ..statusCode = io.HttpStatus.ok
+      ..headers.contentType =
+          io.ContentType('application', 'vnd.apple.mpegurl', charset: 'utf-8')
+      ..write(playlist);
+    await request.response.close();
+  }
+
+  Future<void> _writeVlcPlaylist(io.HttpRequest request) async {
+    final playlist = _buildVlcPlaylist();
+    request.response
+      ..statusCode = io.HttpStatus.ok
+      ..headers.contentType =
+          io.ContentType('audio', 'mpegurl', charset: 'utf-8')
+      ..write(playlist);
+    await request.response.close();
+  }
+
+  Future<void> _writeLocalVlcPlaylist() async {
+    await _vlcPlaylistFile.writeAsString(_buildVlcPlaylist(), flush: true);
+  }
+
+  String _buildVlcPlaylist() {
+    final baseUrl = 'http://127.0.0.1:${_server.port}';
+    final duration = _durationSeconds > 0 ? _durationSeconds : -1;
+    final title = _escapeM3uText(_pageUrl.split('/').last);
+    return '''
+#EXTM3U
+#EXTVLCOPT:input-slave=$baseUrl/audio.m4s
+#EXTINF:$duration,$title
+$baseUrl/video.m4s
+''';
+  }
+
+  String _escapeM3uText(String value) {
+    return value.replaceAll('\n', ' ').replaceAll('\r', ' ').trim();
+  }
+
+  Future<void> _proxyMedia(io.HttpRequest request, String upstreamUrl) async {
+    final upstreamRequest = http.Request('GET', Uri.parse(upstreamUrl));
+    upstreamRequest.headers.addAll({
+      'Accept': '*/*',
+      'User-Agent': _userAgent,
+      'Referer': _pageUrl,
+      'Origin': Uri.parse(_pageUrl).origin,
+      if (request.headers.value(io.HttpHeaders.rangeHeader) != null)
+        io.HttpHeaders.rangeHeader:
+            request.headers.value(io.HttpHeaders.rangeHeader)!,
+    });
+    http.StreamedResponse? upstream;
+    var responseStarted = false;
+    try {
+      upstream = await _client
+          .send(upstreamRequest)
+          .timeout(const Duration(seconds: 20));
+      request.response.statusCode = upstream.statusCode;
+      for (final name in const [
+        io.HttpHeaders.acceptRangesHeader,
+        io.HttpHeaders.contentLengthHeader,
+        io.HttpHeaders.contentRangeHeader,
+        io.HttpHeaders.contentTypeHeader,
+        io.HttpHeaders.cacheControlHeader,
+      ]) {
+        final value = upstream.headers[name];
+        if (value != null && value.trim().isNotEmpty) {
+          request.response.headers.set(name, value);
+        }
+      }
+      responseStarted = true;
+      await upstream.stream.pipe(request.response);
+    } catch (_) {
+      if (!responseStarted) {
+        request.response.statusCode = io.HttpStatus.badGateway;
+        await request.response.close();
+      }
+    }
+  }
 }
 
 class _HostCandidate {
@@ -6127,6 +7162,90 @@ class _RemoteEpisodeLink {
 
   final int episodeNumber;
   final String url;
+}
+
+class _BiliBiliVideoResult {
+  const _BiliBiliVideoResult({
+    required this.videoId,
+    required this.url,
+    required this.title,
+    required this.imageUrl,
+    required this.durationLabel,
+    required this.episodeNumber,
+  });
+
+  final String videoId;
+  final String url;
+  final String title;
+  final String imageUrl;
+  final String durationLabel;
+  final int episodeNumber;
+}
+
+class _BiliBiliPlaybackOption {
+  const _BiliBiliPlaybackOption({
+    required this.server,
+    required this.url,
+    required this.title,
+    required this.imageUrl,
+    required this.durationLabel,
+  });
+
+  final String server;
+  final String url;
+  final String title;
+  final String imageUrl;
+  final String durationLabel;
+}
+
+class _BiliBiliSeriesAccumulator {
+  _BiliBiliSeriesAccumulator({
+    required this.key,
+    required this.title,
+    required this.slug,
+    required this.imageUrl,
+  });
+
+  final String key;
+  final String title;
+  final String slug;
+  final String imageUrl;
+  final Map<int, SeriesEpisodeMetadata> _episodes = {};
+
+  List<SeriesEpisodeMetadata> get episodes {
+    final values = _episodes.values.toList()
+      ..sort((left, right) => left.episodeNumber.compareTo(
+            right.episodeNumber,
+          ));
+    return values;
+  }
+
+  void add(SeriesEpisodeMetadata episode) {
+    if (episode.episodeNumber <= 0) {
+      return;
+    }
+    _episodes.putIfAbsent(episode.episodeNumber, () => episode);
+  }
+
+  RemoteSearchCandidate toCandidate() {
+    final details = episodes;
+    final firstEpisodeUrl = details
+        .map((entry) => entry.description.trim())
+        .firstWhere((entry) => entry.isNotEmpty, orElse: () => '');
+    return RemoteSearchCandidate(
+      provider: RemoteProvider.bilibili,
+      slug: slug,
+      title: title,
+      seriesUrl: Uri.https('www.bilibili.tv', '/en/search-result', {
+        'q': title,
+      }).toString(),
+      watchUrl: firstEpisodeUrl,
+      imageUrl: imageUrl,
+      episodeCount: details.length,
+      format: 'UGC',
+      episodeDetails: details,
+    );
+  }
 }
 
 class _TmdbMatch {
@@ -6222,7 +7341,7 @@ String _stripProviderSuffix(String value) {
   return value
       .replaceAll(
         RegExp(
-          r'\s*\((AnimeAV1|AnimeKai|JKAnime|LatAnime|AnimeFLV|Facebook|Catalogo)(\s+\d+)?\)\s*$',
+          r'\s*\((AnimeAV1|AnimeKai|JKAnime|LatAnime|AnimeFLV|Facebook|BiliBili|Catalogo)(\s+\d+)?\)\s*$',
           caseSensitive: false,
         ),
         '',

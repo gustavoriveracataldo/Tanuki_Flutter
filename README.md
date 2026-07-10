@@ -122,7 +122,16 @@ gh secret set MYANIMELIST_CLIENT_SECRET
 
 Si tienes `lib/src/local_secrets.dart` en tu maquina, copia desde ahi los valores a GitHub Secrets. Ese archivo esta en `.gitignore` y no debe subirse al repositorio.
 
-Los scripts `scripts/build_android.sh`, `scripts/build_linux.sh` y `scripts/build_windows.ps1` pasan esas variables automaticamente como `--dart-define`. Si usas `flutter build ...` directo, agrega manualmente los `--dart-define`.
+Los scripts `scripts/build_android.sh`, `scripts/build_linux.sh` y `scripts/build_windows.ps1` pasan esas variables automaticamente como `--dart-define`. Primero leen variables de entorno y, si no existen, usan `lib/src/local_secrets.dart`.
+
+Para correr local con las mismas claves, usa el wrapper:
+
+```sh
+sh scripts/flutter_with_secrets.sh run -d linux
+sh scripts/flutter_with_secrets.sh run -d d28624c3
+```
+
+Si usas `flutter run ...` o `flutter build ...` directo, Flutter no lee `local_secrets.dart`; en ese caso agrega manualmente los `--dart-define`.
 
 ### Android + Linux
 

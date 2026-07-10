@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' as io;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -110,6 +111,71 @@ void main() {
     expect(requestedHosts, contains('jkanime.net'));
     expect(requestedHosts, contains('latanime.org'));
     expect(requestedHosts, isNot(contains('www4.animeflv.net')));
+  });
+
+  test('falls back to MyAnimeList catalog search when Jikan fails', () async {
+    final requestedHosts = <String>[];
+    final service = RemoteCatalogService(
+      myAnimeListClientId: 'mal-client',
+      client: MockClient((request) async {
+        requestedHosts.add(request.url.host);
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response(
+            '{"status":504,"message":"Jikan failed"}',
+            504,
+            request: request,
+          );
+        }
+        expect(request.url.host, 'api.myanimelist.net');
+        expect(request.headers['X-MAL-CLIENT-ID'], 'mal-client');
+        expect(request.url.path, '/v2/anime');
+        expect(request.url.queryParameters['q'], 'kirarin');
+        return http.Response.bytes(
+          utf8.encode('''
+          {
+            "data": [
+              {
+                "node": {
+                  "id": 1516,
+                  "title": "Kirarin☆Revolution",
+                  "main_picture": {
+                    "medium": "https://cdn.example.test/kirarin.jpg",
+                    "large": "https://cdn.example.test/kirarin-large.jpg"
+                  },
+                  "alternative_titles": {
+                    "synonyms": [],
+                    "en": "Kirarin Revolution",
+                    "ja": "きらりん☆レボリューション"
+                  },
+                  "start_date": "2006-04-07",
+                  "media_type": "tv",
+                  "num_episodes": 153,
+                  "synopsis": "Kirari demo",
+                  "mean": 7.05
+                }
+              }
+            ]
+          }
+          '''),
+          200,
+          request: request,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }),
+    );
+
+    final results = await service.searchCatalog('kirarin');
+
+    expect(requestedHosts, ['api.jikan.moe', 'api.myanimelist.net']);
+    expect(results, hasLength(1));
+    expect(results.first.provider, RemoteProvider.catalog);
+    expect(results.first.catalogId, 1516);
+    expect(results.first.title, 'Kirarin☆Revolution');
+    expect(results.first.aliases, contains('Kirarin Revolution'));
+    expect(results.first.format, 'TV');
+    expect(results.first.episodeCount, 153);
+    expect(results.first.releaseYear, 2006);
+    expect(results.first.rating, '7.0');
   });
 
   test('fetches Jikan catalog recommendations as candidates', () async {
@@ -771,6 +837,215 @@ void main() {
     expect(stream?.playbackUrl, 'https://cdn.example.test/demo/sw.m3u8');
     expect(stream?.server, 'streamwish');
     expect(requestedUrls, isNot(contains('https://mixdrop.co/e/sw-fallback')));
+  });
+
+  test('resolves BiliBili dash media through local manifest proxy', () async {
+    const pageUrl = 'https://www.bilibili.tv/en/video/2044128968';
+    const videoUrl =
+        'https://upos.example.test/kirarin-111210.m4s?e=abc&uipk=1';
+    const audioUrl = 'https://upos.example.test/kirarin-1a130.m4s?e=abc&uipk=1';
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        return switch (request.url.toString()) {
+          pageUrl => http.Response(
+              '''
+              <script>
+                window.__initialState={"duration":1376,
+                  "video":"${videoUrl.replaceAll('/', r'\/').replaceAll('&', r'\u0026')}",
+                  "audio":"${audioUrl.replaceAll('/', r'\/').replaceAll('&', r'\u0026')}"
+                };
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          videoUrl => http.Response.bytes(
+              const [0, 1, 2, 3],
+              206,
+              headers: const {
+                'content-type': 'video/mp4',
+                'content-range': 'bytes 0-3/4',
+                'accept-ranges': 'bytes',
+              },
+              request: request,
+            ),
+          audioUrl => http.Response.bytes(
+              const [4, 5, 6, 7],
+              206,
+              headers: const {
+                'content-type': 'audio/mp4',
+                'content-range': 'bytes 0-3/4',
+                'accept-ranges': 'bytes',
+              },
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.bilibili,
+        filePath: pageUrl,
+        watchUrl: pageUrl,
+        slug: '2044128968',
+      ),
+    );
+    addTearDown(service.close);
+
+    expect(stream?.playbackKind, 'dash');
+    expect(stream?.server, 'bilibili-1');
+    expect(stream?.httpHeaders['X-Tanuki-Vlc-Hls-Url'], isNotEmpty);
+    expect(stream?.httpHeaders['X-Tanuki-Vlc-Video-Url'], isNotEmpty);
+    expect(stream?.httpHeaders['X-Tanuki-Vlc-Audio-Url'], isNotEmpty);
+    expect(stream?.httpHeaders['X-Tanuki-Vlc-Playlist-Url'], isNotEmpty);
+    expect(stream?.httpHeaders['X-Tanuki-Vlc-Playlist-Path'], isNotEmpty);
+    final manifest = await http.get(Uri.parse(stream!.playbackUrl));
+    expect(manifest.statusCode, 200);
+    expect(manifest.body, contains('mediaPresentationDuration="PT1376S"'));
+    expect(manifest.body, contains('<SegmentList'));
+    expect(manifest.body, contains('video.m4s'));
+    expect(manifest.body, contains('audio.m4s'));
+    final vlcPlaylist = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Playlist-Url']!),
+    );
+    expect(vlcPlaylist.statusCode, 200);
+    expect(vlcPlaylist.body, contains('#EXTVLCOPT:input-slave='));
+    expect(vlcPlaylist.body, contains('/audio.m4s'));
+    expect(vlcPlaylist.body, contains('/video.m4s'));
+    final localVlcPlaylist = await io.File(
+      stream.httpHeaders['X-Tanuki-Vlc-Playlist-Path']!,
+    ).readAsString();
+    expect(localVlcPlaylist, contains('#EXTVLCOPT:input-slave='));
+    expect(localVlcPlaylist, contains('/audio.m4s'));
+    expect(localVlcPlaylist, contains('/video.m4s'));
+    final vlcHls = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!),
+    );
+    expect(vlcHls.statusCode, 200);
+    expect(vlcHls.body, contains('#EXT-X-MEDIA:TYPE=AUDIO'));
+    expect(vlcHls.body, contains('/audio.m3u8'));
+    expect(vlcHls.body, contains('/video.m3u8'));
+    final audioPlaylist = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!)
+          .replace(path: '/audio.m3u8'),
+    );
+    expect(audioPlaylist.statusCode, 200);
+    expect(audioPlaylist.body, contains('/audio.m4s'));
+
+    final videoResponse = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Video-Url']!),
+      headers: const {'Range': 'bytes=0-3'},
+    );
+    expect(videoResponse.statusCode, 206);
+    expect(videoResponse.bodyBytes, const [0, 1, 2, 3]);
+    expect(requestedUrls, contains(videoUrl));
+    final audioResponse = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Audio-Url']!),
+      headers: const {'Range': 'bytes=0-3'},
+    );
+    expect(audioResponse.statusCode, 206);
+    expect(audioResponse.bodyBytes, const [4, 5, 6, 7]);
+    expect(requestedUrls, contains(audioUrl));
+  });
+
+  test(
+      'resolves BiliBili provider episode from first two episode search videos',
+      () async {
+    final requestedUrls = <String>[];
+    const page222 = 'https://www.bilibili.tv/en/video/222';
+    const videoUrl =
+        'https://upos.example.test/kirarin-114-111210.m4s?e=abc&uipk=1';
+    const audioUrl =
+        'https://upos.example.test/kirarin-114-1a130.m4s?e=abc&uipk=1';
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        if (request.url.host == 'www.bilibili.tv' &&
+            request.url.path == '/en/search-result') {
+          expect(
+            request.url.queryParameters['q'],
+            'Kirarin Revolution episode 114',
+          );
+          return http.Response(
+            '''
+            <a href="/en/video/111" class="bstar-video-card__cover-link">
+              <img src="//img.example.test/111.jpg" alt="Kirarin Revolution ep. 114">
+              <span class="bstar-video-card__cover-mask-text">22:55</span>
+            </a>
+            <a href="/en/video/222" class="bstar-video-card__cover-link">
+              <img src="//img.example.test/222.jpg" alt="Kirarin Revolution ep. 114 sub">
+              <span class="bstar-video-card__cover-mask-text">22:56</span>
+            </a>
+            <a href="/en/video/333" class="bstar-video-card__cover-link">
+              <img src="//img.example.test/333.jpg" alt="Kirarin Revolution ep. 115">
+              <span class="bstar-video-card__cover-mask-text">22:56</span>
+            </a>
+            ''',
+            200,
+            request: request,
+          );
+        }
+        if (request.url.toString() == page222) {
+          return http.Response(
+            '''
+            <script>
+              window.__initialState={"duration":1376,
+                "video":"${videoUrl.replaceAll('/', r'\/').replaceAll('&', r'\u0026')}",
+                "audio":"${audioUrl.replaceAll('/', r'\/').replaceAll('&', r'\u0026')}"
+              };
+            </script>
+            ''',
+            200,
+            request: request,
+          );
+        }
+        if (request.url.toString() == videoUrl ||
+            request.url.toString() == audioUrl) {
+          return http.Response.bytes(
+            const [0, 1],
+            206,
+            headers: const {'content-type': 'video/mp4'},
+            request: request,
+          );
+        }
+        return http.Response('', 404, request: request);
+      }),
+    );
+    addTearDown(service.close);
+
+    final series = SeriesItem(
+      name: 'Kirarin☆Revolution',
+      seriesStateKey: 'kirarin-revolution',
+      sourceType: SourceType.remote,
+      episodeCount: 153,
+      episodes: const [],
+    );
+    final episode = _episode(
+      provider: RemoteProvider.catalog,
+      filePath: 'https://myanimelist.net/anime/1516',
+      watchUrl: 'https://myanimelist.net/anime/1516',
+      slug: '1516',
+      episodeNumber: 114,
+    );
+
+    final resolvedEpisode = await service.resolveProviderEpisode(
+      series: series,
+      episode: episode,
+      provider: RemoteProvider.bilibili,
+    );
+    expect(resolvedEpisode?.filePath, 'https://www.bilibili.tv/en/video/111');
+
+    final stream = await service.resolveDirectStream(
+      resolvedEpisode!,
+      excludedServers: const {'bilibili-1'},
+    );
+    expect(stream?.server, 'bilibili-2');
+    expect(stream?.pageUrl, 'https://www.bilibili.tv/en/video/222');
+    expect(requestedUrls, contains(page222));
   });
 
   test('filters JKAnime hosts by payload server labels', () async {
@@ -2457,14 +2732,15 @@ EpisodeItem _episode({
   required String filePath,
   required String watchUrl,
   required String slug,
+  int episodeNumber = 1,
 }) {
   return EpisodeItem(
     seriesName: 'Demo',
     seriesStateKey: 'demo',
-    episodeIndex: 0,
-    episodeNumber: 1,
-    displayName: 'Demo - Capitulo 1',
-    relativePath: 'Demo / Capitulo 1',
+    episodeIndex: episodeNumber - 1,
+    episodeNumber: episodeNumber,
+    displayName: 'Demo - Capitulo $episodeNumber',
+    relativePath: 'Demo / Capitulo $episodeNumber',
     filePath: filePath,
     sourceType: SourceType.remote,
     provider: provider,

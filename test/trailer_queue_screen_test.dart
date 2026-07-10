@@ -19,7 +19,7 @@ void main() {
     );
     expect(
       canUseEmbeddedTrailerWebView(platform: TargetPlatform.linux),
-      isFalse,
+      isTrue,
     );
     expect(
       canUseEmbeddedTrailerWebView(platform: TargetPlatform.windows),
@@ -31,30 +31,6 @@ void main() {
         isWeb: true,
       ),
       isFalse,
-    );
-  });
-
-  test('opens YouTube trailers in WebView first on Android', () {
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeTrailerUrl,
-        platform: TargetPlatform.android,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeShortUrl,
-        platform: TargetPlatform.android,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeShortsUrl,
-        platform: TargetPlatform.android,
-      ),
-      isTrue,
     );
   });
 
@@ -105,10 +81,10 @@ void main() {
     );
   });
 
-  test('opens YouTube trailers in WebView first on Windows but not Linux', () {
+  test('embeds desktop trailer WebViews on Windows and Linux', () {
     expect(
       canUseFloatingDesktopTrailerWebView(platform: TargetPlatform.linux),
-      isFalse,
+      isTrue,
     );
     expect(
       canUseFloatingDesktopTrailerWebView(platform: TargetPlatform.windows),
@@ -122,35 +98,6 @@ void main() {
       isFalse,
     );
     expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeTrailerUrl,
-        platform: TargetPlatform.linux,
-      ),
-      isFalse,
-    );
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeShortUrl,
-        platform: TargetPlatform.windows,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        'https://cdn.example.test/trailer.mp4',
-        platform: TargetPlatform.linux,
-      ),
-      isFalse,
-    );
-    expect(
-      canUseFallbackTrailerVideoPlayer(platform: TargetPlatform.linux),
-      isFalse,
-    );
-    expect(
-      canUseFallbackTrailerVideoPlayer(platform: TargetPlatform.windows),
-      isTrue,
-    );
-    expect(
       shouldOpenNativeYouTubeTrailerQueue(
         const [
           TrailerQueueEntry(
@@ -161,40 +108,6 @@ void main() {
         platform: TargetPlatform.linux,
       ),
       isFalse,
-    );
-  });
-
-  test('prefers YouTube WebView first on iOS', () {
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeTrailerUrl,
-        platform: TargetPlatform.iOS,
-      ),
-      isTrue,
-    );
-  });
-
-  test('allows WebView fallback on Android', () {
-    expect(
-      shouldFallbackTrailerToWebView(
-        _sampleYouTubeTrailerUrl,
-        platform: TargetPlatform.android,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldFallbackTrailerToWebView(
-        'https://www.youtube.com/watch?feature=share',
-        platform: TargetPlatform.android,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldFallbackTrailerToWebView(
-        'https://cdn.example.test/trailer.mp4',
-        platform: TargetPlatform.android,
-      ),
-      isTrue,
     );
   });
 
@@ -279,6 +192,7 @@ void main() {
     );
 
     expect(html, contains('TanukiTrailerPlayer.postMessage'));
+    expect(html, contains("typeof window.TanukiTrailerPlayer === 'function'"));
     expect(html, contains('Trailer anterior'));
     expect(html, contains('Trailer siguiente'));
     expect(html, contains('Ver detalle'));
@@ -287,22 +201,5 @@ void main() {
     expect(html, contains('"entryIndex":1'));
     expect(html, contains("host: 'https://www.youtube-nocookie.com'"));
     expect(html, contains('playWhenReady'));
-  });
-
-  test('does not prefer webview first for non YouTube trailers', () {
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        'https://cdn.example.test/trailer.mp4',
-        platform: TargetPlatform.android,
-      ),
-      isFalse,
-    );
-    expect(
-      shouldOpenTrailerInWebViewFirst(
-        _sampleYouTubeTrailerUrl,
-        platform: TargetPlatform.linux,
-      ),
-      isFalse,
-    );
   });
 }

@@ -939,7 +939,11 @@ class _SideRailButtonState extends State<_SideRailButton> {
             child: Stack(
               alignment: Alignment.center,
               children: [
-                Icon(widget.item.icon, size: 36, color: foreground),
+                _RailItemIcon(
+                  item: widget.item,
+                  size: 36,
+                  color: foreground,
+                ),
                 if (widget.active)
                   const Positioned(
                     bottom: 3,
@@ -1041,7 +1045,11 @@ class _BottomRailButton extends StatelessWidget {
       message: item.label,
       child: IconButton(
         onPressed: onPressed,
-        icon: Icon(item.icon),
+        icon: _RailItemIcon(
+          item: item,
+          size: 26,
+          color: active ? TanukiColors.text : TanukiColors.muted,
+        ),
         color: active ? TanukiColors.text : TanukiColors.muted,
         style: ButtonStyle(
           fixedSize: MaterialStateProperty.all(const Size(72, 72)),
@@ -1070,7 +1078,12 @@ class _BottomRailButton extends StatelessWidget {
 List<_RailItem> _navigationItems() {
   return const [
     _RailItem(_Section.search, Icons.search, 'Buscar'),
-    _RailItem(_Section.anime, Icons.live_tv, 'Anime'),
+    _RailItem(
+      _Section.anime,
+      Icons.live_tv,
+      'Inicio',
+      assetPath: 'assets/images/sidebar_home_naruto.png',
+    ),
     _RailItem(_Section.random, Icons.shuffle, 'Random'),
     _RailItem(_Section.favorites, Icons.favorite, 'Mi espacio'),
     _RailItem(_Section.playlist, Icons.playlist_play, 'Playlist'),
@@ -1079,11 +1092,41 @@ List<_RailItem> _navigationItems() {
 }
 
 class _RailItem {
-  const _RailItem(this.section, this.icon, this.label);
+  const _RailItem(
+    this.section,
+    this.icon,
+    this.label, {
+    this.assetPath = '',
+  });
 
   final _Section section;
   final IconData icon;
   final String label;
+  final String assetPath;
+}
+
+class _RailItemIcon extends StatelessWidget {
+  const _RailItemIcon({
+    required this.item,
+    required this.size,
+    required this.color,
+  });
+
+  final _RailItem item;
+  final double size;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    if (item.assetPath.isEmpty) {
+      return Icon(item.icon, size: size, color: color);
+    }
+    return ImageIcon(
+      AssetImage(item.assetPath),
+      size: size,
+      color: color,
+    );
+  }
 }
 
 enum _ProfileOverlayMode {
@@ -1781,6 +1824,12 @@ class _AvatarPresetButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final fallback = _AvatarFallback(
+      preset: preset,
+      initial: initial,
+      fontSize: 28,
+      borderRadius: 18,
+    );
     return SizedBox(
       width: 92,
       child: InkWell(
@@ -1793,25 +1842,22 @@ class _AvatarPresetButton extends StatelessWidget {
               height: 72,
               alignment: Alignment.center,
               decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [preset.startColor, preset.endColor],
-                ),
+                color: const Color(0xFF080C12),
                 borderRadius: BorderRadius.circular(18),
                 border: Border.all(
                   color: selected ? TanukiColors.orange : preset.accentColor,
                   width: selected ? 3 : 1,
                 ),
               ),
-              child: Text(
-                initial,
-                style: TextStyle(
-                  color: preset.textColor,
-                  fontSize: 28,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
+              clipBehavior: Clip.antiAlias,
+              child: preset.assetPath.isEmpty
+                  ? fallback
+                  : Image.asset(
+                      preset.assetPath,
+                      fit: BoxFit.cover,
+                      alignment: Alignment.topCenter,
+                      errorBuilder: (_, __, ___) => fallback,
+                    ),
             ),
             const SizedBox(height: 8),
             Text(
@@ -1826,6 +1872,46 @@ class _AvatarPresetButton extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AvatarFallback extends StatelessWidget {
+  const _AvatarFallback({
+    required this.preset,
+    required this.initial,
+    required this.fontSize,
+    required this.borderRadius,
+  });
+
+  final _ProfileAvatarPreset preset;
+  final String initial;
+  final double fontSize;
+  final double borderRadius;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.expand(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [preset.startColor, preset.endColor],
+          ),
+          borderRadius: BorderRadius.circular(borderRadius),
+        ),
+        child: Center(
+          child: Text(
+            initial,
+            style: TextStyle(
+              color: preset.textColor,
+              fontSize: fontSize,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
         ),
       ),
     );
@@ -1850,27 +1936,32 @@ class _ProfileAvatar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final preset = _profileAvatarPreset(profile.avatarPresetId);
+    final fallback = _AvatarFallback(
+      preset: preset,
+      initial: _profileInitial(profile),
+      fontSize: fontSize,
+      borderRadius: radius,
+    );
     return Container(
       width: size,
       height: size,
       alignment: Alignment.center,
+      clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [preset.startColor, preset.endColor],
-        ),
+        color: const Color(0xFF080C12),
         borderRadius: BorderRadius.circular(radius),
         border: Border.all(color: borderColor ?? Colors.transparent),
       ),
-      child: Text(
-        _profileInitial(profile),
-        style: TextStyle(
-          color: preset.textColor,
-          fontSize: fontSize,
-          fontWeight: FontWeight.w900,
-        ),
-      ),
+      child: preset.assetPath.isEmpty
+          ? fallback
+          : Image.asset(
+              preset.assetPath,
+              width: size,
+              height: size,
+              fit: BoxFit.cover,
+              alignment: Alignment.topCenter,
+              errorBuilder: (_, __, ___) => fallback,
+            ),
     );
   }
 }
@@ -1881,51 +1972,101 @@ class _ProfileAvatarPreset {
     required this.startColor,
     required this.endColor,
     required this.accentColor,
+    this.assetPath = '',
   });
 
   final String id;
   final Color startColor;
   final Color endColor;
   final Color accentColor;
+  final String assetPath;
   final Color textColor = TanukiColors.text;
 }
 
 const _profileAvatarPresets = [
   _ProfileAvatarPreset(
-    id: 'sunrise',
-    startColor: Color(0xFF6A2AF8),
-    endColor: Color(0xFFC346FF),
-    accentColor: Color(0xFFFAD9FF),
+    id: 'avatar_01',
+    assetPath: 'assets/images/avatar_01.png',
+    startColor: Color(0xFF8E5A2A),
+    endColor: Color(0xFF1C2733),
+    accentColor: Color(0xFFECC38C),
   ),
   _ProfileAvatarPreset(
-    id: 'lagoon',
-    startColor: Color(0xFF1080C9),
-    endColor: Color(0xFF36E2D9),
-    accentColor: Color(0xFFE9FFFD),
+    id: 'avatar_02',
+    assetPath: 'assets/images/avatar_02.png',
+    startColor: Color(0xFF102B55),
+    endColor: Color(0xFF0A1018),
+    accentColor: Color(0xFFDDE7F6),
   ),
   _ProfileAvatarPreset(
-    id: 'mint',
-    startColor: Color(0xFF31B51A),
-    endColor: Color(0xFF8CFF2D),
-    accentColor: Color(0xFFF1FFE6),
+    id: 'avatar_03',
+    assetPath: 'assets/images/avatar_03.png',
+    startColor: Color(0xFFD6B844),
+    endColor: Color(0xFF1D1C20),
+    accentColor: Color(0xFFFCE7A6),
   ),
   _ProfileAvatarPreset(
-    id: 'ember',
-    startColor: Color(0xFFA11C1C),
-    endColor: Color(0xFFFF5A36),
-    accentColor: Color(0xFFFFE8E2),
+    id: 'avatar_04',
+    assetPath: 'assets/images/avatar_04.png',
+    startColor: Color(0xFF182033),
+    endColor: Color(0xFF8791A6),
+    accentColor: Color(0xFFD6DEEF),
   ),
   _ProfileAvatarPreset(
-    id: 'sky',
-    startColor: Color(0xFF1B63D8),
-    endColor: Color(0xFF52A5FF),
-    accentColor: Color(0xFFEDF6FF),
+    id: 'avatar_05',
+    assetPath: 'assets/images/avatar_05.png',
+    startColor: Color(0xFFAEB8C5),
+    endColor: Color(0xFF243128),
+    accentColor: Color(0xFFE5EBF4),
   ),
   _ProfileAvatarPreset(
-    id: 'dusk',
-    startColor: Color(0xFF2B3346),
-    endColor: Color(0xFF59657E),
-    accentColor: Color(0xFFF4F7FF),
+    id: 'avatar_06',
+    assetPath: 'assets/images/avatar_06.png',
+    startColor: Color(0xFFE38BA5),
+    endColor: Color(0xFF9B263C),
+    accentColor: Color(0xFFFFD7E1),
+  ),
+  _ProfileAvatarPreset(
+    id: 'avatar_07',
+    assetPath: 'assets/images/avatar_07.png',
+    startColor: Color(0xFFE4B321),
+    endColor: Color(0xFF20252D),
+    accentColor: Color(0xFFFFE18F),
+  ),
+  _ProfileAvatarPreset(
+    id: 'avatar_08',
+    assetPath: 'assets/images/avatar_08.png',
+    startColor: Color(0xFFE3382F),
+    endColor: Color(0xFF47121B),
+    accentColor: Color(0xFFFFB6B1),
+  ),
+  _ProfileAvatarPreset(
+    id: 'avatar_09',
+    assetPath: 'assets/images/avatar_09.png',
+    startColor: Color(0xFF9EBDC4),
+    endColor: Color(0xFF293B40),
+    accentColor: Color(0xFFD4EDF2),
+  ),
+  _ProfileAvatarPreset(
+    id: 'avatar_10',
+    assetPath: 'assets/images/avatar_10.png',
+    startColor: Color(0xFFE0B23A),
+    endColor: Color(0xFF721E24),
+    accentColor: Color(0xFFFFD97B),
+  ),
+  _ProfileAvatarPreset(
+    id: 'avatar_11',
+    assetPath: 'assets/images/avatar_11.png',
+    startColor: Color(0xFF1E2438),
+    endColor: Color(0xFFEDEEF6),
+    accentColor: Color(0xFFD8D8FF),
+  ),
+  _ProfileAvatarPreset(
+    id: 'avatar_12',
+    assetPath: 'assets/images/avatar_12.png',
+    startColor: Color(0xFF1E1C22),
+    endColor: Color(0xFF6A5B50),
+    accentColor: Color(0xFFE2D4C9),
   ),
 ];
 
@@ -1958,8 +2099,8 @@ class _HeroBackground extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           if (imageUrl.isNotEmpty)
-            Image.network(
-              imageUrl,
+            _FadeInNetworkImage(
+              imageUrl: imageUrl,
               fit: BoxFit.cover,
               errorBuilder: (_, __, ___) => const SizedBox.shrink(),
             )
@@ -2431,8 +2572,8 @@ class _HeroBlock extends StatelessWidget {
                     if (series?.logoUrl.isNotEmpty == true)
                       SizedBox(
                         height: _heroLogoHeight(context),
-                        child: Image.network(
-                          series!.logoUrl,
+                        child: _FadeInNetworkImage(
+                          imageUrl: series!.logoUrl,
                           fit: BoxFit.contain,
                           alignment: Alignment.centerLeft,
                           errorBuilder: (_, __, ___) =>
@@ -2887,8 +3028,8 @@ class _SeriesDetailInfo extends StatelessWidget {
           if (hasLogo) ...[
             SizedBox(
               height: 76,
-              child: Image.network(
-                series.logoUrl,
+              child: _FadeInNetworkImage(
+                imageUrl: series.logoUrl,
                 fit: BoxFit.contain,
                 alignment: Alignment.centerLeft,
                 errorBuilder: (_, __, ___) => const SizedBox.shrink(),
@@ -6571,23 +6712,53 @@ class _Poster extends StatelessWidget {
         decoration: const BoxDecoration(color: TanukiColors.backgroundAlt),
         child: imageUrl.isEmpty
             ? _PosterFallback(title: title)
-            : Image.network(
-                imageUrl,
+            : _FadeInNetworkImage(
+                imageUrl: imageUrl,
                 fit: BoxFit.cover,
                 errorBuilder: (_, __, ___) => _PosterFallback(title: title),
-                loadingBuilder: (context, child, loadingProgress) {
-                  if (loadingProgress == null) {
-                    return child;
-                  }
-                  return const Center(
-                    child: SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2)),
-                  );
-                },
               ),
       ),
+    );
+  }
+}
+
+class _FadeInNetworkImage extends StatelessWidget {
+  const _FadeInNetworkImage({
+    required this.imageUrl,
+    this.width,
+    this.height,
+    this.fit,
+    this.alignment = Alignment.center,
+    this.errorBuilder,
+  });
+
+  final String imageUrl;
+  final double? width;
+  final double? height;
+  final BoxFit? fit;
+  final AlignmentGeometry alignment;
+  final ImageErrorWidgetBuilder? errorBuilder;
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.network(
+      imageUrl,
+      width: width,
+      height: height,
+      fit: fit,
+      alignment: alignment,
+      errorBuilder: errorBuilder,
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (wasSynchronouslyLoaded) {
+          return child;
+        }
+        return AnimatedOpacity(
+          opacity: frame == null ? 0 : 1,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          child: child,
+        );
+      },
     );
   }
 }

@@ -110,7 +110,13 @@ static void my_application_activate(GApplication* application) {
   gdk_rgba_parse(&background_color, "#000000");
   fl_view_set_background_color(view, &background_color);
   gtk_widget_show(GTK_WIDGET(view));
-  gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
+
+  // Desktop WebViews are native GTK children positioned above the Flutter
+  // surface. GtkOverlay keeps them embedded in this application window.
+  GtkWidget* overlay = gtk_overlay_new();
+  gtk_widget_show(overlay);
+  gtk_container_add(GTK_CONTAINER(overlay), GTK_WIDGET(view));
+  gtk_container_add(GTK_CONTAINER(window), overlay);
   gtk_window_maximize(window);
 
   // Show the window when Flutter renders.

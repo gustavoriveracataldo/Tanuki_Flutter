@@ -3,6 +3,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 SOURCE_ROOT="$(pwd)"
+export TANUKI_PROJECT_ROOT="$SOURCE_ROOT"
 
 FLUTTER_BIN="${FLUTTER_BIN:-flutter}"
 if ! command -v "$FLUTTER_BIN" >/dev/null 2>&1 && [ -x "$HOME/.codex/sdks/flutter/bin/flutter" ]; then
@@ -38,28 +39,6 @@ fi
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$SOURCE_ROOT/.gradle-user-home}"
 mkdir -p "$GRADLE_USER_HOME"
 
-LEGACY_LOCAL_PROPERTIES="${TANUKI_LEGACY_LOCAL_PROPERTIES:-$SOURCE_ROOT/../toonami-tv-pwa/android-tv-shell/local.properties}"
-
-legacy_property_name() {
-  case "$1" in
-    TMDB_BEARER_TOKEN) printf '%s' "tmdbBearerToken" ;;
-    TMDB_API_KEY) printf '%s' "tmdbApiKey" ;;
-    FANART_API_KEY) printf '%s' "fanartApiKey" ;;
-    SIMKL_CLIENT_ID) printf '%s' "simklClientId" ;;
-    MYANIMELIST_CLIENT_ID) printf '%s' "myAnimeListClientId" ;;
-    MYANIMELIST_CLIENT_SECRET) printf '%s' "myAnimeListClientSecret" ;;
-    *) printf '%s' "" ;;
-  esac
-}
-
-legacy_property_value() {
-  key="$(legacy_property_name "$1")"
-  if [ -z "$key" ] || [ ! -f "$LEGACY_LOCAL_PROPERTIES" ]; then
-    return 0
-  fi
-  sed -n "s/^$key[[:space:]]*=[[:space:]]*//p" "$LEGACY_LOCAL_PROPERTIES" | tail -n 1
-}
-
 if [ ! -d android ]; then
   "$FLUTTER_BIN" create --platforms=android .
 fi
@@ -94,16 +73,8 @@ find_android_aapt2() {
   printf '%s' "$found_aapt2"
 }
 
-FLUTTER_DART_DEFINES=""
-for key in TMDB_BEARER_TOKEN TMDB_API_KEY FANART_API_KEY SIMKL_CLIENT_ID MYANIMELIST_CLIENT_ID MYANIMELIST_CLIENT_SECRET; do
-  value="$(eval "printf '%s' \"\${$key:-}\"")"
-  if [ -z "$value" ]; then
-    value="$(legacy_property_value "$key")"
-  fi
-  if [ -n "$value" ]; then
-    FLUTTER_DART_DEFINES="$FLUTTER_DART_DEFINES --dart-define=$key=$value"
-  fi
-done
+. "$SOURCE_ROOT/scripts/load_flutter_secrets.sh"
+FLUTTER_DART_DEFINES="$(tanuki_flutter_dart_defines)"
 
 if [ ! -x android/gradlew ]; then
   BUILD_ROOT="${TANUKI_ANDROID_BUILD_ROOT:-$HOME/.codex/build-work/tanuki_android_build}"
