@@ -61,6 +61,15 @@ write_android_local_properties() {
   } > "$target_properties"
 }
 
+remove_stale_android_generated_registrant() {
+  target_root="$1"
+  stale_registrant="$target_root/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java"
+  if [ -f "$stale_registrant" ]; then
+    printf 'Removing stale Android GeneratedPluginRegistrant.java from source tree...\n'
+    rm -f "$stale_registrant"
+  fi
+}
+
 find_android_aapt2() {
   found_aapt2=""
   if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/build-tools" ]; then
@@ -75,6 +84,7 @@ find_android_aapt2() {
 
 . "$SOURCE_ROOT/scripts/load_flutter_secrets.sh"
 FLUTTER_DART_DEFINES="$(tanuki_flutter_dart_defines)"
+remove_stale_android_generated_registrant "$SOURCE_ROOT"
 
 if [ ! -x android/gradlew ]; then
   BUILD_ROOT="${TANUKI_ANDROID_BUILD_ROOT:-$HOME/.codex/build-work/tanuki_android_build}"
@@ -88,6 +98,7 @@ if [ ! -x android/gradlew ]; then
     -cf - . | (cd "$BUILD_ROOT" && tar -xf -)
   chmod +x "$BUILD_ROOT/android/gradlew"
   write_android_local_properties "$BUILD_ROOT"
+  remove_stale_android_generated_registrant "$BUILD_ROOT"
   AAPT2_OVERRIDE="$(find_android_aapt2)"
   if [ -n "$AAPT2_OVERRIDE" ]; then
     printf '\nandroid.aapt2FromMavenOverride=%s\n' "$AAPT2_OVERRIDE" >> "$BUILD_ROOT/android/gradle.properties"
@@ -96,6 +107,7 @@ if [ ! -x android/gradlew ]; then
 else
   BUILD_ROOT="$SOURCE_ROOT"
   write_android_local_properties "$BUILD_ROOT"
+  remove_stale_android_generated_registrant "$BUILD_ROOT"
 fi
 
 "$FLUTTER_BIN" pub get

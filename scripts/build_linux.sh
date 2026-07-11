@@ -14,25 +14,52 @@ if [ ! -d linux ]; then
   "$FLUTTER_BIN" create --platforms=linux .
 fi
 
-LINUX_RELEASE_DIR="$PROJECT_ROOT/build/linux/x64/release"
-CMAKE_CACHE="$LINUX_RELEASE_DIR/CMakeCache.txt"
-if [ -f "$CMAKE_CACHE" ]; then
-  CURRENT_SOURCE_DIR="$PROJECT_ROOT/linux"
-  CACHE_SOURCE_DIR="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$CMAKE_CACHE" | tail -n 1)"
-  if [ -n "$CACHE_SOURCE_DIR" ] && [ "$CACHE_SOURCE_DIR" != "$CURRENT_SOURCE_DIR" ]; then
-    printf 'Linux CMake cache points to an old project path:\n'
-    printf '  old: %s\n' "$CACHE_SOURCE_DIR"
-    printf '  now: %s\n' "$CURRENT_SOURCE_DIR"
-    printf 'Removing stale Linux build cache...\n'
-    rm -rf "$LINUX_RELEASE_DIR"
-  fi
-fi
+remove_stale_linux_cache() {
+  cache_dir="$1"
+  cache_file="$cache_dir/CMakeCache.txt"
+  [ -f "$cache_file" ] || return 0
 
-if [ -f "$CMAKE_CACHE" ] && grep -q '^MEDIA_KIT_LIBS_AVAILABLE:BOOL=OFF$' "$CMAKE_CACHE"; then
-  printf 'Linux CMake cache has media_kit native libs disabled.\n'
-  printf 'Removing stale Linux build cache...\n'
-  rm -rf "$LINUX_RELEASE_DIR"
-fi
+  current_source_dir="$PROJECT_ROOT/linux"
+  cache_source_dir="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache_file" | tail -n 1)"
+  if [ -n "$cache_source_dir" ] && [ "$cache_source_dir" != "$current_source_dir" ]; then
+    printf 'Linux CMake cache points to an old project path:\n'
+    printf '  old: %s\n' "$cache_source_dir"
+    printf '  now: %s\n' "$current_source_dir"
+    printf 'Removing stale Linux build cache...\n'
+    rm -rf "$cache_dir"
+    return 0
+  fi
+
+  if grep -q '^MEDIA_KIT_LIBS_AVAILABLE:BOOL=OFF$' "$cache_file"; then
+    printf 'Linux CMake cache has media_kit native libs disabled.\n'
+    printf 'Removing stale Linux build cache...\n'
+    rm -rf "$cache_dir"
+    return 0
+  fi
+
+  missing_include="$(
+    sed -n 's/^WEBKIT_INCLUDE_DIRS:INTERNAL=//p' "$cache_file" |
+      tr ';' '\n' |
+      while IFS= read -r include_dir; do
+        case "$include_dir" in
+          /*)
+            if [ ! -d "$include_dir" ]; then
+              printf '%s\n' "$include_dir"
+              break
+            fi
+            ;;
+        esac
+      done
+  )"
+  if [ -n "$missing_include" ]; then
+    printf 'Linux CMake cache references a missing WebKit include path: %s\n' "$missing_include"
+    printf 'Removing stale Linux build cache...\n'
+    rm -rf "$cache_dir"
+  fi
+}
+
+LINUX_RELEASE_DIR="$PROJECT_ROOT/build/linux/x64/release"
+remove_stale_linux_cache "$LINUX_RELEASE_DIR"
 
 ensure_linux_build_deps() {
   if [ "${TANUKI_SKIP_MEDIA_KIT_DEPS:-0}" = "1" ]; then

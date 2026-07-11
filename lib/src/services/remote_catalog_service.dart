@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt;
 
 import '../build_config.dart';
 import '../models.dart';
@@ -51,6 +52,7 @@ class RemoteCatalogService {
   static const _animeAv1ModeSubHls = 'sub-hls';
   static const _animeAv1ModeDubHls = 'dub-hls';
   static const _bilibiliEpisodeOptionsPrefix = 'tanuki:bilibili-options:';
+  static const _youtubeEpisodeOptionsPrefix = 'tanuki:youtube-options:';
 
   final http.Client _client;
   final RemoteWebResolver _webResolver;
@@ -586,6 +588,9 @@ class RemoteCatalogService {
     if (provider == RemoteProvider.bilibili) {
       return _resolveBiliBiliProviderEpisode(series: series, episode: episode);
     }
+    if (provider == RemoteProvider.youtube) {
+      return _resolveYoutubeProviderEpisode(series: series, episode: episode);
+    }
     final queries = _seriesProviderLookupQueries(series, episode).take(4);
     final candidates = <RemoteSearchCandidate>[];
     for (final query in queries) {
@@ -632,6 +637,61 @@ class RemoteCatalogService {
       RemoteProvider.bilibili => searchBiliBili(query),
       _ => Future.value(const <RemoteSearchCandidate>[]),
     };
+  }
+
+  Future<EpisodeItem?> _resolveYoutubeProviderEpisode({
+    required SeriesItem series,
+    required EpisodeItem episode,
+  }) async {
+    final title = _youtubeLookupTitle(series);
+    if (title.isEmpty || episode.episodeNumber <= 0) {
+      return null;
+    }
+    final options = <_YoutubePlaybackOption>[];
+    options.addAll(
+      await _searchYoutubeEpisodeOptions(
+        '$title episodio ${episode.episodeNumber} sub esp',
+        mode: YoutubePlaybackMode.sub,
+        episodeNumber: episode.episodeNumber,
+        limit: 2,
+      ),
+    );
+    options.addAll(
+      await _searchYoutubeEpisodeOptions(
+        '$title episodio ${episode.episodeNumber} latino',
+        mode: YoutubePlaybackMode.dub,
+        episodeNumber: episode.episodeNumber,
+        limit: 2,
+      ),
+    );
+    if (options.isEmpty) {
+      _debugResolver('youtube lookup no options title="$title"');
+      return null;
+    }
+    final first = options.first;
+    final stateKey = episode.seriesStateKey.trim().isNotEmpty
+        ? episode.seriesStateKey
+        : series.stableKey;
+    return EpisodeItem(
+      seriesName: episode.seriesName,
+      seriesStateKey: stateKey,
+      episodeIndex: episode.episodeIndex,
+      episodeNumber: episode.episodeNumber,
+      displayName: episode.displayName,
+      relativePath: 'YouTube / Capitulo ${episode.episodeNumber}',
+      filePath: first.url,
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.youtube,
+      slug: first.videoId,
+      watchUrl: first.url,
+      releaseYear:
+          episode.releaseYear > 0 ? episode.releaseYear : series.releaseYear,
+      imageUrl: first.imageUrl.isNotEmpty ? first.imageUrl : episode.imageUrl,
+      description: _encodeYoutubeEpisodeOptions(options),
+      durationLabel: first.durationLabel.isNotEmpty
+          ? first.durationLabel
+          : episode.durationLabel,
+    );
   }
 
   Future<EpisodeItem?> _resolveBiliBiliProviderEpisode({
@@ -773,6 +833,21 @@ class RemoteCatalogService {
     SeriesItem series,
     EpisodeItem episode,
   ) {
+    final requestedDate = _episodeDateKey(episode.airDateIso);
+    if (requestedDate.isNotEmpty) {
+      final dateMatches = series.episodes
+          .where((candidate) =>
+              _episodeDateKey(candidate.airDateIso) == requestedDate)
+          .toList(growable: false);
+      if (dateMatches.length == 1) {
+        return dateMatches.single;
+      }
+      for (final candidate in dateMatches) {
+        if (candidate.episodeNumber == episode.episodeNumber) {
+          return candidate;
+        }
+      }
+    }
     for (final candidate in series.episodes) {
       if (candidate.episodeNumber == episode.episodeNumber) {
         return candidate;
@@ -1394,6 +1469,16 @@ class RemoteCatalogService {
       _debugResolver('bilibili resolved ${_debugStreamLabel(resolved)}');
       return resolved;
     }
+    if (entry.provider == RemoteProvider.youtube) {
+      final resolved = await _resolveYoutubeDirectStream(
+        entry,
+        preferredMode: preferredMode,
+        preferredServer: preferredServer,
+        excludedServers: excludedServers,
+      );
+      _debugResolver('youtube resolved ${_debugStreamLabel(resolved)}');
+      return resolved;
+    }
     if (entry.provider != RemoteProvider.animeAv1) {
       final resolved = await _resolveGenericDirectStream(
         entry,
@@ -1831,6 +1916,516 @@ class RemoteCatalogService {
     }
   }
 
+  Future<List<_YoutubePlaybackOption>> _searchYoutubeEpisodeOptions(
+    String query, {
+    required YoutubePlaybackMode mode,
+    required int episodeNumber,
+    int limit = 2,
+  }) async {
+    final normalized = _cleanBiliBiliSearchQuery(query);
+    if (normalized.isEmpty) {
+      return const [];
+    }
+    final ytDlpOptions = await _searchYoutubeEpisodeOptionsWithYtDlp(
+      normalized,
+      mode: mode,
+      episodeNumber: episodeNumber,
+      limit: limit,
+    );
+    if (ytDlpOptions.isNotEmpty) {
+      return ytDlpOptions;
+    }
+    final ytClient = yt.YoutubeExplode();
+    try {
+      final results = await ytClient.search.search(normalized);
+      final exactMatches = <_YoutubePlaybackOption>[];
+      final fallbackMatches = <_YoutubePlaybackOption>[];
+      for (final video in results) {
+        if (video.isLive) {
+          continue;
+        }
+        if (!_isLikelyFullYoutubeEpisode(
+          title: video.title,
+          durationSeconds: video.duration?.inSeconds,
+        )) {
+          continue;
+        }
+        final option = _YoutubePlaybackOption(
+          server: '',
+          mode: mode,
+          option: YoutubePlaybackOption.first,
+          videoId: video.id.value,
+          url: video.url,
+          title: _cleanRemoteText(video.title),
+          imageUrl: video.thumbnails.highResUrl,
+          durationLabel: _formatYoutubeDuration(video.duration),
+        );
+        if (_youtubeTitleMatchesEpisodeNumber(video.title, episodeNumber)) {
+          exactMatches.add(option);
+        } else {
+          fallbackMatches.add(option);
+        }
+        if (exactMatches.length >= limit.clamp(1, 8).toInt()) {
+          break;
+        }
+      }
+      return _renumberYoutubeOptions(
+        exactMatches.isNotEmpty ? exactMatches : fallbackMatches,
+        mode: mode,
+        limit: limit,
+      );
+    } finally {
+      ytClient.close();
+    }
+  }
+
+  Future<List<_YoutubePlaybackOption>> _searchYoutubeEpisodeOptionsWithYtDlp(
+    String query, {
+    required YoutubePlaybackMode mode,
+    required int episodeNumber,
+    int limit = 2,
+  }) async {
+    final searchLimit = max(limit.clamp(1, 8).toInt() * 4, 8);
+    final result = await _runYtDlp([
+      '--dump-single-json',
+      '--flat-playlist',
+      '--no-warnings',
+      'ytsearch$searchLimit:$query',
+    ]);
+    if (result == null || result.exitCode != 0) {
+      return const [];
+    }
+    try {
+      final decoded = jsonDecode(result.stdout);
+      final entries = decoded is Map ? decoded['entries'] : null;
+      if (entries is! List) {
+        return const [];
+      }
+      final exactMatches = <_YoutubePlaybackOption>[];
+      final fallbackMatches = <_YoutubePlaybackOption>[];
+      for (final entry in entries.whereType<Map>()) {
+        final videoId = _readString(entry['id']);
+        if (!_isYoutubeVideoId(videoId)) {
+          continue;
+        }
+        final title = _cleanRemoteText(_readString(entry['title']));
+        final durationSeconds = _readInt(entry['duration']);
+        if (!_isLikelyFullYoutubeEpisode(
+          title: title,
+          durationSeconds: durationSeconds,
+        )) {
+          continue;
+        }
+        final option = _YoutubePlaybackOption(
+          server: '',
+          mode: mode,
+          option: YoutubePlaybackOption.first,
+          videoId: videoId,
+          url: _youtubeWatchUrl(videoId),
+          title: title,
+          imageUrl: _youtubeThumbnailUrl(videoId),
+          durationLabel: _formatSecondsDuration(durationSeconds),
+        );
+        if (_youtubeTitleMatchesEpisodeNumber(title, episodeNumber)) {
+          exactMatches.add(option);
+        } else {
+          fallbackMatches.add(option);
+        }
+        if (exactMatches.length >= limit.clamp(1, 8).toInt()) {
+          break;
+        }
+      }
+      return _renumberYoutubeOptions(
+        exactMatches.isNotEmpty ? exactMatches : fallbackMatches,
+        mode: mode,
+        limit: limit,
+      );
+    } catch (error) {
+      _debugResolver('youtube yt-dlp search parse failed: $error');
+      return const [];
+    }
+  }
+
+  List<_YoutubePlaybackOption> _renumberYoutubeOptions(
+    List<_YoutubePlaybackOption> options, {
+    required YoutubePlaybackMode mode,
+    required int limit,
+  }) {
+    final normalizedLimit = limit.clamp(1, 8).toInt();
+    final normalized = <_YoutubePlaybackOption>[];
+    for (final option in options) {
+      if (normalized.length >= normalizedLimit) {
+        break;
+      }
+      final optionIndex = normalized.length + 1;
+      normalized.add(
+        option.copyWith(
+          server: 'youtube-${mode.id}-$optionIndex',
+          option: optionIndex == 1
+              ? YoutubePlaybackOption.first
+              : YoutubePlaybackOption.second,
+        ),
+      );
+    }
+    return normalized;
+  }
+
+  bool _isLikelyFullYoutubeEpisode({
+    required String title,
+    required int? durationSeconds,
+  }) {
+    final normalizedTitle = title.toLowerCase();
+    if (normalizedTitle.contains('opening') ||
+        normalizedTitle.contains('ending') ||
+        normalizedTitle.contains('op ') ||
+        normalizedTitle.contains(' ed ') ||
+        normalizedTitle.contains('tema de apertura')) {
+      return false;
+    }
+    if (durationSeconds == null || durationSeconds <= 0) {
+      return true;
+    }
+    return durationSeconds >= 10 * 60;
+  }
+
+  bool _youtubeTitleMatchesEpisodeNumber(String title, int episodeNumber) {
+    if (episodeNumber <= 0) {
+      return true;
+    }
+    final normalized = title
+        .toLowerCase()
+        .replaceAll(RegExp(r'[\[\]\(\)\|:_\-]+'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    final escaped = RegExp.escape('$episodeNumber');
+    final patterns = [
+      RegExp(r'(^|\s)(ep|eps|episodio|episode|chapter|capitulo|cap)\.?\s*' +
+          escaped +
+          r'(\s|$)'),
+      RegExp(r'(^|\s)' + escaped + r'(\s|$)'),
+    ];
+    return patterns.any((pattern) => pattern.hasMatch(normalized));
+  }
+
+  Future<RemoteDirectStream?> _resolveYoutubeDirectStream(
+    EpisodeItem entry, {
+    String preferredMode = '',
+    String preferredServer = '',
+    Set<String> excludedServers = const {},
+  }) async {
+    final options = _youtubePlaybackOptionsFor(entry);
+    if (options.isEmpty) {
+      _debugResolver('youtube skipped empty playback options');
+      return null;
+    }
+    final selected = _selectYoutubePlaybackOption(
+      options,
+      preferredMode: preferredMode,
+      preferredServer: preferredServer,
+      excludedServers: excludedServers,
+    );
+    if (selected == null) {
+      _debugResolver('youtube skipped all options');
+      return null;
+    }
+    final ytDlpStream = await _resolveYoutubeDirectStreamWithYtDlp(
+      selected,
+      availableModes: options.map((option) => option.server).toSet(),
+    );
+    if (ytDlpStream != null) {
+      return ytDlpStream;
+    }
+    final ytClient = yt.YoutubeExplode();
+    try {
+      final manifest =
+          await ytClient.videos.streamsClient.getManifest(selected.videoId);
+      final muxed = manifest.muxed.toList()
+        ..sort((left, right) {
+          final containerCompare = (right.container.name == 'mp4' ? 1 : 0)
+              .compareTo(left.container.name == 'mp4' ? 1 : 0);
+          if (containerCompare != 0) {
+            return containerCompare;
+          }
+          final heightCompare = right.videoResolution.height
+              .compareTo(left.videoResolution.height);
+          if (heightCompare != 0) {
+            return heightCompare;
+          }
+          return right.bitrate.bitsPerSecond
+              .compareTo(left.bitrate.bitsPerSecond);
+        });
+      if (muxed.isEmpty) {
+        _debugResolver('youtube missing muxed streams id=${selected.videoId}');
+        return null;
+      }
+      final stream = muxed.first;
+      return RemoteDirectStream(
+        playbackUrl: stream.url.toString(),
+        playbackKind: stream.container.name == 'mp4' ? 'mp4' : 'direct',
+        pageUrl: selected.url,
+        availableModes: options.map((option) => option.server).toSet(),
+        selectedMode: selected.server,
+        provider: RemoteProvider.youtube,
+        server: selected.server,
+        httpHeaders: const {
+          'User-Agent': _defaultFetchUserAgent,
+        },
+      );
+    } on yt.YoutubeExplodeException catch (error) {
+      _debugResolver('youtube manifest failed id=${selected.videoId}: $error');
+      return null;
+    } finally {
+      ytClient.close();
+    }
+  }
+
+  Future<RemoteDirectStream?> _resolveYoutubeDirectStreamWithYtDlp(
+    _YoutubePlaybackOption selected, {
+    required Set<String> availableModes,
+  }) async {
+    _YtDlpResult? result;
+    for (final format in const [
+      '18/best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best',
+      'best',
+    ]) {
+      result = await _runYtDlp([
+        '-g',
+        '-f',
+        format,
+        '--no-warnings',
+        selected.url,
+      ]);
+      if (result != null && result.exitCode == 0) {
+        break;
+      }
+    }
+    if (result == null || result.exitCode != 0) {
+      if (result != null) {
+        _debugResolver(
+          'youtube yt-dlp resolve failed id=${selected.videoId}: '
+          '${result.stderr}',
+        );
+      }
+      return null;
+    }
+    final playbackUrl = result.stdout
+        .split(RegExp(r'\r?\n'))
+        .map((line) => line.trim())
+        .firstWhere(
+          (line) => line.startsWith('http://') || line.startsWith('https://'),
+          orElse: () => '',
+        );
+    if (playbackUrl.isEmpty) {
+      return null;
+    }
+    return RemoteDirectStream(
+      playbackUrl: playbackUrl,
+      playbackKind: playbackUrl.toLowerCase().contains('.m3u8')
+          ? 'hls'
+          : playbackUrl.toLowerCase().contains('.mp4')
+              ? 'mp4'
+              : 'direct',
+      pageUrl: selected.url,
+      availableModes: availableModes,
+      selectedMode: selected.server,
+      provider: RemoteProvider.youtube,
+      server: selected.server,
+      httpHeaders: const {
+        'User-Agent': _defaultFetchUserAgent,
+      },
+    );
+  }
+
+  List<_YoutubePlaybackOption> _youtubePlaybackOptionsFor(EpisodeItem entry) {
+    final decoded = _decodeYoutubeEpisodeOptions(entry.description);
+    if (decoded.isNotEmpty) {
+      return decoded;
+    }
+    final videoId = _youtubeVideoIdFromUrl(
+        entry.watchUrl.isNotEmpty ? entry.watchUrl : entry.filePath);
+    if (videoId.isEmpty) {
+      return const [];
+    }
+    return [
+      _YoutubePlaybackOption(
+        server: 'youtube-sub-1',
+        mode: YoutubePlaybackMode.sub,
+        option: YoutubePlaybackOption.first,
+        videoId: videoId,
+        url: _youtubeWatchUrl(videoId),
+        title: entry.displayName,
+        imageUrl: entry.imageUrl,
+        durationLabel: entry.durationLabel,
+      ),
+    ];
+  }
+
+  _YoutubePlaybackOption? _selectYoutubePlaybackOption(
+    List<_YoutubePlaybackOption> options, {
+    required String preferredMode,
+    required String preferredServer,
+    required Set<String> excludedServers,
+  }) {
+    final excluded =
+        excludedServers.map((entry) => entry.toLowerCase()).toSet();
+    final preferred = preferredServer.trim().toLowerCase();
+    if (preferred.isNotEmpty && !excluded.contains(preferred)) {
+      for (final option in options) {
+        if (option.server.toLowerCase() == preferred) {
+          return option;
+        }
+      }
+    }
+    final mode = youtubePlaybackModeFromId(preferredMode);
+    final byMode = options
+        .where((option) =>
+            option.mode == mode &&
+            !excluded.contains(option.server.toLowerCase()))
+        .toList();
+    if (byMode.isNotEmpty) {
+      return byMode.first;
+    }
+    for (final option in options) {
+      if (!excluded.contains(option.server.toLowerCase())) {
+        return option;
+      }
+    }
+    return null;
+  }
+
+  String _encodeYoutubeEpisodeOptions(List<_YoutubePlaybackOption> options) {
+    final payload = [
+      for (final option in options)
+        {
+          'server': option.server,
+          'mode': option.mode.id,
+          'option': option.option.id,
+          'videoId': option.videoId,
+          'url': option.url,
+          'title': option.title,
+          'imageUrl': option.imageUrl,
+          'durationLabel': option.durationLabel,
+        },
+    ];
+    return '$_youtubeEpisodeOptionsPrefix${jsonEncode(payload)}';
+  }
+
+  List<_YoutubePlaybackOption> _decodeYoutubeEpisodeOptions(String value) {
+    final trimmed = value.trim();
+    if (!trimmed.startsWith(_youtubeEpisodeOptionsPrefix)) {
+      return const [];
+    }
+    try {
+      final decoded =
+          jsonDecode(trimmed.substring(_youtubeEpisodeOptionsPrefix.length));
+      if (decoded is! List) {
+        return const [];
+      }
+      final options = <_YoutubePlaybackOption>[];
+      for (final entry in decoded.whereType<Map>()) {
+        final videoId = _readString(entry['videoId']);
+        final url = _readString(entry['url']);
+        final server = _readString(entry['server']);
+        if (videoId.isEmpty || url.isEmpty || server.isEmpty) {
+          continue;
+        }
+        options.add(
+          _YoutubePlaybackOption(
+            server: server,
+            mode: youtubePlaybackModeFromId(entry['mode']),
+            option: youtubePlaybackOptionFromId(entry['option']),
+            videoId: videoId,
+            url: url,
+            title: _readString(entry['title']),
+            imageUrl: _readString(entry['imageUrl']),
+            durationLabel: _readString(entry['durationLabel']),
+          ),
+        );
+      }
+      return options;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  String _youtubeLookupTitle(SeriesItem series) {
+    final candidates = [
+      series.name,
+      ...series.aliases,
+      series.japaneseTitle,
+    ];
+    for (final candidate in candidates) {
+      final cleaned = _cleanBiliBiliSearchQuery(candidate);
+      if (cleaned.isNotEmpty) {
+        return cleaned;
+      }
+    }
+    return '';
+  }
+
+  String _formatYoutubeDuration(Duration? duration) {
+    if (duration == null || duration <= Duration.zero) {
+      return '';
+    }
+    return _formatSecondsDuration(duration.inSeconds);
+  }
+
+  String _formatSecondsDuration(int secondsValue) {
+    if (secondsValue <= 0) {
+      return '';
+    }
+    final duration = Duration(seconds: secondsValue);
+    final minutes = duration.inMinutes;
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  String _youtubeThumbnailUrl(String videoId) {
+    return _isYoutubeVideoId(videoId)
+        ? 'https://img.youtube.com/vi/$videoId/hqdefault.jpg'
+        : '';
+  }
+
+  Future<_YtDlpResult?> _runYtDlp(List<String> arguments) async {
+    if (!io.Platform.isLinux && !io.Platform.isWindows) {
+      return null;
+    }
+    Object? lastError;
+    for (final executable in _ytDlpExecutableCandidates()) {
+      try {
+        final result = await io.Process.run(
+          executable,
+          arguments,
+        ).timeout(const Duration(seconds: 45));
+        return _YtDlpResult(
+          exitCode: result.exitCode,
+          stdout: '${result.stdout}',
+          stderr: '${result.stderr}',
+        );
+      } on Object catch (error) {
+        lastError = error;
+      }
+    }
+    _debugResolver('yt-dlp unavailable or failed: $lastError');
+    return null;
+  }
+
+  List<String> _ytDlpExecutableCandidates() {
+    final configured = io.Platform.environment['YTDLP_PATH']?.trim() ?? '';
+    final candidates = <String>[
+      if (configured.isNotEmpty) configured,
+      io.Platform.isWindows ? 'yt-dlp.exe' : 'yt-dlp',
+    ];
+    if (io.Platform.isLinux) {
+      final home = io.Platform.environment['HOME']?.trim() ?? '';
+      if (home.isNotEmpty) {
+        candidates.add('$home/.local/bin/yt-dlp');
+      }
+      candidates.add('/var/data/python/bin/yt-dlp');
+    }
+    return candidates.toSet().toList(growable: false);
+  }
+
   String _cleanBiliBiliSearchQuery(String value) {
     final buffer = StringBuffer();
     var previousWasSpace = true;
@@ -1972,6 +2567,10 @@ class RemoteCatalogService {
         selectedMode: 'http-direct',
         server: _normalizeServerPreference(pageUrl),
         subtitleTracks: subtitleTracks,
+        httpHeaders: _directMediaHttpHeaders(
+          directUrl: directUrl,
+          pageUrl: pageUrl,
+        ),
       );
     }
     final doodstreamPassStream =
@@ -2138,6 +2737,10 @@ class RemoteCatalogService {
               ? _normalizeServerPreference(endpointUrl)
               : _normalizeServerPreference(pageUrl),
           subtitleTracks: subtitleTracks,
+          httpHeaders: _directMediaHttpHeaders(
+            directUrl: directUrl,
+            pageUrl: endpointUrl,
+          ),
         );
       }
 
@@ -2165,10 +2768,33 @@ class RemoteCatalogService {
             subtitleTracks,
             resolved.subtitleTracks,
           ),
+          httpHeaders: resolved.httpHeaders,
         );
       }
     }
     return null;
+  }
+
+  Map<String, String> _directMediaHttpHeaders({
+    required String directUrl,
+    required String pageUrl,
+  }) {
+    if (_inferPlaybackKind(directUrl).isEmpty) {
+      return const {};
+    }
+    final server = _normalizeServerPreference(pageUrl);
+    if (server != 'mp4upload') {
+      return const {};
+    }
+    final uri = Uri.tryParse(pageUrl);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      return const {};
+    }
+    return {
+      'User-Agent': _defaultFetchUserAgent,
+      'Referer': pageUrl,
+      'Origin': _baseOrigin(pageUrl),
+    };
   }
 
   Future<RemoteDirectStream?> _resolveDoodstreamPassMd5Stream(
@@ -2493,34 +3119,55 @@ class RemoteCatalogService {
         _fetchJikanEpisodeMetadata(candidate.catalogId),
         _fetchJikanCast(candidate.catalogId),
       ]);
-      final detail = results[0] as RemoteSearchCandidate?;
+      final jikanDetail = results[0] as RemoteSearchCandidate?;
+      final detail = jikanDetail ??
+          await _fetchMyAnimeListCandidateDetail(candidate.catalogId);
       final episodes = results[1] as List<SeriesEpisodeMetadata>;
       final cast = results[2] as List<String>;
       if (detail == null && episodes.isEmpty && cast.isEmpty) {
         return candidate;
       }
-      final episodeCount = max(
-        max(candidate.episodeCount, detail?.episodeCount ?? 0),
-        episodes.length,
+      final jikanEpisodeCount = detail?.episodeCount ?? 0;
+      final episodeCount = jikanEpisodeCount > 0
+          ? jikanEpisodeCount
+          : episodes.isNotEmpty
+              ? episodes.length
+              : 0;
+      var episodeDetails = jikanEpisodeCount > 0 || episodes.isNotEmpty
+          ? _mergeEpisodeMetadata(
+              episodes,
+              candidate.episodeDetails,
+            )
+          : const <SeriesEpisodeMetadata>[];
+      episodeDetails = await _mergeAnimeAv1EpisodeScaffold(
+        candidate,
+        episodeDetails,
+        fallbackImageUrl: _firstNonEmpty([
+          detail?.imageUrl ?? '',
+          candidate.imageUrl,
+        ]),
       );
+      final scaffoldEpisodeCount = episodeDetails.isEmpty
+          ? episodeCount
+          : episodeDetails
+              .where((episode) => episode.episodeNumber >= 0)
+              .length;
       return _copyCandidate(
         candidate,
         watchUrl: _firstNonEmpty([candidate.watchUrl, detail?.watchUrl ?? '']),
         seriesUrl:
             _firstNonEmpty([candidate.seriesUrl, detail?.seriesUrl ?? '']),
-        imageUrl: _firstNonEmpty([candidate.imageUrl, detail?.imageUrl ?? '']),
+        imageUrl: _firstNonEmpty([detail?.imageUrl ?? '', candidate.imageUrl]),
         backgroundUrl: _firstNonEmpty([
           candidate.backgroundUrl,
           detail?.backgroundUrl ?? '',
         ]),
         trailerUrl:
             _firstNonEmpty([candidate.trailerUrl, detail?.trailerUrl ?? '']),
-        description: _firstNonEmpty([
-          candidate.description,
-          detail?.description ?? '',
-        ]),
+        description:
+            _firstNonEmpty([detail?.description ?? '', candidate.description]),
         rating: _firstNonEmpty([candidate.rating, detail?.rating ?? '']),
-        episodeCount: episodeCount,
+        episodeCount: max(episodeCount, scaffoldEpisodeCount),
         format: _firstNonEmpty([candidate.format, detail?.format ?? '']),
         japaneseTitle: _firstNonEmpty([
           candidate.japaneseTitle,
@@ -2539,11 +3186,8 @@ class RemoteCatalogService {
             ? candidate.releaseYear
             : detail?.releaseYear ?? 0,
         airDateIso:
-            _firstNonEmpty([candidate.airDateIso, detail?.airDateIso ?? '']),
-        episodeDetails: _mergeEpisodeMetadata(
-          candidate.episodeDetails,
-          episodes,
-        ),
+            _firstNonEmpty([detail?.airDateIso ?? '', candidate.airDateIso]),
+        episodeDetails: episodeDetails,
         cast: _mergeCast(candidate.cast, [
           ...?detail?.cast,
           ...cast,
@@ -2552,6 +3196,91 @@ class RemoteCatalogService {
     } catch (_) {
       return candidate;
     }
+  }
+
+  Future<List<SeriesEpisodeMetadata>> _mergeAnimeAv1EpisodeScaffold(
+    RemoteSearchCandidate candidate,
+    List<SeriesEpisodeMetadata> episodeDetails, {
+    required String fallbackImageUrl,
+  }) async {
+    if (candidate.provider != RemoteProvider.catalog ||
+        candidate.title.trim().isEmpty) {
+      return episodeDetails;
+    }
+    final queries = _seriesProviderLookupQueries(
+      candidate.toSeries(existingNames: const []),
+      null,
+    ).take(4);
+    RemoteSearchCandidate? best;
+    var bestScore = 0;
+    for (final query in queries) {
+      final results = await _safeProviderSearch(
+        () => searchAnimeAv1(query, releaseYear: candidate.releaseYear),
+      );
+      for (final result in results) {
+        final score = _scoreCandidateAgainstQuery(query, result);
+        if (score > bestScore) {
+          bestScore = score;
+          best = result;
+        }
+      }
+      if (bestScore >= 900) {
+        break;
+      }
+    }
+    if (best == null || bestScore < 520) {
+      return episodeDetails;
+    }
+    final slug = _extractAnimeAv1Slug(
+      best.seriesUrl.isNotEmpty ? best.seriesUrl : best.watchUrl,
+    );
+    final seriesUrl = _normalizeAnimeAv1SeriesUrl(
+      best.seriesUrl.isNotEmpty
+          ? best.seriesUrl
+          : best.watchUrl.isNotEmpty
+              ? best.watchUrl
+              : slug.isEmpty
+                  ? ''
+                  : '$_animeAv1BaseUrl/media/$slug',
+    );
+    if (slug.isEmpty || seriesUrl.isEmpty) {
+      return episodeDetails;
+    }
+    final response = await _get(Uri.parse(seriesUrl));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return episodeDetails;
+    }
+    final episodeNumbers = _parseAnimeAv1EpisodeNumbers(response.body, slug);
+    if (episodeNumbers.isEmpty) {
+      return episodeDetails;
+    }
+    final currentNumbers = episodeDetails
+        .map((episode) => episode.episodeNumber)
+        .where((number) => number >= 0)
+        .toSet();
+    final hasExtraNumbers = episodeNumbers.any(
+      (episodeNumber) => !currentNumbers.contains(episodeNumber),
+    );
+    if (!hasExtraNumbers &&
+        !episodeNumbers.contains(0) &&
+        episodeNumbers.length <= currentNumbers.length) {
+      return episodeDetails;
+    }
+    final existingByNumber = _episodeMetadataByNumber(episodeDetails);
+    final merged = <SeriesEpisodeMetadata>[];
+    for (final episodeNumber in episodeNumbers) {
+      final existing = existingByNumber[episodeNumber];
+      if (existing != null) {
+        merged.add(existing);
+        continue;
+      }
+      merged.add(SeriesEpisodeMetadata(
+        episodeNumber: episodeNumber,
+        title: episodeNumber == 0 ? 'Episodio 0' : '',
+        imageUrl: episodeNumber == 0 ? fallbackImageUrl : '',
+      ));
+    }
+    return merged;
   }
 
   Future<RemoteSearchCandidate?> _fetchJikanCandidateDetail(
@@ -2576,6 +3305,40 @@ class RemoteCatalogService {
       }
     }
     return null;
+  }
+
+  Future<RemoteSearchCandidate?> _fetchMyAnimeListCandidateDetail(
+    int catalogId,
+  ) async {
+    if (catalogId <= 0 || !_hasMyAnimeListClientId) {
+      return null;
+    }
+    final uri = Uri.parse('$_myAnimeListApiBaseUrl/anime/$catalogId').replace(
+      queryParameters: {
+        'fields': [
+          'id',
+          'title',
+          'main_picture',
+          'alternative_titles',
+          'start_date',
+          'media_type',
+          'num_episodes',
+          'synopsis',
+          'mean',
+        ].join(','),
+      },
+    );
+    final response = await _getMyAnimeList(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return null;
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map) {
+      return null;
+    }
+    return _candidateFromMyAnimeListNode(
+      Map<String, dynamic>.from(decoded),
+    );
   }
 
   Future<List<SeriesEpisodeMetadata>> _fetchJikanEpisodeMetadata(
@@ -2716,6 +3479,9 @@ class RemoteCatalogService {
   Future<_SeriesVisuals?> _fetchTmdbVisuals(
       RemoteSearchCandidate candidate) async {
     final mediaType = _candidateLooksMovie(candidate) ? 'movie' : 'tv';
+    if (mediaType == 'tv' && _candidateLooksStandalonePilot(candidate)) {
+      return null;
+    }
     final match = await _findBestTmdbMatch(candidate, mediaType);
     if (match == null) {
       return null;
@@ -2737,7 +3503,7 @@ class RemoteCatalogService {
     final detailsYear = _extractYearFromText(_readString(
       details[mediaType == 'movie' ? 'release_date' : 'first_air_date'],
     ));
-    if (!_isCompatibleTmdbMatchYear(candidate.releaseYear, detailsYear)) {
+    if (!_isCompatibleTmdbMatchYearForCandidate(candidate, detailsYear)) {
       return null;
     }
 
@@ -2781,6 +3547,7 @@ class RemoteCatalogService {
             details,
             primarySeasonNumber: seasonNumber,
             expectedEpisodeCount: candidate.episodeCount,
+            explicitSeasonNumber: explicitSeasonNumber,
             explicitSeasonOnly: explicitSeasonNumber > 0,
           )
         : _buildTmdbMovieEpisodeMetadata(
@@ -2843,6 +3610,19 @@ class RemoteCatalogService {
       final value = match == null ? 0 : int.tryParse(match.group(1) ?? '') ?? 0;
       if (value > 1 && value <= 30) {
         return value;
+      }
+    }
+    const japaneseSeasonWords = {
+      'ni no shou': 2,
+      'san no shou': 3,
+      'yon no shou': 4,
+      'shi no shou': 4,
+      'go no shou': 5,
+      'roku no shou': 6,
+    };
+    for (final entry in japaneseSeasonWords.entries) {
+      if (text.contains(entry.key)) {
+        return entry.value;
       }
     }
     return 0;
@@ -2929,7 +3709,7 @@ class RemoteCatalogService {
               mediaType == 'movie' ? 'original_title' : 'original_name']);
           final matchYear = _extractYearFromText(_readString(result[
               mediaType == 'movie' ? 'release_date' : 'first_air_date']));
-          if (!_isCompatibleTmdbMatchYear(candidate.releaseYear, matchYear)) {
+          if (!_isCompatibleTmdbMatchYearForCandidate(candidate, matchYear)) {
             continue;
           }
           final match = _TmdbMatch(
@@ -2963,6 +3743,52 @@ class RemoteCatalogService {
   ) {
     if (mediaType != 'tv') {
       return null;
+    }
+    final baseTerms = <String>{
+      candidate.title,
+      candidate.japaneseTitle,
+      ...candidate.aliases,
+    }
+        .expand((term) {
+          final cleaned = _cleanRemoteText(term);
+          final stripped = _stripSeasonQualifier(cleaned);
+          return [
+            _normalizeMatchText(cleaned),
+            if (stripped.isNotEmpty) _normalizeMatchText(stripped),
+          ];
+        })
+        .where((entry) => entry.isNotEmpty)
+        .toSet();
+    final isOshiNoKo = baseTerms.any((term) {
+      return term == 'oshi no ko' ||
+          term == 'oshinoko' ||
+          term.contains('oshi no ko');
+    });
+    if (isOshiNoKo) {
+      return const _TmdbMatch(
+        id: 203737,
+        title: 'Oshi no Ko',
+        originalTitle: '【推しの子】',
+        releaseYear: 2023,
+        imageUrl: '',
+        backgroundUrl: '',
+      );
+    }
+    final isFireForce = baseTerms.any((term) {
+      return term == 'fire force' ||
+          term.contains('fire force') ||
+          term.contains('enen no shouboutai') ||
+          term.contains('enen no shobotai');
+    });
+    if (isFireForce) {
+      return const _TmdbMatch(
+        id: 88046,
+        title: 'Fire Force',
+        originalTitle: 'Enen no Shouboutai',
+        releaseYear: 2019,
+        imageUrl: '',
+        backgroundUrl: '',
+      );
     }
     final releaseYear = candidate.releaseYear;
     if (releaseYear < 1985 || releaseYear > 1990) {
@@ -3014,20 +3840,84 @@ class RemoteCatalogService {
     ];
   }
 
-  bool _isCompatibleTmdbMatchYear(int requestedYear, int matchYear) {
+  bool _isCompatibleTmdbMatchYearForCandidate(
+    RemoteSearchCandidate candidate,
+    int matchYear,
+  ) {
+    final requestedYear = candidate.releaseYear;
     if (requestedYear <= 0 || matchYear <= 0) {
       return true;
+    }
+    if (_explicitSeasonNumberForCandidate(candidate) > 1 &&
+        matchYear <= requestedYear) {
+      return (requestedYear - matchYear).abs() <= 12;
     }
     return (requestedYear - matchYear).abs() <= 2;
   }
 
   List<String> _buildTmdbLookupQueries(RemoteSearchCandidate candidate) {
-    final queries = <String>{
+    final queries = <String>{};
+    for (final raw in [
       candidate.title,
       candidate.japaneseTitle,
       ...candidate.aliases,
-    }.map(_cleanRemoteText).where((entry) => entry.isNotEmpty).toList();
+    ]) {
+      final cleaned = _cleanRemoteText(raw);
+      if (cleaned.isEmpty) {
+        continue;
+      }
+      queries.add(cleaned);
+      final baseSeasonTitle = _stripSeasonQualifier(cleaned);
+      if (baseSeasonTitle.isNotEmpty) {
+        queries.add(baseSeasonTitle);
+      }
+    }
     return queries.toList();
+  }
+
+  bool _candidateLooksStandalonePilot(RemoteSearchCandidate candidate) {
+    final terms = [
+      candidate.title,
+      candidate.japaneseTitle,
+      ...candidate.aliases,
+      candidate.format,
+    ].map(_normalizeMatchText).where((entry) => entry.isNotEmpty);
+    return terms.any((term) => _tokenize(term).contains('pilot'));
+  }
+
+  String _stripSeasonQualifier(String value) {
+    var normalized = value
+        .replaceAll(
+          RegExp(
+            r'\b(?:season|temporada|temp)\s*[0-9ivxlcdm]{1,6}\b',
+            caseSensitive: false,
+          ),
+          ' ',
+        )
+        .replaceAll(
+          RegExp(
+            r'\b[0-9]{1,2}(?:st|nd|rd|th)\s+season\b',
+            caseSensitive: false,
+          ),
+          ' ',
+        )
+        .replaceAll(
+          RegExp(
+            r'\b(?:ni|san|yon|shi|go|roku)\s+no\s+shou\b',
+            caseSensitive: false,
+          ),
+          ' ',
+        )
+        .replaceAll(
+          RegExp(r'\bpart\s*[0-9]{1,2}\b', caseSensitive: false),
+          ' ',
+        )
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (normalized == value.trim()) {
+      return '';
+    }
+    return normalized;
   }
 
   int _scoreTmdbMatch({
@@ -3057,14 +3947,20 @@ class RemoteCatalogService {
     if (candidate.releaseYear > 0 && match.releaseYear > 0) {
       final diff = (candidate.releaseYear - match.releaseYear).abs();
       if (diff > 2) {
-        return 0;
+        if (_explicitSeasonNumberForCandidate(candidate) <= 1 ||
+            match.releaseYear > candidate.releaseYear ||
+            diff > 12) {
+          return 0;
+        }
+        score += max(20, 220 - diff * 30);
+      } else {
+        score += switch (diff) {
+          0 => 520,
+          1 => 160,
+          2 => 40,
+          _ => 0,
+        };
       }
-      score += switch (diff) {
-        0 => 520,
-        1 => 160,
-        2 => 40,
-        _ => 0,
-      };
     } else if (candidate.releaseYear > 0 && match.releaseYear <= 0) {
       score -= 120;
     }
@@ -3478,7 +4374,7 @@ class RemoteCatalogService {
   ) {
     return {
       for (final detail in details)
-        if (detail.episodeNumber > 0) detail.episodeNumber: detail,
+        if (detail.episodeNumber >= 0) detail.episodeNumber: detail,
     };
   }
 
@@ -3570,10 +4466,20 @@ class RemoteCatalogService {
     Map<String, dynamic> details, {
     required int primarySeasonNumber,
     required int expectedEpisodeCount,
+    int explicitSeasonNumber = 0,
     bool explicitSeasonOnly = false,
   }) async {
     final primary =
         await _fetchTmdbSeasonEpisodes(seriesId, primarySeasonNumber);
+    final flattenedSeason = _pickFlattenedTmdbSeasonSegment(
+      primary,
+      expectedEpisodeCount: expectedEpisodeCount,
+      explicitSeasonNumber: explicitSeasonNumber,
+      primarySeasonNumber: primarySeasonNumber,
+    );
+    if (flattenedSeason.isNotEmpty) {
+      return flattenedSeason;
+    }
     if (explicitSeasonOnly) {
       return primary;
     }
@@ -3620,6 +4526,32 @@ class RemoteCatalogService {
       }
     }
     return collected.length > primary.length ? collected : primary;
+  }
+
+  List<SeriesEpisodeMetadata> _pickFlattenedTmdbSeasonSegment(
+    List<SeriesEpisodeMetadata> primary, {
+    required int expectedEpisodeCount,
+    required int explicitSeasonNumber,
+    required int primarySeasonNumber,
+  }) {
+    if (primarySeasonNumber != 1 ||
+        explicitSeasonNumber <= 1 ||
+        expectedEpisodeCount <= 0 ||
+        primary.length <= expectedEpisodeCount) {
+      return const [];
+    }
+    final startIndex = (explicitSeasonNumber - 1) * expectedEpisodeCount;
+    final endIndex = startIndex + expectedEpisodeCount;
+    if (startIndex < 0 || endIndex > primary.length) {
+      return const [];
+    }
+    return [
+      for (var index = startIndex; index < endIndex; index += 1)
+        _renumberTmdbEpisodeMetadata(
+          primary[index],
+          index - startIndex + 1,
+        ),
+    ];
   }
 
   SeriesEpisodeMetadata _renumberTmdbEpisodeMetadata(
@@ -3782,6 +4714,20 @@ class RemoteCatalogService {
   ) {
     final primaryByEpisode = _episodeMetadataByNumber(primary);
     final supplementalByEpisode = _episodeMetadataByNumber(supplemental);
+    final supplementalOffset = _episodeMetadataDateOffset(
+      primaryByEpisode,
+      supplementalByEpisode,
+    );
+    if (supplementalOffset != 0 && primaryByEpisode.isNotEmpty) {
+      final episodeNumbers = primaryByEpisode.keys.toList()..sort();
+      return [
+        for (final episodeNumber in episodeNumbers)
+          _mergeEpisodeDetail(
+            primaryByEpisode[episodeNumber],
+            supplementalByEpisode[episodeNumber + supplementalOffset],
+          ),
+      ];
+    }
     final episodeNumbers = <int>{
       ...primaryByEpisode.keys,
       ...supplementalByEpisode.keys,
@@ -3822,6 +4768,45 @@ class RemoteCatalogService {
           ? primary.airDateIso
           : supplemental.airDateIso,
     );
+  }
+
+  int _episodeMetadataDateOffset(
+    Map<int, SeriesEpisodeMetadata> primaryByEpisode,
+    Map<int, SeriesEpisodeMetadata> supplementalByEpisode,
+  ) {
+    if (primaryByEpisode.isEmpty || supplementalByEpisode.isEmpty) {
+      return 0;
+    }
+    final primaryEntries = primaryByEpisode.entries.toList()
+      ..sort((left, right) => left.key.compareTo(right.key));
+    for (final primaryEntry in primaryEntries) {
+      final primaryDate = _episodeDateKey(primaryEntry.value.airDateIso);
+      if (primaryDate.isEmpty) {
+        continue;
+      }
+      final direct = supplementalByEpisode[primaryEntry.key];
+      if (_episodeDateKey(direct?.airDateIso ?? '') == primaryDate) {
+        return 0;
+      }
+      for (final supplementalEntry in supplementalByEpisode.entries) {
+        if (supplementalEntry.key == primaryEntry.key) {
+          continue;
+        }
+        if (_episodeDateKey(supplementalEntry.value.airDateIso) ==
+            primaryDate) {
+          return supplementalEntry.key - primaryEntry.key;
+        }
+      }
+    }
+    return 0;
+  }
+
+  String _episodeDateKey(String value) {
+    final normalized = value.trim();
+    if (normalized.length < 10) {
+      return normalized;
+    }
+    return normalized.substring(0, 10);
   }
 
   bool _isTmdbConfigured() =>
@@ -6996,16 +7981,16 @@ class _BiliBiliDashProxy {
 <?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" minBufferTime="PT1.5S" mediaPresentationDuration="PT${duration}S">
   <Period id="0" duration="PT${duration}S">
-    <AdaptationSet id="1" contentType="video" mimeType="video/mp4" segmentAlignment="true">
-      <Representation id="video" bandwidth="800000" codecs="avc1.64001F" width="640" height="360">
+    <AdaptationSet id="1" contentType="video" mimeType="video/mp4" segmentAlignment="true" subsegmentAlignment="true" startWithSAP="1">
+      <Representation id="video" bandwidth="800000" codecs="avc1.64001F" width="640" height="360" startWithSAP="1">
         <BaseURL>video.m4s</BaseURL>
         <SegmentList timescale="1" duration="$duration">
           <SegmentURL media="video.m4s" />
         </SegmentList>
       </Representation>
     </AdaptationSet>
-    <AdaptationSet id="2" contentType="audio" mimeType="audio/mp4" segmentAlignment="true">
-      <Representation id="audio" bandwidth="128000" codecs="mp4a.40.2" audioSamplingRate="48000">
+    <AdaptationSet id="2" contentType="audio" mimeType="audio/mp4" lang="und" segmentAlignment="true" subsegmentAlignment="true" startWithSAP="1">
+      <Representation id="audio" bandwidth="128000" codecs="mp4a.40.2" audioSamplingRate="48000" startWithSAP="1">
         <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2" />
         <BaseURL>audio.m4s</BaseURL>
         <SegmentList timescale="1" duration="$duration">
@@ -7026,12 +8011,17 @@ class _BiliBiliDashProxy {
 
   Future<void> _writeVlcHlsMaster(io.HttpRequest request) async {
     final baseUrl = 'http://127.0.0.1:${_server.port}';
+    final startSeconds = _hlsStartSeconds(request);
+    final startQuery = startSeconds > 0 ? '?start=$startSeconds' : '';
+    final startTag = startSeconds > 0
+        ? '#EXT-X-START:TIME-OFFSET=$startSeconds.000,PRECISE=YES\n'
+        : '';
     final playlist = '''
 #EXTM3U
 #EXT-X-VERSION:7
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="bilibili-audio",NAME="BiliBili",DEFAULT=YES,AUTOSELECT=YES,URI="$baseUrl/audio.m3u8"
+$startTag#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="bilibili-audio",NAME="BiliBili",DEFAULT=YES,AUTOSELECT=YES,URI="$baseUrl/audio.m3u8$startQuery"
 #EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=640x360,CODECS="avc1.64001f,mp4a.40.2",AUDIO="bilibili-audio"
-$baseUrl/video.m3u8
+$baseUrl/video.m3u8$startQuery
 ''';
     request.response
       ..statusCode = io.HttpStatus.ok
@@ -7047,9 +8037,14 @@ $baseUrl/video.m3u8
   }) async {
     final baseUrl = 'http://127.0.0.1:${_server.port}';
     final duration = _durationSeconds > 0 ? _durationSeconds : 24 * 60 * 60;
+    final startSeconds = _hlsStartSeconds(request);
+    final startTag = startSeconds > 0
+        ? '#EXT-X-START:TIME-OFFSET=$startSeconds.000,PRECISE=YES\n'
+        : '';
     final playlist = '''
 #EXTM3U
 #EXT-X-VERSION:7
+$startTag#EXT-X-PLAYLIST-TYPE:VOD
 #EXT-X-TARGETDURATION:$duration
 #EXT-X-MEDIA-SEQUENCE:0
 #EXTINF:$duration.000,
@@ -7062,6 +8057,16 @@ $baseUrl/$mediaPath
           io.ContentType('application', 'vnd.apple.mpegurl', charset: 'utf-8')
       ..write(playlist);
     await request.response.close();
+  }
+
+  int _hlsStartSeconds(io.HttpRequest request) {
+    final raw = request.uri.queryParameters['start']?.trim() ?? '';
+    final parsed = int.tryParse(raw);
+    if (parsed == null || parsed <= 0) {
+      return 0;
+    }
+    final duration = _durationSeconds > 0 ? _durationSeconds : 24 * 60 * 60;
+    return parsed.clamp(0, max(0, duration - 1)).toInt();
   }
 
   Future<void> _writeVlcPlaylist(io.HttpRequest request) async {
@@ -7196,6 +8201,62 @@ class _BiliBiliPlaybackOption {
   final String title;
   final String imageUrl;
   final String durationLabel;
+}
+
+class _YoutubePlaybackOption {
+  const _YoutubePlaybackOption({
+    required this.server,
+    required this.mode,
+    required this.option,
+    required this.videoId,
+    required this.url,
+    required this.title,
+    required this.imageUrl,
+    required this.durationLabel,
+  });
+
+  final String server;
+  final YoutubePlaybackMode mode;
+  final YoutubePlaybackOption option;
+  final String videoId;
+  final String url;
+  final String title;
+  final String imageUrl;
+  final String durationLabel;
+
+  _YoutubePlaybackOption copyWith({
+    String? server,
+    YoutubePlaybackMode? mode,
+    YoutubePlaybackOption? option,
+    String? videoId,
+    String? url,
+    String? title,
+    String? imageUrl,
+    String? durationLabel,
+  }) {
+    return _YoutubePlaybackOption(
+      server: server ?? this.server,
+      mode: mode ?? this.mode,
+      option: option ?? this.option,
+      videoId: videoId ?? this.videoId,
+      url: url ?? this.url,
+      title: title ?? this.title,
+      imageUrl: imageUrl ?? this.imageUrl,
+      durationLabel: durationLabel ?? this.durationLabel,
+    );
+  }
+}
+
+class _YtDlpResult {
+  const _YtDlpResult({
+    required this.exitCode,
+    required this.stdout,
+    required this.stderr,
+  });
+
+  final int exitCode;
+  final String stdout;
+  final String stderr;
 }
 
 class _BiliBiliSeriesAccumulator {

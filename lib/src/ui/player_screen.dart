@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' show FontFeature;
+import 'dart:math';
 
 import 'package:dart_vlc/dart_vlc.dart' as vlc;
 import 'package:flutter/material.dart';
@@ -10,6 +10,7 @@ import 'package:http/http.dart' as http;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:video_player/video_player.dart' as vp;
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_controller.dart';
 import '../models.dart';
@@ -30,6 +31,12 @@ const _androidHardwareDecoderCodecs = 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1';
 const _androidHardwareDecoderCodecsWithoutAv1 =
     'h264,hevc,mpeg4,mpeg2video,vp8,vp9';
 
+enum PlayerLaunchMode {
+  normal,
+  detail,
+  continueWatching,
+}
+
 enum _UpcomingCardPhase {
   none,
   next,
@@ -41,10 +48,12 @@ class PlayerScreen extends StatefulWidget {
     super.key,
     required this.controller,
     required this.episode,
+    this.launchMode = PlayerLaunchMode.normal,
   });
 
   final AppController controller;
   final EpisodeItem episode;
+  final PlayerLaunchMode launchMode;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -71,6 +80,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _handlingPlaybackError = false;
   bool _playerOverlaysVisible = true;
   bool _playerControlsFocused = false;
+  bool _playerBuffering = false;
+  bool _playerFullscreen = false;
   final FocusNode _playerControlsRootFocusNode =
       FocusNode(debugLabel: 'playerControlsRoot');
   final FocusNode _playerBackButtonFocusNode =
@@ -85,6 +96,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       FocusNode(debugLabel: 'playerFitButton');
   final FocusNode _playerSettingsButtonFocusNode =
       FocusNode(debugLabel: 'playerSettingsButton');
+  final FocusNode _playerEpisodesButtonFocusNode =
+      FocusNode(debugLabel: 'playerEpisodesButton');
+  final FocusNode _playerFullscreenButtonFocusNode =
+      FocusNode(debugLabel: 'playerFullscreenButton');
   final FocusNode _playerBottomPlayFocusNode =
       FocusNode(debugLabel: 'playerBottomPlay');
   final FocusNode _playerBottomProgressFocusNode =
@@ -114,6 +129,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Timer? _animeAv1SeekRecoveryTimer;
   Timer? _upcomingCardStartTimer;
   Timer? _upcomingCardSequenceTimer;
+  DateTime? _lastPlayerBackKeyAt;
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<Duration>? _durationSubscription;
   StreamSubscription<bool>? _completedSubscription;
@@ -122,6 +138,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   StreamSubscription<int?>? _videoHeightSubscription;
   StreamSubscription<bool>? _playingSubscription;
   StreamSubscription<bool>? _bufferingSubscription;
+  StreamSubscription<bool>? _playerBufferingSubscription;
   StreamSubscription<Duration>? _bufferSubscription;
   StreamSubscription<Track>? _trackSubscription;
   StreamSubscription<Tracks>? _tracksSubscription;
@@ -133,6 +150,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int? _remoteVideoWidth;
   int? _remoteVideoHeight;
   int _remoteOpeningRecoveryAttempts = 0;
+  int _openEpisodeTicket = 0;
+  bool _remoteReloadInProgress = false;
   String _deferredAnimeAv1PlaybackError = '';
   String _currentPlaybackPath = '';
   _UpcomingCardPhase _upcomingCardPhase = _UpcomingCardPhase.none;
@@ -143,6 +162,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    unawaited(_setPlaybackWakelock(enabled: true));
     _videoScaleMode =
         widget.controller.videoScaleModeForEpisode(widget.episode);
     if (!_usesAndroidExoPlayer &&
@@ -182,6 +202,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _playerSubtitlesButtonFocusNode.dispose();
     _playerFitButtonFocusNode.dispose();
     _playerSettingsButtonFocusNode.dispose();
+    _playerEpisodesButtonFocusNode.dispose();
+    _playerFullscreenButtonFocusNode.dispose();
     _playerBottomPlayFocusNode.dispose();
     _playerBottomProgressFocusNode.dispose();
     _cancelRemoteVideoFrameWatchdog();
@@ -222,6 +244,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (nativeLogSubscription != null) {
       unawaited(nativeLogSubscription.cancel());
     }
+    final playerBufferingSubscription = _playerBufferingSubscription;
+    if (playerBufferingSubscription != null) {
+      unawaited(playerBufferingSubscription.cancel());
+    }
+    unawaited(_setPlaybackWakelock(enabled: false));
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     _player?.dispose();
     final androidExoController = _androidExoController;
     if (androidExoController != null) {
@@ -237,6 +265,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   bool get _usesDesktopVlcPlayer =>
       (Platform.isLinux || Platform.isWindows) && widget.episode.isRemote;
+
+  Future<void> _setPlaybackWakelock({required bool enabled}) async {
+    try {
+      if (enabled) {
+        await WakelockPlus.enable();
+      } else {
+        await WakelockPlus.disable();
+      }
+    } catch (error) {
+      debugPrint('PlayerScreen: wakelock failed enabled=$enabled error=$error');
+    }
+  }
 
   void _schedulePlaybackPersistAfterDispose() {
     final position = _lastPosition;
@@ -343,6 +383,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _openEpisode() async {
+    final openTicket = ++_openEpisodeTicket;
     _debugPlayerEvent(
       'open start remote=${widget.episode.isRemote} '
       'episode="${widget.episode.displayName}"',
@@ -379,6 +420,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         excludedRemoteServers: _failedRemoteServers,
         excludedRemoteServersProvider: _serverFallbackProvider,
       );
+      if (!mounted || openTicket != _openEpisodeTicket) {
+        _debugPlayerEvent('open discarded stale remote resolve');
+        return;
+      }
       if (resolved != null && resolved.playbackUrl.isNotEmpty) {
         _currentResolvedStream = resolved;
         _reconcileRemoteSubtitleSelection(resolved);
@@ -443,6 +488,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
+    _currentPlaybackPath = path;
+    if (!mounted || openTicket != _openEpisodeTicket) {
+      _debugPlayerEvent('open discarded stale playback path');
+      return;
+    }
     if (_usesAndroidExoPlayer) {
       await _openAndroidExoPlayer(path);
       return;
@@ -615,8 +665,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _openDesktopVlcPlayer(String path) async {
     await _disposeDesktopVlcPlayer();
     _desktopVlcCompletionHandled = false;
+    _setPlayerBuffering(true);
 
-    final playbackPath = _desktopVlcPlaybackPath(path);
+    final resumePosition =
+        widget.controller.resumePositionForEpisode(widget.episode);
+    final openStart = _desktopVlcOpenStartPosition(resumePosition);
+    final urlStart =
+        _desktopVlcUrlStartPosition(resumePosition, mediaStart: openStart);
+    final playbackPath = _desktopVlcPlaybackPath(path, startPosition: urlStart);
     final headers =
         _remoteMediaHeaders(playbackPath) ?? const <String, String>{};
     final referer = headers['Referer']?.trim() ?? '';
@@ -642,6 +698,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (_lastPosition != previous) {
         _lastPositionChangeAt = DateTime.now();
         _remotePlaybackAccepted = true;
+      }
+      if (_lastDuration > Duration.zero || _lastPosition > Duration.zero) {
+        _setPlayerBuffering(false);
       }
       _maybeScheduleUpcomingCards(_lastPosition);
       _persistPlaybackThrottled();
@@ -678,6 +737,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
       _debugPlayerEvent('VLC error: $error');
+      _setPlayerBuffering(false);
       setState(() {
         _status = 'Error de reproduccion';
         _error = 'VLC no pudo reproducir el video: $error';
@@ -690,11 +750,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       _remoteVideoWidth = dimensions.width;
       _remoteVideoHeight = dimensions.height;
+      if (dimensions.width > 0 && dimensions.height > 0) {
+        _setPlayerBuffering(false);
+      }
       setState(() {});
     });
 
-    final resumePosition =
-        widget.controller.resumePositionForEpisode(widget.episode);
     _lastPosition = resumePosition ?? Duration.zero;
     _lastDuration = Duration.zero;
     _lastPositionChangeAt = DateTime.now();
@@ -707,7 +768,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
     try {
       player.open(
-        _desktopVlcMedia(playbackPath, startTime: _lastPosition),
+        _desktopVlcMedia(playbackPath, startTime: openStart),
         autoStart: true,
       );
       _startSimklScrobble();
@@ -729,27 +790,62 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
       setState(() {
+        _playerBuffering = false;
         _status = 'Error de reproduccion';
         _error = 'No se pudo abrir el video con VLC: $error';
       });
     }
   }
 
-  String _desktopVlcPlaybackPath(String fallbackPath) {
-    final stream = _currentResolvedStream;
-    if (stream?.provider != RemoteProvider.bilibili) {
-      return fallbackPath;
+  Duration _desktopVlcOpenStartPosition(Duration? resumePosition) {
+    final start = resumePosition ?? Duration.zero;
+    if (_currentResolvedStream?.provider == RemoteProvider.bilibili) {
+      return Duration.zero;
     }
-    final video = stream?.httpHeaders['X-Tanuki-Vlc-Video-Url']?.trim() ?? '';
-    return video.isNotEmpty ? video : fallbackPath;
+    return start;
+  }
+
+  Duration _desktopVlcUrlStartPosition(
+    Duration? resumePosition, {
+    required Duration mediaStart,
+  }) {
+    if (_currentResolvedStream?.provider == RemoteProvider.bilibili) {
+      return resumePosition ?? Duration.zero;
+    }
+    return mediaStart;
+  }
+
+  String _desktopVlcPlaybackPath(
+    String fallbackPath, {
+    Duration startPosition = Duration.zero,
+  }) {
+    if (_currentResolvedStream?.provider == RemoteProvider.bilibili) {
+      final hlsUrl =
+          _currentResolvedStream?.httpHeaders['X-Tanuki-Vlc-Hls-Url']?.trim();
+      if (hlsUrl != null && hlsUrl.isNotEmpty) {
+        return _desktopVlcUrlWithStart(hlsUrl, startPosition);
+      }
+    }
+    return fallbackPath;
+  }
+
+  String _desktopVlcUrlWithStart(String url, Duration startPosition) {
+    if (startPosition <= Duration.zero) {
+      return url;
+    }
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme) {
+      return url;
+    }
+    final startSeconds = max(0, startPosition.inSeconds);
+    return uri.replace(queryParameters: {
+      ...uri.queryParameters,
+      'start': '$startSeconds',
+    }).toString();
   }
 
   String _desktopVlcAudioSlave() {
-    final stream = _currentResolvedStream;
-    if (stream?.provider != RemoteProvider.bilibili) {
-      return '';
-    }
-    return stream?.httpHeaders['X-Tanuki-Vlc-Audio-Url']?.trim() ?? '';
+    return '';
   }
 
   vlc.Media _desktopVlcMedia(
@@ -780,7 +876,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     final player = _desktopVlcPlayer;
     _desktopVlcPlayer = null;
-    player?.dispose();
+    if (player != null) {
+      try {
+        player.stop();
+      } catch (_) {}
+      player.dispose();
+    }
+    _setPlayerBuffering(false);
   }
 
   Future<void> _toggleDesktopVlcPlayback() async {
@@ -801,6 +903,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _seekDesktopVlcPlayer(Duration target) async {
     final player = _desktopVlcPlayer;
     if (player == null) {
+      return;
+    }
+    if (_currentResolvedStream?.provider == RemoteProvider.bilibili) {
+      _debugPlayerEvent(
+        'VLC BiliBili seek ignored target=${_formatPlaybackTime(target)}',
+      );
+      if (mounted) {
+        setState(() {
+          _status = 'BiliBili demora en cargar y al adelantar puede demorarse.';
+        });
+      }
+      _showPlayerOverlays();
       return;
     }
     player.seek(target);
@@ -825,6 +939,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!value.isInitialized) {
       return;
     }
+    _setPlayerBuffering(value.isBuffering);
     final previous = _lastPosition;
     _lastPosition = value.position;
     _lastDuration = value.duration;
@@ -1396,8 +1511,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   bool _supportsRemoteServerFallback(RemoteProvider provider) {
     return provider == RemoteProvider.jkAnime ||
-        provider == RemoteProvider.latAnime ||
-        provider == RemoteProvider.bilibili;
+        provider == RemoteProvider.latAnime;
   }
 
   Map<String, String>? _remoteMediaHeaders(String path) {
@@ -1423,6 +1537,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         const Iterable<MapEntry<String, String>>.empty()) {
       final name = entry.key.trim();
       final value = entry.value.trim();
+      if (name.toLowerCase().startsWith('x-tanuki-')) {
+        continue;
+      }
       if (name.isNotEmpty && value.isNotEmpty) {
         headers[name] = value;
       }
@@ -1434,32 +1551,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!widget.episode.isRemote) {
       return;
     }
-    _debugPlayerEvent('manual reload remote source');
-    _failedRemoteProviders.clear();
-    _failedRemoteServers.clear();
-    _serverFallbackProvider = null;
-    _currentResolvedStream = null;
-    _cancelDeferredAnimeAv1PlaybackError();
-    _openedMedia = false;
-    _remotePlaybackAccepted = false;
-    _completionCommitted = false;
-    await _pauseSimklScrobble();
-    final androidExoController = _androidExoController;
-    if (androidExoController != null) {
-      androidExoController.removeListener(_handleAndroidExoValue);
-      await androidExoController.dispose();
-      _androidExoController = null;
-    }
-    await _disposeDesktopVlcPlayer();
-    await _player?.stop();
-    if (!mounted) {
+    if (_remoteReloadInProgress) {
+      _debugPlayerEvent(
+          'manual reload skipped because another reload is active');
       return;
     }
-    setState(() {
-      _error = '';
-      _status = 'Resolviendo fuente remota...';
-    });
-    await _openEpisode();
+    _remoteReloadInProgress = true;
+    ++_openEpisodeTicket;
+    _debugPlayerEvent('manual reload remote source');
+    try {
+      _failedRemoteProviders.clear();
+      _failedRemoteServers.clear();
+      _serverFallbackProvider = null;
+      _currentResolvedStream = null;
+      _cancelDeferredAnimeAv1PlaybackError();
+      _openedMedia = false;
+      _remotePlaybackAccepted = false;
+      _completionCommitted = false;
+      await _pauseSimklScrobble();
+      final androidExoController = _androidExoController;
+      if (androidExoController != null) {
+        androidExoController.removeListener(_handleAndroidExoValue);
+        await androidExoController.dispose();
+        _androidExoController = null;
+      }
+      await _disposeDesktopVlcPlayer();
+      await _player?.stop();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = '';
+        _status = 'Resolviendo fuente remota...';
+      });
+      await _openEpisode();
+    } finally {
+      _remoteReloadInProgress = false;
+    }
   }
 
   void _attachPlaybackTracking(Player player) {
@@ -1467,6 +1595,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final durationSubscription = _durationSubscription;
     final completedSubscription = _completedSubscription;
     final bufferSubscription = _bufferSubscription;
+    final playerBufferingSubscription = _playerBufferingSubscription;
     final trackSubscription = _trackSubscription;
     final tracksSubscription = _tracksSubscription;
     final videoParamsSubscription = _videoParamsSubscription;
@@ -1482,6 +1611,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     if (bufferSubscription != null) {
       unawaited(bufferSubscription.cancel());
+    }
+    if (playerBufferingSubscription != null) {
+      unawaited(playerBufferingSubscription.cancel());
     }
     if (trackSubscription != null) {
       unawaited(trackSubscription.cancel());
@@ -1570,6 +1702,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         'buffer=${_formatPlaybackTime(buffer)} ${_debugPlayerState(player)}',
       );
     });
+    _playerBufferingSubscription = player.stream.buffering.listen((buffering) {
+      _debugPlayerEvent('buffering=$buffering ${_debugPlayerState(player)}');
+      _setPlayerBuffering(buffering);
+    });
     _trackSubscription = player.stream.track.listen((track) {
       _debugPlayerEvent(
         'selected tracks video=[${_debugTrackLabel(track.video)}] '
@@ -1602,6 +1738,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _debugPlayerEvent(
         'native ${log.level}/${log.prefix}: ${_debugShortText(log.text)}',
       );
+    });
+  }
+
+  void _setPlayerBuffering(bool buffering) {
+    if (_playerBuffering == buffering) {
+      return;
+    }
+    if (!mounted) {
+      _playerBuffering = buffering;
+      return;
+    }
+    setState(() {
+      _playerBuffering = buffering;
     });
   }
 
@@ -1750,8 +1899,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   String _remoteSourceLabel() {
     final stream = _currentResolvedStream;
+    final preferredProvider =
+        widget.controller.playbackProviderForEpisode(widget.episode);
     final provider = stream?.provider ??
-        widget.controller.playbackProviderForEpisode(widget.episode) ??
+        preferredProvider ??
+        _currentAutomaticProviderCandidate() ??
         widget.episode.provider;
     if (provider == null || provider == RemoteProvider.catalog) {
       return 'Remoto / Automatico';
@@ -1773,9 +1925,61 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.bilibili => stream?.server.trim().isNotEmpty == true
           ? remoteServerLabel(stream!.server)
           : 'DASH',
+      RemoteProvider.youtube => stream?.server.trim().isNotEmpty == true
+          ? remoteServerLabel(stream!.server)
+          : '${youtubePlaybackModeFromId(
+              widget.controller
+                  .playbackPreferenceForEpisode(widget.episode)
+                  .youtubeMode,
+            ).buttonLabel} ${youtubePlaybackOptionFromId(
+              widget.controller
+                  .playbackPreferenceForEpisode(widget.episode)
+                  .youtubeOption,
+            ).label}',
       _ => '',
     };
-    return detail.isEmpty ? provider.label : '${provider.label} / $detail';
+    final label =
+        detail.isEmpty ? provider.label : '${provider.label} / $detail';
+    if (preferredProvider == null && stream?.provider != null) {
+      return 'Automatico: $label';
+    }
+    if (preferredProvider == null && stream == null) {
+      return 'Automatico: intentando $label';
+    }
+    return label;
+  }
+
+  RemoteProvider? _currentAutomaticProviderCandidate() {
+    final preferred =
+        widget.controller.playbackProviderForEpisode(widget.episode);
+    if (preferred != null) {
+      return preferred;
+    }
+    for (final provider in [
+      widget.episode.provider,
+      RemoteProvider.animeAv1,
+      RemoteProvider.jkAnime,
+      RemoteProvider.latAnime,
+      RemoteProvider.bilibili,
+      RemoteProvider.youtube,
+      RemoteProvider.facebook,
+    ]) {
+      if (provider == null ||
+          provider == RemoteProvider.catalog ||
+          provider == RemoteProvider.animeKai ||
+          provider == RemoteProvider.animeFlv ||
+          _failedRemoteProviders.contains(provider)) {
+        continue;
+      }
+      if (!widget.controller.canUsePlaybackProviderForEpisode(
+        widget.episode,
+        provider,
+      )) {
+        continue;
+      }
+      return provider;
+    }
+    return null;
   }
 
   void _resetUpcomingCards() {
@@ -1960,6 +2164,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 error: _error,
                               ),
               ),
+              if (_openedMedia && _playerBuffering)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: _PlayerBufferingOverlay(
+                      message: _currentResolvedStream?.provider ==
+                              RemoteProvider.bilibili
+                          ? 'BiliBili demora en cargar y al adelantar puede demorarse.'
+                          : '',
+                    ),
+                  ),
+                ),
               Positioned(
                 left: 0,
                 top: 0,
@@ -1982,6 +2197,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       onToggleSubtitles: _toggleSubtitles,
                       onToggleViewMode: _cycleVideoScaleMode,
                       onSettings: _showPlayerSettingsDialog,
+                      onEpisodes: () => unawaited(_showEpisodeListPanel()),
+                      onFullscreen: () => unawaited(_toggleFullscreenMode()),
                       onControlFocusChanged: _setPlayerControlsFocused,
                       backButtonFocusNode: _playerBackButtonFocusNode,
                       previousButtonFocusNode: _playerPreviousButtonFocusNode,
@@ -1989,6 +2206,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       subtitlesButtonFocusNode: _playerSubtitlesButtonFocusNode,
                       fitButtonFocusNode: _playerFitButtonFocusNode,
                       settingsButtonFocusNode: _playerSettingsButtonFocusNode,
+                      episodesButtonFocusNode: _playerEpisodesButtonFocusNode,
+                      fullscreenButtonFocusNode:
+                          _playerFullscreenButtonFocusNode,
                     ),
                   ),
                 ),
@@ -2117,7 +2337,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (key == LogicalKeyboardKey.goBack ||
         key == LogicalKeyboardKey.browserBack ||
         key == LogicalKeyboardKey.escape) {
-      Navigator.of(context).maybePop();
+      return _handlePlayerBackKey();
+    }
+    if (_isPlayerActivationKey(key) && _activateFocusedPlayerControl()) {
+      _showPlayerOverlays();
       return KeyEventResult.handled;
     }
     if (_playerControlsFocused && key == LogicalKeyboardKey.arrowDown) {
@@ -2172,6 +2395,85 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return KeyEventResult.ignored;
   }
 
+  KeyEventResult _handlePlayerBackKey() {
+    final now = DateTime.now();
+    final previous = _lastPlayerBackKeyAt;
+    _lastPlayerBackKeyAt = now;
+    if (previous != null &&
+        now.difference(previous) <= const Duration(milliseconds: 850)) {
+      Navigator.of(context).maybePop();
+      return KeyEventResult.handled;
+    }
+    _playerControlsRootFocusNode.requestFocus();
+    if (mounted) {
+      setState(() {
+        _playerControlsFocused = false;
+        _playerOverlaysVisible = !_playerOverlaysVisible;
+      });
+    }
+    if (_playerOverlaysVisible) {
+      _schedulePlayerOverlayHide();
+    } else {
+      _playerOverlayHideTimer?.cancel();
+    }
+    return KeyEventResult.handled;
+  }
+
+  bool _isPlayerActivationKey(LogicalKeyboardKey key) {
+    return key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.gameButtonA;
+  }
+
+  bool _activateFocusedPlayerControl() {
+    if (_playerBackButtonFocusNode.hasFocus) {
+      Navigator.of(context).maybePop();
+      return true;
+    }
+    if (_playerPreviousButtonFocusNode.hasFocus) {
+      unawaited(_playPrevious());
+      return true;
+    }
+    if (_playerNextButtonFocusNode.hasFocus) {
+      unawaited(_playNext());
+      return true;
+    }
+    if (_playerSubtitlesButtonFocusNode.hasFocus) {
+      _toggleSubtitles();
+      return true;
+    }
+    if (_playerFitButtonFocusNode.hasFocus) {
+      _cycleVideoScaleMode();
+      return true;
+    }
+    if (_playerSettingsButtonFocusNode.hasFocus) {
+      unawaited(_showPlayerSettingsDialog());
+      return true;
+    }
+    if (_playerEpisodesButtonFocusNode.hasFocus) {
+      unawaited(_showEpisodeListPanel());
+      return true;
+    }
+    if (_playerFullscreenButtonFocusNode.hasFocus) {
+      unawaited(_toggleFullscreenMode());
+      return true;
+    }
+    if (_playerBottomPlayFocusNode.hasFocus) {
+      if (_usesAndroidExoPlayer) {
+        unawaited(_toggleAndroidExoPlayback());
+      } else if (_usesDesktopVlcPlayer) {
+        unawaited(_toggleDesktopVlcPlayback());
+      } else {
+        final player = _player;
+        if (player != null) {
+          unawaited(player.playOrPause());
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
   void _requestPlayerControlFocus({bool preferBottom = false}) {
     if (!mounted) {
       return;
@@ -2190,9 +2492,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _playerBackButtonFocusNode,
       _playerPreviousButtonFocusNode,
       _playerNextButtonFocusNode,
-      _playerSubtitlesButtonFocusNode,
-      _playerFitButtonFocusNode,
+      _playerEpisodesButtonFocusNode,
       _playerSettingsButtonFocusNode,
+      _playerFullscreenButtonFocusNode,
     ];
     final currentIndex = nodes.indexWhere((node) => node.hasFocus);
     if (currentIndex < 0) {
@@ -2584,8 +2886,411 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await widget.controller.setVideoScaleModeForEpisode(widget.episode, mode);
   }
 
+  Future<void> _toggleFullscreenMode() async {
+    final next = !_playerFullscreen;
+    setState(() {
+      _playerFullscreen = next;
+      _status = next ? 'Pantalla completa' : 'Pantalla normal';
+    });
+    await SystemChrome.setEnabledSystemUIMode(
+      next ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+    _showPlayerOverlays();
+  }
+
+  Future<void> _showEpisodeListPanel() async {
+    _showPlayerOverlays();
+    final series = widget.controller.findSeriesForEpisode(widget.episode);
+    if (series == null || series.episodes.isEmpty) {
+      return;
+    }
+    final selected = await showDialog<EpisodeItem>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (context) => _PlayerEpisodeListDialog(
+        series: series,
+        current: widget.episode,
+        controller: widget.controller,
+      ),
+    );
+    if (selected == null ||
+        !mounted ||
+        _isSameEpisode(selected, widget.episode)) {
+      return;
+    }
+    await widget.controller.setCurrentEntry(selected);
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => PlayerScreen(
+          controller: widget.controller,
+          episode: selected,
+          launchMode: widget.launchMode,
+        ),
+      ),
+    );
+  }
+
   Future<void> _showPlayerSettingsDialog() async {
     _showPlayerOverlays();
+    var preference =
+        widget.controller.playbackPreferenceForEpisode(widget.episode);
+    await showDialog<void>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (dialogContext) {
+        var tab = 0;
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final selectedProvider =
+                widget.controller.playbackProviderForEpisode(widget.episode);
+            final activeProvider = selectedProvider ??
+                _currentResolvedStream?.provider ??
+                widget.episode.provider;
+            final animeAv1Mode =
+                animeAv1PlaybackModeFromId(preference.animeAv1Mode);
+            final jkAnimeServer = _currentResolvedStream?.provider ==
+                        RemoteProvider.jkAnime &&
+                    _currentResolvedStream?.server.trim().isNotEmpty == true
+                ? jkAnimeServerPreferenceFromId(_currentResolvedStream!.server)
+                : jkAnimeServerPreferenceFromId(preference.jkAnimeServer);
+            final facebookMode =
+                facebookPlaybackModeFromId(preference.facebookMode);
+            final facebookOption =
+                facebookPlaybackOptionFromId(preference.facebookOption);
+            final youtubeMode =
+                youtubePlaybackModeFromId(preference.youtubeMode);
+            final youtubeOption =
+                youtubePlaybackOptionFromId(preference.youtubeOption);
+
+            Future<void> savePreference(Future<void> Function() save) async {
+              await save();
+              if (!mounted || !dialogContext.mounted) {
+                return;
+              }
+              setDialogState(() {
+                preference = widget.controller
+                    .playbackPreferenceForEpisode(widget.episode);
+              });
+              if (widget.episode.isRemote) {
+                await _reloadRemoteSource();
+              }
+            }
+
+            Widget sourceOptions(RemoteProvider? provider) {
+              if (provider == RemoteProvider.animeAv1) {
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final mode in AnimeAv1PlaybackMode.values)
+                      _PlayerDialogButton(
+                        label: mode.dialogLabel,
+                        active: animeAv1Mode == mode,
+                        onPressed: () => unawaited(
+                          savePreference(
+                            () => widget.controller.setAnimeAv1ModeForEpisode(
+                              widget.episode,
+                              mode,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              }
+              if (provider == RemoteProvider.jkAnime) {
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final server in JkAnimeServerPreference.values)
+                      _PlayerDialogButton(
+                        label: server.label,
+                        active: jkAnimeServer == server,
+                        onPressed: () => unawaited(
+                          savePreference(
+                            () => widget.controller.setJkAnimeServerForEpisode(
+                              widget.episode,
+                              server,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              }
+              if (provider == RemoteProvider.facebook) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final mode in FacebookPlaybackMode.values)
+                          _PlayerDialogButton(
+                            label: mode.dialogLabel,
+                            active: facebookMode == mode,
+                            onPressed: () => unawaited(
+                              savePreference(
+                                () =>
+                                    widget.controller.setFacebookModeForEpisode(
+                                  widget.episode,
+                                  mode,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final option in FacebookPlaybackOption.values)
+                          _PlayerDialogButton(
+                            label: option.label,
+                            active: facebookOption == option,
+                            onPressed: () => unawaited(
+                              savePreference(
+                                () => widget.controller
+                                    .setFacebookOptionForEpisode(
+                                  widget.episode,
+                                  option,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                );
+              }
+              if (provider == RemoteProvider.bilibili) {
+                return const Text(
+                  'BiliBili usa las opciones encontradas automaticamente.',
+                  style: TextStyle(color: TanukiColors.muted),
+                );
+              }
+              if (provider == RemoteProvider.youtube) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final mode in YoutubePlaybackMode.values)
+                          _PlayerDialogButton(
+                            label: mode.buttonLabel,
+                            active: youtubeMode == mode,
+                            onPressed: () => unawaited(
+                              savePreference(
+                                () =>
+                                    widget.controller.setYoutubeModeForEpisode(
+                                  widget.episode,
+                                  mode,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final option in YoutubePlaybackOption.values)
+                          _PlayerDialogButton(
+                            label: option.label,
+                            active: youtubeOption == option,
+                            onPressed: () => unawaited(
+                              savePreference(
+                                () => widget.controller
+                                    .setYoutubeOptionForEpisode(
+                                  widget.episode,
+                                  option,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                );
+              }
+              return const Text(
+                'Esta fuente no tiene opciones adicionales.',
+                style: TextStyle(color: TanukiColors.muted),
+              );
+            }
+
+            final providers = [
+              RemoteProvider.animeAv1,
+              RemoteProvider.jkAnime,
+              RemoteProvider.latAnime,
+              RemoteProvider.bilibili,
+              RemoteProvider.youtube,
+              if (widget.controller.canUsePlaybackProviderForEpisode(
+                widget.episode,
+                RemoteProvider.facebook,
+              ))
+                RemoteProvider.facebook,
+            ];
+
+            return Dialog(
+              alignment: Alignment.centerRight,
+              insetPadding: const EdgeInsets.only(right: 28),
+              backgroundColor: const Color(0xF2131518),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+                side: const BorderSide(color: Color(0x44F28C28)),
+              ),
+              child: SizedBox(
+                width: 430,
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.tune, color: TanukiColors.orange),
+                          const SizedBox(width: 10),
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Player Settings',
+                                  style: TextStyle(
+                                    color: TanukiColors.text,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                                Text(
+                                  'Ajusta player y fuentes',
+                                  style: TextStyle(
+                                    color: TanukiColors.muted,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => Navigator.of(context).pop(),
+                            icon: const Icon(Icons.close),
+                          ),
+                        ],
+                      ),
+                      const Divider(color: Color(0x22FFFFFF)),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _PlayerSettingsTabButton(
+                              icon: Icons.aspect_ratio,
+                              label: 'Player',
+                              active: tab == 0,
+                              onPressed: () => setDialogState(() => tab = 0),
+                            ),
+                          ),
+                          Expanded(
+                            child: _PlayerSettingsTabButton(
+                              icon: Icons.cloud,
+                              label: 'Fuentes',
+                              active: tab == 1,
+                              onPressed: () => setDialogState(() => tab = 1),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 14),
+                      if (tab == 0)
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            _PlayerDialogButton(
+                              label: 'Fit',
+                              active: _videoScaleMode == VideoScaleMode.fit,
+                              onPressed: () => unawaited(
+                                _setVideoScaleMode(VideoScaleMode.fit),
+                              ),
+                            ),
+                            _PlayerDialogButton(
+                              label: 'Stretch',
+                              active: _videoScaleMode == VideoScaleMode.stretch,
+                              onPressed: () => unawaited(
+                                _setVideoScaleMode(VideoScaleMode.stretch),
+                              ),
+                            ),
+                            _PlayerDialogButton(
+                              label: 'Sub',
+                              active: false,
+                              onPressed: () {},
+                            ),
+                          ],
+                        )
+                      else
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _PlayerDialogButton(
+                              label: 'Automatico',
+                              active: selectedProvider == null,
+                              onPressed: () => unawaited(
+                                savePreference(
+                                  () => widget.controller
+                                      .setPlaybackProviderForEpisode(
+                                    widget.episode,
+                                    null,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            for (final provider in providers) ...[
+                              _PlayerDialogButton(
+                                label: provider.label,
+                                active: selectedProvider == provider,
+                                onPressed: () => unawaited(
+                                  savePreference(
+                                    () => widget.controller
+                                        .setPlaybackProviderForEpisode(
+                                      widget.episode,
+                                      provider,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              if (activeProvider == provider) ...[
+                                const SizedBox(height: 8),
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 10),
+                                  child: sourceOptions(provider),
+                                ),
+                              ],
+                              const SizedBox(height: 8),
+                            ],
+                          ],
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    return;
     await showDialog<void>(
       context: context,
       builder: (dialogContext) {
@@ -2921,6 +3626,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.jkAnime => 'JKAnime - ${jkAnimeServer.label}',
       RemoteProvider.latAnime => 'LatAnime',
       RemoteProvider.bilibili => 'BiliBili - DASH',
+      RemoteProvider.youtube => 'YouTube',
       RemoteProvider.animeFlv => 'AnimeFLV',
       RemoteProvider.facebook =>
         'Facebook - ${facebookMode.dialogLabel}, ${facebookOption.label}',
@@ -2938,6 +3644,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         builder: (_) => PlayerScreen(
           controller: widget.controller,
           episode: replacement,
+          launchMode: widget.launchMode,
         ),
       ),
     );
@@ -2946,8 +3653,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _playNext() async {
     final replacement = _adjacentEpisode(1);
     if (replacement == null) {
+      if (widget.launchMode == PlayerLaunchMode.detail) {
+        Navigator.of(context).maybePop();
+        return;
+      }
       final entries = widget.controller.buildNextEntries(limit: 1);
       if (entries.isEmpty) {
+        if (widget.launchMode == PlayerLaunchMode.continueWatching) {
+          Navigator.of(context).maybePop();
+        }
         return;
       }
       await Navigator.of(context).pushReplacement(
@@ -2955,6 +3669,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           builder: (_) => PlayerScreen(
             controller: widget.controller,
             episode: entries.first,
+            launchMode: widget.launchMode,
           ),
         ),
       );
@@ -2965,6 +3680,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         builder: (_) => PlayerScreen(
           controller: widget.controller,
           episode: replacement,
+          launchMode: widget.launchMode,
         ),
       ),
     );
@@ -3069,6 +3785,58 @@ class _AndroidExoVideoSurface extends StatelessWidget {
   }
 }
 
+class _PlayerBufferingOverlay extends StatelessWidget {
+  const _PlayerBufferingOverlay({
+    this.message = '',
+  });
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0xBB000000),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(
+                width: 42,
+                height: 42,
+                child: CircularProgressIndicator(
+                  strokeWidth: 3,
+                  color: TanukiColors.orange,
+                ),
+              ),
+              if (message.trim().isNotEmpty) ...[
+                const SizedBox(height: 12),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 280),
+                  child: Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      height: 1.25,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _AndroidExoControls extends StatefulWidget {
   const _AndroidExoControls({
     required this.controller,
@@ -3138,14 +3906,8 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
       policy: OrderedTraversalPolicy(),
       child: Focus(
         onFocusChange: widget.onFocusChanged,
-        child: Container(
-          height: 58,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: const Color(0xD9101419),
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: TanukiColors.panelStroke),
-          ),
+        child: SizedBox(
+          height: 48,
           child: Row(
             children: [
               FocusTraversalOrder(
@@ -3156,7 +3918,7 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
                   onPressed: () => unawaited(widget.onTogglePlayback()),
                   icon: Icon(
                     value.isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: TanukiColors.text,
+                    color: Colors.white,
                   ),
                 ),
               ),
@@ -3187,10 +3949,10 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
                     child: SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         activeTrackColor: TanukiColors.orange,
-                        inactiveTrackColor: const Color(0x665C6873),
-                        thumbColor: TanukiColors.orangeHot,
+                        inactiveTrackColor: const Color(0x668A939E),
+                        thumbColor: Colors.white,
                         overlayColor: const Color(0x33F0B760),
-                        trackHeight: 4,
+                        trackHeight: 2,
                       ),
                       child: Slider(
                         min: 0,
@@ -3343,14 +4105,8 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
       policy: OrderedTraversalPolicy(),
       child: Focus(
         onFocusChange: widget.onFocusChanged,
-        child: Container(
-          height: 58,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: const Color(0xD9101419),
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: TanukiColors.panelStroke),
-          ),
+        child: SizedBox(
+          height: 48,
           child: Row(
             children: [
               FocusTraversalOrder(
@@ -3361,7 +4117,7 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
                   onPressed: () => unawaited(widget.onTogglePlayback()),
                   icon: Icon(
                     isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: TanukiColors.text,
+                    color: Colors.white,
                   ),
                 ),
               ),
@@ -3392,10 +4148,10 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
                     child: SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         activeTrackColor: TanukiColors.orange,
-                        inactiveTrackColor: const Color(0x665C6873),
-                        thumbColor: TanukiColors.orangeHot,
+                        inactiveTrackColor: const Color(0x668A939E),
+                        thumbColor: Colors.white,
                         overlayColor: const Color(0x33F0B760),
-                        trackHeight: 4,
+                        trackHeight: 2,
                       ),
                       child: Slider(
                         min: 0,
@@ -3469,6 +4225,206 @@ class _TanukiVideoTheme extends StatelessWidget {
   }
 }
 
+class _PlayerSettingsTabButton extends StatelessWidget {
+  const _PlayerSettingsTabButton({
+    required this.icon,
+    required this.label,
+    required this.active,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool active;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextButton.icon(
+      onPressed: onPressed,
+      icon: Icon(icon, size: 17),
+      label: Text(label),
+      style: TextButton.styleFrom(
+        foregroundColor: active ? TanukiColors.orange : TanukiColors.muted,
+        backgroundColor: active ? const Color(0x332A170B) : Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+      ),
+    );
+  }
+}
+
+class _PlayerEpisodeListDialog extends StatelessWidget {
+  const _PlayerEpisodeListDialog({
+    required this.series,
+    required this.current,
+    required this.controller,
+  });
+
+  final SeriesItem series;
+  final EpisodeItem current;
+  final AppController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      alignment: Alignment.centerRight,
+      insetPadding: const EdgeInsets.only(right: 28),
+      backgroundColor: const Color(0xF2131518),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: const BorderSide(color: Color(0x44F28C28)),
+      ),
+      child: SizedBox(
+        width: 430,
+        height: MediaQuery.sizeOf(context).height * 0.72,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 8, 10),
+              child: Row(
+                children: [
+                  const Icon(Icons.view_list, color: TanukiColors.orange),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      series.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: TanukiColors.text,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Color(0x22FFFFFF)),
+            Expanded(
+              child: ListView.builder(
+                padding: const EdgeInsets.all(12),
+                itemCount: series.episodes.length,
+                itemBuilder: (context, index) {
+                  final episode = series.episodes[index];
+                  final active = episode.episodeIndex == current.episodeIndex;
+                  final playback = controller.playbackForEpisode(episode);
+                  final progress = playback == null || playback.durationMs <= 0
+                      ? 0.0
+                      : playback.positionMs / playback.durationMs;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 9),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: () => Navigator.of(context).pop(episode),
+                      child: Container(
+                        height: 76,
+                        decoration: BoxDecoration(
+                          color: active
+                              ? const Color(0x552A170B)
+                              : const Color(0x331C2229),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: active
+                                ? TanukiColors.orange
+                                : const Color(0x22FFFFFF),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            ClipRRect(
+                              borderRadius: const BorderRadius.horizontal(
+                                left: Radius.circular(8),
+                              ),
+                              child: SizedBox(
+                                width: 112,
+                                height: 76,
+                                child: Image.network(
+                                  episode.imageUrl,
+                                  fit: BoxFit.cover,
+                                  frameBuilder:
+                                      (context, child, frame, wasSync) {
+                                    if (wasSync || frame != null) {
+                                      return child;
+                                    }
+                                    return AnimatedOpacity(
+                                      opacity: frame == null ? 0 : 1,
+                                      duration:
+                                          const Duration(milliseconds: 220),
+                                      child: child,
+                                    );
+                                  },
+                                  errorBuilder: (_, __, ___) => Container(
+                                    color: TanukiColors.backgroundAlt,
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      '${episode.episodeNumber}',
+                                      style: const TextStyle(
+                                        color: TanukiColors.muted,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 10),
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      '${episode.episodeNumber}. ${episode.displayName}',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: TanukiColors.text,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 5),
+                                    LinearProgressIndicator(
+                                      minHeight: 3,
+                                      value: progress.clamp(0, 1),
+                                      backgroundColor: const Color(0x334A5663),
+                                      valueColor:
+                                          const AlwaysStoppedAnimation<Color>(
+                                        TanukiColors.orange,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            if (active)
+                              const Padding(
+                                padding: EdgeInsets.only(right: 10),
+                                child: Icon(
+                                  Icons.play_arrow,
+                                  color: TanukiColors.orange,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _PlayerDialogButton extends StatelessWidget {
   const _PlayerDialogButton({
     required this.label,
@@ -3521,6 +4477,8 @@ class _PlayerTopBar extends StatelessWidget {
     required this.onToggleSubtitles,
     required this.onToggleViewMode,
     required this.onSettings,
+    required this.onEpisodes,
+    required this.onFullscreen,
     required this.onControlFocusChanged,
     this.backButtonFocusNode,
     this.previousButtonFocusNode,
@@ -3528,6 +4486,8 @@ class _PlayerTopBar extends StatelessWidget {
     this.subtitlesButtonFocusNode,
     this.fitButtonFocusNode,
     this.settingsButtonFocusNode,
+    this.episodesButtonFocusNode,
+    this.fullscreenButtonFocusNode,
   });
 
   final EpisodeItem episode;
@@ -3537,6 +4497,8 @@ class _PlayerTopBar extends StatelessWidget {
   final FocusNode? subtitlesButtonFocusNode;
   final FocusNode? fitButtonFocusNode;
   final FocusNode? settingsButtonFocusNode;
+  final FocusNode? episodesButtonFocusNode;
+  final FocusNode? fullscreenButtonFocusNode;
   final String status;
   final IconData statusIcon;
   final Color statusColor;
@@ -3548,6 +4510,8 @@ class _PlayerTopBar extends StatelessWidget {
   final VoidCallback onToggleSubtitles;
   final VoidCallback onToggleViewMode;
   final VoidCallback onSettings;
+  final VoidCallback onEpisodes;
+  final VoidCallback onFullscreen;
   final ValueChanged<bool> onControlFocusChanged;
 
   @override
@@ -3628,26 +4592,22 @@ class _PlayerTopBar extends StatelessWidget {
             const SizedBox(width: 12),
             FocusTraversalOrder(
               order: const NumericFocusOrder(4),
-              child: _PlayerCaptionButton(
-                label: subtitlesEnabled ? 'SUB' : 'OFF',
-                tooltip: subtitlesEnabled
-                    ? 'Desactivar subtitulos'
-                    : 'Activar subtitulos',
-                active: subtitlesEnabled,
-                focusNode: subtitlesButtonFocusNode,
-                onPressed: onToggleSubtitles,
+              child: _PlayerIconButton(
+                icon: Icons.view_list,
+                tooltip: 'Episodios',
+                focusNode: episodesButtonFocusNode,
+                onPressed: onEpisodes,
                 onFocusChanged: onControlFocusChanged,
               ),
             ),
             const SizedBox(width: 10),
             FocusTraversalOrder(
               order: const NumericFocusOrder(5),
-              child: _PlayerCaptionButton(
-                label: videoScaleMode.buttonLabel,
-                tooltip: 'Vista del video',
-                active: true,
-                focusNode: fitButtonFocusNode,
-                onPressed: onToggleViewMode,
+              child: _PlayerIconButton(
+                icon: Icons.settings,
+                tooltip: 'Ajustes',
+                focusNode: settingsButtonFocusNode,
+                onPressed: onSettings,
                 onFocusChanged: onControlFocusChanged,
               ),
             ),
@@ -3655,10 +4615,10 @@ class _PlayerTopBar extends StatelessWidget {
             FocusTraversalOrder(
               order: const NumericFocusOrder(6),
               child: _PlayerIconButton(
-                icon: Icons.settings,
-                tooltip: 'Ajustes',
-                focusNode: settingsButtonFocusNode,
-                onPressed: onSettings,
+                icon: Icons.fullscreen,
+                tooltip: 'Pantalla completa',
+                focusNode: fullscreenButtonFocusNode,
+                onPressed: onFullscreen,
                 onFocusChanged: onControlFocusChanged,
               ),
             ),
@@ -3782,21 +4742,15 @@ class _PlayerIconButton extends StatelessWidget {
             fixedSize: MaterialStateProperty.all(const Size(44, 44)),
             backgroundColor: MaterialStateProperty.resolveWith((states) {
               if (states.contains(MaterialState.focused)) {
-                return const Color(0xAA24384C);
+                return const Color(0x3324384C);
               }
-              return const Color(0x66141D28);
+              return Colors.transparent;
             }),
             foregroundColor: MaterialStateProperty.all(Colors.white),
-            side: MaterialStateProperty.resolveWith((states) {
-              if (states.contains(MaterialState.focused)) {
-                return const BorderSide(
-                  color: TanukiColors.orangeHot,
-                  width: 3,
-                );
-              }
-              return BorderSide.none;
-            }),
-            shape: MaterialStateProperty.all(const CircleBorder()),
+            side: MaterialStateProperty.all(BorderSide.none),
+            shape: MaterialStateProperty.all(
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
           ),
         ),
       ),
@@ -4051,6 +5005,10 @@ String remoteServerLabel(String server) {
     'netu' => 'Netu',
     'bilibili-1' => 'BiliBili 1',
     'bilibili-2' => 'BiliBili 2',
+    'youtube-sub-1' => 'SUB Opcion 1',
+    'youtube-sub-2' => 'SUB Opcion 2',
+    'youtube-dub-1' => 'DUB Opcion 1',
+    'youtube-dub-2' => 'DUB Opcion 2',
     String value when value.isNotEmpty => value,
     _ => 'servidor',
   };

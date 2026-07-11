@@ -11,6 +11,7 @@ enum RemoteProvider {
   animeFlv,
   facebook,
   bilibili,
+  youtube,
   catalog,
 }
 
@@ -33,6 +34,7 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.animeFlv => 'animeflv',
       RemoteProvider.facebook => 'facebook',
       RemoteProvider.bilibili => 'bilibili',
+      RemoteProvider.youtube => 'youtube',
       RemoteProvider.catalog => 'catalog',
     };
   }
@@ -46,6 +48,7 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.animeFlv => 'AnimeFLV',
       RemoteProvider.facebook => 'Facebook',
       RemoteProvider.bilibili => 'BiliBili',
+      RemoteProvider.youtube => 'YouTube',
       RemoteProvider.catalog => 'Catalogo',
     };
   }
@@ -182,6 +185,46 @@ FacebookPlaybackOption facebookPlaybackOptionFromId(Object? value) {
     'option 2' =>
       FacebookPlaybackOption.second,
     _ => FacebookPlaybackOption.first,
+  };
+}
+
+enum YoutubePlaybackMode {
+  sub('sub', 'SUB', 'Sub esp'),
+  dub('dub', 'DUB', 'Latino');
+
+  const YoutubePlaybackMode(this.id, this.buttonLabel, this.dialogLabel);
+
+  final String id;
+  final String buttonLabel;
+  final String dialogLabel;
+}
+
+YoutubePlaybackMode youtubePlaybackModeFromId(Object? value) {
+  return switch ('$value'.trim().toLowerCase()) {
+    'dub' || 'lat' || 'latino' => YoutubePlaybackMode.dub,
+    _ => YoutubePlaybackMode.sub,
+  };
+}
+
+enum YoutubePlaybackOption {
+  first('option-1', 'Opcion 1'),
+  second('option-2', 'Opcion 2');
+
+  const YoutubePlaybackOption(this.id, this.label);
+
+  final String id;
+  final String label;
+}
+
+YoutubePlaybackOption youtubePlaybackOptionFromId(Object? value) {
+  return switch ('$value'.trim().toLowerCase()) {
+    '2' ||
+    'opcion-2' ||
+    'opcion 2' ||
+    'option-2' ||
+    'option 2' =>
+      YoutubePlaybackOption.second,
+    _ => YoutubePlaybackOption.first,
   };
 }
 
@@ -532,24 +575,41 @@ class RemoteSearchCandidate {
 
   SeriesItem toSeries({required Iterable<String> existingNames}) {
     final name = uniqueSeriesName(title, existingNames, provider.label);
-    final count = episodeCount > 0 ? episodeCount : 1;
     final stateKey = normalizeSeriesKey(name);
     final detailsByEpisode = {
       for (final detail in episodeDetails)
-        if (detail.episodeNumber > 0) detail.episodeNumber: detail,
+        if (detail.episodeNumber >= 0) detail.episodeNumber: detail,
     };
-    final episodes = List.generate(count, (index) {
-      final episodeNumber = index + 1;
+    final explicitEpisodeNumbers = detailsByEpisode.keys.toList()..sort();
+    final count = episodeCount > 0
+        ? episodeCount
+        : provider == RemoteProvider.catalog
+            ? explicitEpisodeNumbers.length
+            : 1;
+    final episodeNumbers = explicitEpisodeNumbers.isNotEmpty
+        ? [
+            ...explicitEpisodeNumbers,
+            if (explicitEpisodeNumbers.length < count)
+              for (var episodeNumber = 1;
+                  episodeNumber <= count;
+                  episodeNumber += 1)
+                if (!detailsByEpisode.containsKey(episodeNumber)) episodeNumber,
+          ]
+        : List.generate(count, (index) => index + 1);
+    final episodes = episodeNumbers.asMap().entries.map((entry) {
+      final index = entry.key;
+      final episodeNumber = entry.value;
       final detail = detailsByEpisode[episodeNumber];
+      final episodeLabel =
+          episodeNumber == 0 ? 'Episodio 0' : 'Episodio $episodeNumber';
       return EpisodeItem(
         seriesName: name,
         seriesStateKey: stateKey,
         episodeIndex: index,
         episodeNumber: episodeNumber,
-        displayName: detail?.title.isNotEmpty == true
-            ? detail!.title
-            : 'Episodio $episodeNumber',
-        relativePath: 'Episodio $episodeNumber',
+        displayName:
+            detail?.title.isNotEmpty == true ? detail!.title : episodeLabel,
+        relativePath: episodeLabel,
         filePath: watchUrl,
         sourceType: SourceType.remote,
         provider: provider,
@@ -562,7 +622,7 @@ class RemoteSearchCandidate {
         airDateIso: detail?.airDateIso ?? '',
         durationLabel: detail?.durationLabel ?? '',
       );
-    });
+    }).toList();
 
     return SeriesItem(
       name: name,
@@ -661,6 +721,8 @@ class SeriesPlaybackPreference {
     this.jkAnimeServer = '',
     this.facebookMode = '',
     this.facebookOption = '',
+    this.youtubeMode = '',
+    this.youtubeOption = '',
     this.videoScaleMode = '',
   });
 
@@ -670,6 +732,8 @@ class SeriesPlaybackPreference {
   final String jkAnimeServer;
   final String facebookMode;
   final String facebookOption;
+  final String youtubeMode;
+  final String youtubeOption;
   final String videoScaleMode;
 
   factory SeriesPlaybackPreference.fromJson(Map<String, dynamic> json) {
@@ -682,6 +746,8 @@ class SeriesPlaybackPreference {
       jkAnimeServer: _normalizeOptionalJkAnimeServer(json['jkAnimeServer']),
       facebookMode: _normalizeOptionalFacebookMode(json['facebookMode']),
       facebookOption: _normalizeOptionalFacebookOption(json['facebookOption']),
+      youtubeMode: _normalizeOptionalYoutubeMode(json['youtubeMode']),
+      youtubeOption: _normalizeOptionalYoutubeOption(json['youtubeOption']),
       videoScaleMode: rawVideoScaleMode.trim().isEmpty
           ? ''
           : videoScaleModeFromId(rawVideoScaleMode).id,
@@ -696,6 +762,8 @@ class SeriesPlaybackPreference {
     String? jkAnimeServer,
     String? facebookMode,
     String? facebookOption,
+    String? youtubeMode,
+    String? youtubeOption,
     String? videoScaleMode,
   }) {
     return SeriesPlaybackPreference(
@@ -713,6 +781,12 @@ class SeriesPlaybackPreference {
       facebookOption: facebookOption == null
           ? this.facebookOption
           : _normalizeOptionalFacebookOption(facebookOption),
+      youtubeMode: youtubeMode == null
+          ? this.youtubeMode
+          : _normalizeOptionalYoutubeMode(youtubeMode),
+      youtubeOption: youtubeOption == null
+          ? this.youtubeOption
+          : _normalizeOptionalYoutubeOption(youtubeOption),
       videoScaleMode: videoScaleMode == null
           ? this.videoScaleMode
           : videoScaleMode.trim().isEmpty
@@ -728,6 +802,8 @@ class SeriesPlaybackPreference {
         jkAnimeServer.trim().isNotEmpty ||
         facebookMode.trim().isNotEmpty ||
         facebookOption.trim().isNotEmpty ||
+        youtubeMode.trim().isNotEmpty ||
+        youtubeOption.trim().isNotEmpty ||
         videoScaleMode.trim().isNotEmpty;
   }
 
@@ -739,6 +815,8 @@ class SeriesPlaybackPreference {
       'jkAnimeServer': _normalizeOptionalJkAnimeServer(jkAnimeServer),
       'facebookMode': _normalizeOptionalFacebookMode(facebookMode),
       'facebookOption': _normalizeOptionalFacebookOption(facebookOption),
+      'youtubeMode': _normalizeOptionalYoutubeMode(youtubeMode),
+      'youtubeOption': _normalizeOptionalYoutubeOption(youtubeOption),
       'videoScaleMode': videoScaleMode.trim().isEmpty
           ? ''
           : videoScaleModeFromId(videoScaleMode).id,
@@ -1721,6 +1799,16 @@ String _normalizeOptionalFacebookMode(Object? value) {
 String _normalizeOptionalFacebookOption(Object? value) {
   final raw = _readString(value);
   return raw.isEmpty ? '' : facebookPlaybackOptionFromId(raw).id;
+}
+
+String _normalizeOptionalYoutubeMode(Object? value) {
+  final raw = _readString(value);
+  return raw.isEmpty ? '' : youtubePlaybackModeFromId(raw).id;
+}
+
+String _normalizeOptionalYoutubeOption(Object? value) {
+  final raw = _readString(value);
+  return raw.isEmpty ? '' : youtubePlaybackOptionFromId(raw).id;
 }
 
 int _readInt(Object? value, {int fallback = 0}) {

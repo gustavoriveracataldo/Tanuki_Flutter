@@ -9,6 +9,35 @@ import 'package:toonami_viernes_noche_flutter/src/services/remote_catalog_servic
 import 'package:toonami_viernes_noche_flutter/src/services/remote_web_resolver.dart';
 
 void main() {
+  test('keeps explicit episode zero when converting catalog candidates',
+      () async {
+    final series = const RemoteSearchCandidate(
+      provider: RemoteProvider.catalog,
+      slug: 'gundam-demo',
+      title: 'Gundam Demo',
+      episodeCount: 3,
+      imageUrl: 'https://cdn.example.test/poster.jpg',
+      episodeDetails: [
+        SeriesEpisodeMetadata(
+          episodeNumber: 0,
+          title: 'Prologo',
+          imageUrl: 'https://cdn.example.test/prologue.jpg',
+        ),
+        SeriesEpisodeMetadata(
+          episodeNumber: 1,
+          title: 'Capitulo 1',
+          imageUrl: 'https://cdn.example.test/episode-1.jpg',
+        ),
+        SeriesEpisodeMetadata(episodeNumber: 2),
+      ],
+    ).toSeries(existingNames: const []);
+
+    expect(series.episodes.map((episode) => episode.episodeNumber), [0, 1, 2]);
+    expect(series.episodes.first.relativePath, 'Episodio 0');
+    expect(series.episodes.first.imageUrl,
+        'https://cdn.example.test/prologue.jpg');
+  });
+
   test('fetches a supported random Jikan anime candidate', () async {
     var calls = 0;
     final service = RemoteCatalogService(
@@ -464,6 +493,159 @@ void main() {
     expect(series.episodes.single.airDateIso, '2024-04-05');
   });
 
+  test('aligns split-cour catalog episodes to TMDB season episodes by air date',
+      () async {
+    final service = RemoteCatalogService(
+      tmdbApiKey: 'tmdb-key',
+      client: MockClient((request) async {
+        if (request.url.host == 'api.jikan.moe') {
+          return switch (request.url.path) {
+            '/v4/anime/59229/full' => http.Response(
+                jsonEncode({
+                  'data': {
+                    'mal_id': 59229,
+                    'title': 'Enen no Shouboutai: San no Shou Part 2',
+                    'url': 'https://myanimelist.net/anime/59229',
+                    'type': 'TV',
+                    'episodes': 13,
+                    'year': 2026,
+                    'images': {
+                      'jpg': {
+                        'large_image_url': 'https://jikan.test/enen.jpg',
+                      }
+                    },
+                  },
+                }),
+                200,
+                request: request,
+              ),
+            '/v4/anime/59229/episodes' => http.Response(
+                jsonEncode({
+                  'data': [
+                    {
+                      'mal_id': 1,
+                      'number': 1,
+                      'title': 'Unaware',
+                      'synopsis': 'Jikan ep 1',
+                      'duration': '24 min',
+                      'aired': '2026-01-10T00:00:00+00:00',
+                    },
+                    {
+                      'mal_id': 2,
+                      'number': 2,
+                      'title': 'With the Sun at His Back',
+                      'duration': '24 min',
+                      'aired': '2026-01-17T00:00:00+00:00',
+                    },
+                  ],
+                  'pagination': {
+                    'last_visible_page': 1,
+                    'has_next_page': false,
+                  },
+                }),
+                200,
+                request: request,
+              ),
+            _ => http.Response('', 404, request: request),
+          };
+        }
+        if (request.url.host == 'api.themoviedb.org') {
+          expect(request.url.queryParameters['api_key'], 'tmdb-key');
+          return switch (request.url.path) {
+            '/3/tv/88046' => http.Response(
+                jsonEncode({
+                  'id': 88046,
+                  'name': 'Fire Force',
+                  'original_name': 'Enen no Shouboutai',
+                  'overview': 'Fire Force',
+                  'poster_path': '/poster.jpg',
+                  'backdrop_path': '/backdrop.jpg',
+                  'external_ids': {'tvdb_id': 0},
+                  'seasons': [
+                    {
+                      'season_number': 1,
+                      'episode_count': 24,
+                      'air_date': '2019-07-06',
+                    },
+                    {
+                      'season_number': 2,
+                      'episode_count': 24,
+                      'air_date': '2020-07-04',
+                    },
+                    {
+                      'season_number': 3,
+                      'episode_count': 25,
+                      'air_date': '2025-04-05',
+                    },
+                  ],
+                }),
+                200,
+                request: request,
+              ),
+            '/3/tv/88046/images' ||
+            '/3/tv/88046/season/3/images' =>
+              http.Response('{"logos":[],"posters":[]}', 200, request: request),
+            '/3/tv/88046/season/3' => http.Response(
+                jsonEncode({
+                  'episodes': [
+                    {
+                      'episode_number': 12,
+                      'name': 'The Madness of the Distant Past',
+                      'still_path': '/season3-12.jpg',
+                      'runtime': 23,
+                      'air_date': '2025-06-21',
+                    },
+                    {
+                      'episode_number': 13,
+                      'name': 'Unaware',
+                      'overview': 'TMDB season 3 episode 13',
+                      'still_path': '/season3-13.jpg',
+                      'runtime': 24,
+                      'air_date': '2026-01-10',
+                    },
+                    {
+                      'episode_number': 14,
+                      'name': 'With the Sun at His Back',
+                      'still_path': '/season3-14.jpg',
+                      'runtime': 24,
+                      'air_date': '2026-01-17',
+                    },
+                  ],
+                }),
+                200,
+                request: request,
+              ),
+            _ => http.Response('{"results":[]}', 200, request: request),
+          };
+        }
+        return http.Response('', 404, request: request);
+      }),
+    );
+
+    final series = await service.buildImportSeries(
+      const RemoteSearchCandidate(
+        provider: RemoteProvider.catalog,
+        slug: '59229',
+        title: 'Enen no Shouboutai: San no Shou Part 2',
+        watchUrl: 'https://myanimelist.net/anime/59229',
+        imageUrl: 'https://jikan.test/enen.jpg',
+        episodeCount: 13,
+        format: 'TV',
+        releaseYear: 2026,
+        catalogId: 59229,
+      ),
+      existingNames: const [],
+    );
+
+    expect(series.episodes.first.episodeNumber, 1);
+    expect(series.episodes.first.displayName, 'Unaware');
+    expect(series.episodes.first.description, 'Jikan ep 1');
+    expect(series.episodes.first.imageUrl,
+        'https://image.tmdb.org/t/p/w780/season3-13.jpg');
+    expect(series.episodes[1].imageUrl,
+        'https://image.tmdb.org/t/p/w780/season3-14.jpg');
+  });
+
   test('enriches imported catalog series with Jikan episodes and cast',
       () async {
     final service = RemoteCatalogService(
@@ -720,6 +902,9 @@ void main() {
     expect(stream?.playbackKind, 'mp4');
     expect(stream?.playbackUrl, 'https://cdn.example.test/demo/window.mp4');
     expect(stream?.server, 'mp4upload');
+    expect(stream?.httpHeaders['Referer'],
+        'https://www.mp4upload.com/embed-window.html');
+    expect(stream?.httpHeaders['Origin'], 'https://www.mp4upload.com');
   });
 
   test('prioritizes preferred JKAnime server host', () async {
@@ -929,12 +1114,32 @@ void main() {
     expect(vlcHls.body, contains('#EXT-X-MEDIA:TYPE=AUDIO'));
     expect(vlcHls.body, contains('/audio.m3u8'));
     expect(vlcHls.body, contains('/video.m3u8'));
+    final vlcHlsWithStart = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!)
+          .replace(queryParameters: const {'start': '296'}),
+    );
+    expect(vlcHlsWithStart.statusCode, 200);
+    expect(
+      vlcHlsWithStart.body,
+      contains('#EXT-X-START:TIME-OFFSET=296.000,PRECISE=YES'),
+    );
+    expect(vlcHlsWithStart.body, contains('/audio.m3u8?start=296'));
+    expect(vlcHlsWithStart.body, contains('/video.m3u8?start=296'));
     final audioPlaylist = await http.get(
       Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!)
           .replace(path: '/audio.m3u8'),
     );
     expect(audioPlaylist.statusCode, 200);
     expect(audioPlaylist.body, contains('/audio.m4s'));
+    final audioPlaylistWithStart = await http.get(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!).replace(
+          path: '/audio.m3u8', queryParameters: const {'start': '296'}),
+    );
+    expect(audioPlaylistWithStart.statusCode, 200);
+    expect(
+      audioPlaylistWithStart.body,
+      contains('#EXT-X-START:TIME-OFFSET=296.000,PRECISE=YES'),
+    );
 
     final videoResponse = await http.get(
       Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Video-Url']!),
@@ -951,6 +1156,199 @@ void main() {
     expect(audioResponse.bodyBytes, const [4, 5, 6, 7]);
     expect(requestedUrls, contains(audioUrl));
   });
+
+  test('probes real BiliBili dash media with ffprobe', () async {
+    const pageUrl = 'https://www.bilibili.tv/en/video/2044128968';
+    final service = RemoteCatalogService();
+    addTearDown(service.close);
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.bilibili,
+        filePath: pageUrl,
+        watchUrl: pageUrl,
+        slug: '2044128968',
+      ),
+    );
+
+    expect(stream, isNotNull);
+    expect(stream?.playbackKind, 'dash');
+    expect(stream?.httpHeaders['X-Tanuki-Duration-Seconds'], '1376');
+
+    final manifestResponse = await http.get(Uri.parse(stream!.playbackUrl));
+    expect(manifestResponse.statusCode, 200);
+    expect(
+      manifestResponse.body,
+      contains('mediaPresentationDuration="PT1376S"'),
+    );
+
+    Future<
+        ({
+          int exitCode,
+          Set<String> streamTypes,
+          double duration,
+          String stderr
+        })> probeUrl(String url) async {
+      final probe = await io.Process.run(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-print_format',
+          'json',
+          '-show_streams',
+          '-show_format',
+          url,
+        ],
+      ).timeout(const Duration(seconds: 45));
+      if (probe.exitCode != 0) {
+        return (
+          exitCode: probe.exitCode,
+          streamTypes: <String>{},
+          duration: 0.0,
+          stderr: '${probe.stderr}\n${probe.stdout}',
+        );
+      }
+      final decoded = jsonDecode('${probe.stdout}') as Map<String, dynamic>;
+      final streams = (decoded['streams'] as List? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList();
+      final streamTypes = streams
+          .map((entry) => '${entry['codec_type']}'.trim())
+          .where((entry) => entry.isNotEmpty)
+          .toSet();
+      final duration = double.tryParse(
+            '${(decoded['format'] as Map<String, dynamic>?)?['duration']}',
+          ) ??
+          0;
+      return (
+        exitCode: probe.exitCode,
+        streamTypes: streamTypes,
+        duration: duration,
+        stderr: '${probe.stderr}',
+      );
+    }
+
+    final dashProbe = await probeUrl(stream.playbackUrl);
+    final hlsProbe =
+        await probeUrl(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!);
+    final hlsStartProbe = await probeUrl(
+      Uri.parse(stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']!)
+          .replace(queryParameters: const {'start': '296'}).toString(),
+    );
+    final playlistProbe =
+        await probeUrl(stream.httpHeaders['X-Tanuki-Vlc-Playlist-Url']!);
+    // Keep these prints in the opt-in probe; they are the diagnostic output.
+    // ignore: avoid_print
+    print('BiliBili DASH ${stream.playbackUrl}: $dashProbe');
+    // ignore: avoid_print
+    print(
+      'BiliBili HLS ${stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']}: $hlsProbe',
+    );
+    // ignore: avoid_print
+    print(
+      'BiliBili HLS start '
+      '${stream.httpHeaders['X-Tanuki-Vlc-Hls-Url']}?start=296: '
+      '$hlsStartProbe',
+    );
+    // ignore: avoid_print
+    print(
+      'BiliBili VLC playlist '
+      '${stream.httpHeaders['X-Tanuki-Vlc-Playlist-Url']}: $playlistProbe',
+    );
+
+    final probe = dashProbe;
+    expect(probe.exitCode, 0, reason: probe.stderr);
+    expect(probe.streamTypes, contains('video'));
+    expect(probe.streamTypes, contains('audio'));
+    expect(probe.duration, greaterThan(1300));
+
+    expect(hlsProbe.exitCode, 0, reason: hlsProbe.stderr);
+    expect(hlsProbe.streamTypes, contains('video'));
+    expect(hlsProbe.streamTypes, contains('audio'));
+    expect(hlsProbe.duration, greaterThan(1300));
+    expect(hlsStartProbe.exitCode, 0, reason: hlsStartProbe.stderr);
+    expect(hlsStartProbe.streamTypes, contains('video'));
+    expect(hlsStartProbe.streamTypes, contains('audio'));
+  }, skip: io.Platform.environment['RUN_BILIBILI_PROBE'] != '1');
+
+  test('probes real YouTube search returns expected dub option', () async {
+    final service = RemoteCatalogService();
+    addTearDown(service.close);
+
+    final youtubeEpisode = await service.resolveProviderEpisode(
+      series: _kaitouSaintTailSeries(),
+      episode: _kaitouSaintTailEpisode(),
+      provider: RemoteProvider.youtube,
+    );
+
+    expect(youtubeEpisode, isNotNull);
+    expect(youtubeEpisode?.provider, RemoteProvider.youtube);
+    expect(youtubeEpisode?.description, contains('youtube-dub-1'));
+    expect(youtubeEpisode?.description, contains('1nePXee26HA'));
+  }, skip: io.Platform.environment['RUN_YOUTUBE_PROBE'] != '1');
+
+  test('probes real YouTube direct muxed stream', () async {
+    final service = RemoteCatalogService();
+    addTearDown(service.close);
+    const targetUrl = 'https://www.youtube.com/watch?v=1nePXee26HA';
+    final youtubeEpisode = await service.resolveProviderEpisode(
+      series: _kaitouSaintTailSeries(),
+      episode: _kaitouSaintTailEpisode(),
+      provider: RemoteProvider.youtube,
+    );
+    expect(youtubeEpisode, isNotNull);
+
+    final stream = await service.resolveDirectStream(
+      youtubeEpisode!,
+      preferredMode: YoutubePlaybackMode.dub.id,
+      preferredServer: 'youtube-dub-1',
+    );
+
+    expect(stream, isNotNull);
+    expect(stream?.provider, RemoteProvider.youtube);
+    expect(stream?.server, 'youtube-dub-1');
+    expect(stream?.pageUrl, targetUrl);
+    expect(stream?.playbackUrl, startsWith('http'));
+    expect(stream?.playbackKind, anyOf('mp4', 'direct'));
+  }, skip: io.Platform.environment['RUN_YOUTUBE_STREAM_PROBE'] != '1');
+
+  test('probes real YouTube with yt-dlp direct stream', () async {
+    final ytDlpVersion = await io.Process.run('yt-dlp', ['--version']);
+    expect(ytDlpVersion.exitCode, 0, reason: 'yt-dlp no esta instalado');
+
+    final service = RemoteCatalogService();
+    addTearDown(service.close);
+    const targetUrl = 'https://www.youtube.com/watch?v=1nePXee26HA';
+    final youtubeEpisode = await service.resolveProviderEpisode(
+      series: _kaitouSaintTailSeries(),
+      episode: _kaitouSaintTailEpisode(),
+      provider: RemoteProvider.youtube,
+    );
+
+    expect(youtubeEpisode, isNotNull);
+    expect(youtubeEpisode?.description, contains('youtube-dub-1'));
+    expect(youtubeEpisode?.description, contains('1nePXee26HA'));
+
+    final directEntry = youtubeEpisode!.copyWith(
+      filePath: '$targetUrl&t=746s',
+      watchUrl: '$targetUrl&t=746s',
+      description: '',
+      slug: '1nePXee26HA',
+    );
+    final stream = await service.resolveDirectStream(
+      directEntry,
+      preferredMode: YoutubePlaybackMode.dub.id,
+      preferredServer: 'youtube-dub-1',
+    );
+
+    expect(stream, isNotNull);
+    expect(stream?.provider, RemoteProvider.youtube);
+    expect(stream?.server, 'youtube-sub-1');
+    expect(stream?.pageUrl, targetUrl);
+    expect(stream?.playbackUrl, startsWith('http'));
+    expect(stream?.playbackKind, anyOf('mp4', 'hls', 'direct'));
+  }, skip: io.Platform.environment['RUN_YTDLP_PROBE'] != '1');
 
   test(
       'resolves BiliBili provider episode from first two episode search videos',
@@ -2268,6 +2666,52 @@ void main() {
     );
   });
 
+  test('resolves LatAnime MP4Upload host with embed headers', () async {
+    final encodedMp4Upload = base64Encode(
+      utf8.encode('https://www.mp4upload.com/embed-latanime.html'),
+    );
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://latanime.org/ver/demo-episodio-1' => http.Response(
+              '''
+              <a class="play-video" data-player="$encodedMp4Upload">MP4Upload</a>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://www.mp4upload.com/embed-latanime.html' => http.Response(
+              '''
+              <script>
+                player.src({ src: "https://cdn.example.test/latanime/video.mp4" });
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(_episode(
+      provider: RemoteProvider.latAnime,
+      filePath: 'https://latanime.org/ver/demo-episodio-1',
+      watchUrl: 'https://latanime.org/anime/demo',
+      slug: 'demo',
+    ));
+
+    expect(stream?.playbackKind, 'mp4');
+    expect(
+      stream?.playbackUrl,
+      'https://cdn.example.test/latanime/video.mp4',
+    );
+    expect(stream?.server, 'mp4upload');
+    expect(stream?.httpHeaders['Referer'],
+        'https://www.mp4upload.com/embed-latanime.html');
+    expect(stream?.httpHeaders['Origin'], 'https://www.mp4upload.com');
+  });
+
   test('resolves LatAnime wrapper query url payload through host page',
       () async {
     final encodedHost = Uri.encodeComponent(
@@ -2725,6 +3169,32 @@ void main() {
     );
     expect(stream?.httpHeaders['Cookie'], 'zilla=session');
   });
+}
+
+EpisodeItem _kaitouSaintTailEpisode() {
+  return const EpisodeItem(
+    seriesName: 'Kaitou Saint Tail',
+    seriesStateKey: 'kaitou-saint-tail',
+    episodeIndex: 0,
+    episodeNumber: 1,
+    displayName: 'Kaitou Saint Tail - Episodio 1',
+    relativePath: 'Catalogo / Episodio 1',
+    filePath: '',
+    sourceType: SourceType.remote,
+    provider: RemoteProvider.catalog,
+    watchUrl: '',
+  );
+}
+
+SeriesItem _kaitouSaintTailSeries() {
+  return SeriesItem(
+    name: 'Kaitou Saint Tail',
+    seriesStateKey: 'kaitou-saint-tail',
+    sourceType: SourceType.remote,
+    provider: RemoteProvider.catalog,
+    episodeCount: 1,
+    episodes: [_kaitouSaintTailEpisode()],
+  );
 }
 
 EpisodeItem _episode({

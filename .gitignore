@@ -37,6 +37,7 @@ migrate_working_dir/
 lib/src/local_secrets.dart
 android/local.properties
 android/.gradle/
+android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
 linux/flutter/ephemeral/
 
 # Symbolication related

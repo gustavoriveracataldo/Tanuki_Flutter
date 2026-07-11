@@ -1596,7 +1596,12 @@ class AppController extends ChangeNotifier {
       candidate.episodeCount,
       candidate.episodeDetails.length,
     );
-    if (knownCandidateEpisodes <= existing.episodeCount) {
+    final shouldRefreshCatalogMetadata =
+        existing.provider == RemoteProvider.catalog &&
+            existing.catalogId > 0 &&
+            candidate.catalogId == existing.catalogId;
+    if (knownCandidateEpisodes <= existing.episodeCount &&
+        !shouldRefreshCatalogMetadata) {
       return existing;
     }
     try {
@@ -1748,14 +1753,16 @@ class AppController extends ChangeNotifier {
       );
       final stream = await _remoteCatalog.resolveDirectStream(
         playbackTarget,
-        preferredMode: animeAv1PlaybackModeFromId(preference.animeAv1Mode).id,
+        preferredMode: playbackTarget.provider == RemoteProvider.youtube
+            ? youtubePlaybackModeFromId(preference.youtubeMode).id
+            : animeAv1PlaybackModeFromId(preference.animeAv1Mode).id,
         preferredFacebookMode: facebookPlaybackModeFromId(
           preference.facebookMode,
         ).id,
-        preferredServer: playbackTarget.provider == RemoteProvider.jkAnime &&
-                preference.jkAnimeServer.trim().isNotEmpty
-            ? jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id
-            : '',
+        preferredServer: _preferredServerForPlayback(
+          playbackTarget.provider,
+          preference,
+        ),
         excludedServers:
             playbackTarget.provider == excludedRemoteServersProvider
                 ? excludedRemoteServers
@@ -1777,7 +1784,16 @@ class AppController extends ChangeNotifier {
                 preferredProvider != episode.provider) ||
             (episode.provider != null && excluded.contains(episode.provider)));
     if (shouldLookupProvider) {
-      final series = findSeriesForEpisode(episode);
+      final series = findSeriesForEpisode(episode) ??
+          SeriesItem(
+            name: episode.seriesName,
+            seriesStateKey: episode.seriesStateKey,
+            sourceType: SourceType.remote,
+            provider: RemoteProvider.catalog,
+            episodeCount: episode.episodeNumber > 0 ? episode.episodeNumber : 1,
+            episodes: [episode],
+            releaseYear: episode.releaseYear,
+          );
       if (series != null) {
         for (final provider in _dynamicRemoteProviderOrder(preferredProvider)
             .where((provider) => !excluded.contains(provider))) {
@@ -1809,6 +1825,10 @@ class AppController extends ChangeNotifier {
           }
           _debugRemotePlayback('provider ${provider.id} returned null stream');
         }
+      }
+      if (episode.provider == RemoteProvider.catalog) {
+        _debugRemotePlayback('resolve finished null after catalog lookup');
+        return null;
       }
     }
     final resolved = await resolve(effectiveEpisode);
@@ -1857,6 +1877,23 @@ class AppController extends ChangeNotifier {
     return stream.copyWith(provider: provider);
   }
 
+  String _preferredServerForPlayback(
+    RemoteProvider? provider,
+    SeriesPlaybackPreference preference,
+  ) {
+    if (provider == RemoteProvider.jkAnime &&
+        preference.jkAnimeServer.trim().isNotEmpty) {
+      return jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id;
+    }
+    if (provider == RemoteProvider.youtube) {
+      final mode = youtubePlaybackModeFromId(preference.youtubeMode);
+      final option = youtubePlaybackOptionFromId(preference.youtubeOption);
+      final optionNumber = option == YoutubePlaybackOption.second ? 2 : 1;
+      return 'youtube-${mode.id}-$optionNumber';
+    }
+    return '';
+  }
+
   List<RemoteProvider> _dynamicRemoteProviderOrder(
     RemoteProvider? preferredProvider,
   ) {
@@ -1865,6 +1902,7 @@ class AppController extends ChangeNotifier {
       RemoteProvider.jkAnime,
       RemoteProvider.latAnime,
       RemoteProvider.bilibili,
+      RemoteProvider.youtube,
     ];
     if (preferredProvider == null ||
         _isDisabledRemoteProvider(preferredProvider) ||
@@ -2530,7 +2568,8 @@ class AppController extends ChangeNotifier {
     return provider == RemoteProvider.animeAv1 ||
         provider == RemoteProvider.jkAnime ||
         provider == RemoteProvider.latAnime ||
-        provider == RemoteProvider.bilibili;
+        provider == RemoteProvider.bilibili ||
+        provider == RemoteProvider.youtube;
   }
 
   Future<void> setAnimeAv1ModeForEpisode(
@@ -2574,6 +2613,28 @@ class AppController extends ChangeNotifier {
       episode,
       (current) => current.copyWith(facebookOption: option.id),
       'Facebook: ${option.label}.',
+    );
+  }
+
+  Future<void> setYoutubeModeForEpisode(
+    EpisodeItem episode,
+    YoutubePlaybackMode mode,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(youtubeMode: mode.id),
+      'YouTube: ${mode.dialogLabel}.',
+    );
+  }
+
+  Future<void> setYoutubeOptionForEpisode(
+    EpisodeItem episode,
+    YoutubePlaybackOption option,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(youtubeOption: option.id),
+      'YouTube: ${option.label}.',
     );
   }
 
@@ -3817,27 +3878,31 @@ class AppController extends ChangeNotifier {
       for (final episode in refreshed.episodes)
         if (episode.episodeNumber > 0) episode.episodeNumber: episode,
     };
-    final episodes = current.episodes.map((episode) {
-      final visual = refreshedByNumber[episode.episodeNumber];
-      if (visual == null) {
-        return episode;
+    String mergedText(String currentValue, String refreshedValue) {
+      if (replaceExistingVisuals && refreshedValue.isNotEmpty) {
+        return refreshedValue;
       }
-      return episode.copyWith(
-        displayName: episode.displayName.isNotEmpty
-            ? episode.displayName
-            : visual.displayName,
-        imageUrl: mergedVisual(episode.imageUrl, visual.imageUrl),
-        description: episode.description.isNotEmpty
-            ? episode.description
-            : visual.description,
-        airDateIso: episode.airDateIso.isNotEmpty
-            ? episode.airDateIso
-            : visual.airDateIso,
-        durationLabel: episode.durationLabel.isNotEmpty
-            ? episode.durationLabel
-            : visual.durationLabel,
-      );
-    }).toList(growable: false);
+      return currentValue.isNotEmpty ? currentValue : refreshedValue;
+    }
+
+    final episodes = replaceExistingVisuals &&
+            refreshed.episodes.isEmpty &&
+            refreshed.episodeCount == 0
+        ? <EpisodeItem>[]
+        : current.episodes.map((episode) {
+            final visual = refreshedByNumber[episode.episodeNumber];
+            if (visual == null) {
+              return episode;
+            }
+            return episode.copyWith(
+              displayName: mergedText(episode.displayName, visual.displayName),
+              imageUrl: mergedVisual(episode.imageUrl, visual.imageUrl),
+              description: mergedText(episode.description, visual.description),
+              airDateIso: mergedText(episode.airDateIso, visual.airDateIso),
+              durationLabel:
+                  mergedText(episode.durationLabel, visual.durationLabel),
+            );
+          }).toList(growable: false);
     final existingEpisodeNumbers = {
       for (final episode in episodes)
         if (episode.episodeNumber > 0) episode.episodeNumber,
@@ -3861,10 +3926,12 @@ class AppController extends ChangeNotifier {
       expandedEpisodes[index] =
           expandedEpisodes[index].copyWith(episodeIndex: index);
     }
-    final episodeCount = max(
-      max(current.episodeCount, refreshed.episodeCount),
-      expandedEpisodes.length,
-    );
+    final episodeCount = replaceExistingVisuals
+        ? max(refreshed.episodeCount, expandedEpisodes.length)
+        : max(
+            max(current.episodeCount, refreshed.episodeCount),
+            expandedEpisodes.length,
+          );
     return current.copyWith(
       episodeCount: episodeCount,
       imageUrl: mergedVisual(current.imageUrl, refreshed.imageUrl),
@@ -4008,15 +4075,19 @@ class AppController extends ChangeNotifier {
       return null;
     }
     if (progress >= series.episodes.length) {
-      return series.episodes.reversed.firstWhere(
-        _shouldIncludeEpisode,
-        orElse: () => series.episodes.last,
-      );
+      for (final episode in series.episodes.reversed) {
+        if (_shouldIncludeEpisode(episode)) {
+          return episode;
+        }
+      }
+      return null;
     }
-    return series.episodes.skip(progress).firstWhere(
-          _shouldIncludeEpisode,
-          orElse: () => series.episodes[progress],
-        );
+    for (final episode in series.episodes.skip(progress)) {
+      if (_shouldIncludeEpisode(episode)) {
+        return episode;
+      }
+    }
+    return null;
   }
 
   int watchedCountFor(SeriesItem series) {
@@ -4063,6 +4134,9 @@ class AppController extends ChangeNotifier {
   }
 
   bool _shouldIncludeEpisode(EpisodeItem episode) {
+    if (_episodeAirsInFuture(episode.airDateIso)) {
+      return false;
+    }
     final tag = _normalizeEpisodeTag(episode.episodeTag);
     if (_state.skipFillerEpisodes && tag == 'filler') {
       return false;
@@ -4071,6 +4145,23 @@ class AppController extends ChangeNotifier {
       return false;
     }
     return true;
+  }
+
+  bool _episodeAirsInFuture(String airDateIso) {
+    final normalized = airDateIso.trim();
+    if (normalized.isEmpty) {
+      return false;
+    }
+    final source =
+        normalized.length >= 10 ? normalized.substring(0, 10) : normalized;
+    final parsed = DateTime.tryParse(source);
+    if (parsed == null) {
+      return false;
+    }
+    final airDate = DateTime(parsed.year, parsed.month, parsed.day);
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    return airDate.isAfter(today);
   }
 
   String _normalizeEpisodeTag(String tag) {
@@ -4218,11 +4309,11 @@ class AppController extends ChangeNotifier {
     if (completedSeries) {
       playlist = playlist.copyWith(
         selectedSeries: {...playlist.selectedSeries}
-          ..removeAll(_matchingSeriesKeysForState(series!)),
+          ..removeAll(_matchingSeriesKeysForState(series)),
       );
     }
     final matchingKeys =
-        completedSeries ? _matchingSeriesKeysForState(series!) : <String>{key};
+        completedSeries ? _matchingSeriesKeysForState(series) : <String>{key};
     final nextWatchlist = {...profile.watchlistSeries}..removeAll(matchingKeys);
     final nextWatching = {...profile.watchingSeries};
     final nextCompleted = {...profile.completedSeries};
