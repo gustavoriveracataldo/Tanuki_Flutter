@@ -34,7 +34,10 @@ add_definitions(-DUNICODE -D_UNICODE)
 
 # Newer MSVC toolchains turn the deprecated <experimental/coroutine> warning
 # into a hard error. Some third-party Windows plugins still include it.
-add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+if(MSVC)
+  add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")
+endif()
 
 # Compilation settings that should be applied to most targets.
 #
@@ -60,6 +63,11 @@ add_subdirectory("runner")
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
+
+if(TARGET webview_all_windows_plugin)
+  target_compile_definitions(webview_all_windows_plugin PRIVATE
+    _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+endif()
 
 
 # === Installation ===
