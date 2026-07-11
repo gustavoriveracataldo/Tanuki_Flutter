@@ -148,15 +148,7 @@ jobs:
       - name: Build Windows
         shell: pwsh
         run: |
-          powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
-
-      - name: Package Windows bundle
-        shell: pwsh
-        run: |
-          $Version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$').Matches[0].Groups[1].Value
-          $VersionName = $Version.Split('+')[0]
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath "dist\tanuki-windows-x64-v$VersionName.zip" -Force
+          powershell -ExecutionPolicy Bypass -File scripts\build_release_windows.ps1
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4

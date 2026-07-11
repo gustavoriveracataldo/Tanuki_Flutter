@@ -5,8 +5,21 @@ Set-Location $ProjectRoot
 
 $FlutterBin = if ($env:FLUTTER_BIN) { $env:FLUTTER_BIN } else { "flutter" }
 
+function Invoke-Checked {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+  )
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+  }
+}
+
 if (-not (Test-Path "windows")) {
-  & $FlutterBin create --platforms=windows .
+  Invoke-Checked $FlutterBin create --platforms=windows .
 }
 
 function Get-LocalSecretName {
@@ -52,5 +65,5 @@ foreach ($Key in @("TMDB_BEARER_TOKEN", "TMDB_API_KEY", "FANART_API_KEY", "SIMKL
   }
 }
 
-& $FlutterBin pub get
-& $FlutterBin build windows --release @DartDefines
+Invoke-Checked $FlutterBin pub get
+Invoke-Checked $FlutterBin build windows --release @DartDefines
