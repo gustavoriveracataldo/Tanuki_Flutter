@@ -58,6 +58,9 @@ ensure_linux_build_deps() {
   if ! pkg-config --exists mpv 2>/dev/null; then
     packages="$packages libmpv-dev"
   fi
+  if ! pkg-config --exists libvlc 2>/dev/null; then
+    packages="$packages libvlc-dev vlc"
+  fi
   if ! pkg-config --exists epoxy 2>/dev/null; then
     packages="$packages libepoxy-dev"
   fi

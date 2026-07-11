@@ -99,9 +99,11 @@ jobs:
             libwebkit2gtk-4.1-dev \
             liblzma-dev \
             libmpv-dev \
+            libvlc-dev \
             libsoup-3.0-dev \
             ninja-build \
-            pkg-config
+            pkg-config \
+            vlc
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2

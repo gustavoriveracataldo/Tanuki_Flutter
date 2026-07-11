@@ -2114,7 +2114,7 @@ class _HeroBackground extends StatelessWidget {
               ),
             ),
           Container(
-            color: const Color(0x22000000),
+            color: const Color(0x66000000),
           ),
           Container(
             decoration: const BoxDecoration(
@@ -2122,10 +2122,10 @@ class _HeroBackground extends StatelessWidget {
                 begin: Alignment.centerLeft,
                 end: Alignment.centerRight,
                 colors: [
+                  Color(0x77000000),
                   Color(0x33000000),
-                  Colors.transparent,
-                  Colors.transparent,
                   Color(0x22000000),
+                  Color(0x55000000),
                 ],
               ),
             ),
@@ -2135,7 +2135,7 @@ class _HeroBackground extends StatelessWidget {
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
-                colors: [Color(0x00000000), Color(0x66000000)],
+                colors: [Color(0x22000000), Color(0x88000000)],
               ),
             ),
           ),

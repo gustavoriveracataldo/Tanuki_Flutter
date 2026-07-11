@@ -172,6 +172,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     int ticket,
   ) async {
     final previousWebViewController = _webViewController;
+    await _stopTrailerWebViewController(previousWebViewController);
     _disposeDesktopWebViewController(previousWebViewController);
     final uri = Uri.parse(trailerUrl);
     final controller = _createTrailerWebViewController()
@@ -309,9 +310,10 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         );
         await controller.loadHtmlString(
           canUseFloatingDesktopTrailerWebView(
-            platform: defaultTargetPlatform,
-            isWeb: kIsWeb,
-          )
+                    platform: defaultTargetPlatform,
+                    isWeb: kIsWeb,
+                  ) &&
+                  widget.entries.length > 1
               ? desktopYouTubeTrailerQueueHtml(
                   title: widget.title,
                   entries: widget.entries,
@@ -380,6 +382,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
   }
 
   Future<void> _closeTrailerQueue() async {
+    await _stopTrailerWebViewController(_webViewController);
     await _hideDesktopWebViewController(_webViewController);
     if (!mounted) {
       return;
@@ -394,6 +397,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     if (resolvedDetailUrl == null || resolvedDetailUrl.trim().isEmpty) {
       return;
     }
+    await _stopTrailerWebViewController(_webViewController);
     await _hideDesktopWebViewController(_webViewController);
     if (!mounted) {
       return;
@@ -406,6 +410,7 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
     _openTicket += 1;
     final webViewController = _webViewController;
     _webViewController = null;
+    unawaited(_stopTrailerWebViewController(webViewController));
     _disposeDesktopWebViewController(webViewController);
     _trailerRootFocusNode.dispose();
     _trailerBackFocusNode.dispose();
@@ -814,6 +819,37 @@ Future<void> _hideDesktopWebViewController(
   WebViewController? controller,
 ) async {}
 
+Future<void> _stopTrailerWebViewController(
+    WebViewController? controller) async {
+  if (controller == null) {
+    return;
+  }
+  try {
+    await controller.runJavaScript('''
+      try {
+        if (window.player && window.player.stopVideo) {
+          window.player.stopVideo();
+        }
+      } catch (error) {}
+      try {
+        document.querySelectorAll('video').forEach(function(video) {
+          try {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+          } catch (error) {}
+        });
+      } catch (error) {}
+    ''');
+  } catch (_) {}
+  try {
+    await controller.loadHtmlString(
+      '<!doctype html><html><body style="margin:0;background:#000"></body></html>',
+      baseUrl: 'about:blank',
+    );
+  } catch (_) {}
+}
+
 void _disposeDesktopWebViewController(WebViewController? controller) {}
 
 String youtubeWebTrailerEmbedHtml(String videoId) {
@@ -917,6 +953,7 @@ String youtubeWebTrailerEmbedHtml(String videoId) {
         },
         events: {
           onReady: function(event) {
+            window.player = event.target;
             playWhenReady(event.target);
             notify('ready');
           },
@@ -1315,6 +1352,7 @@ String desktopYouTubeTrailerQueueHtml({
         events: {
           onReady: function(event) {
             player = event.target;
+            window.player = player;
             configureIframe();
             playWhenReady(player);
             notify('ready');
