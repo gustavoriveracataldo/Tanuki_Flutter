@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:dart_vlc/dart_vlc.dart' as vlc;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -11,11 +12,14 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:video_player/video_player.dart' as vp;
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 import '../app_controller.dart';
 import '../models.dart';
 import '../services/playback_backend.dart';
 import 'toonami_theme.dart';
+import 'trailer_queue_screen.dart';
 
 const _remotePlaybackUserAgent =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
@@ -60,10 +64,13 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
+  static final List<vlc.Player> _retiredBiliBiliVlcPlayers = <vlc.Player>[];
+
   Player? _player;
   VideoController? _videoController;
   vp.VideoPlayerController? _androidExoController;
   vlc.Player? _desktopVlcPlayer;
+  WebViewController? _youtubeWebController;
   StreamSubscription<vlc.PositionState>? _desktopVlcPositionSubscription;
   StreamSubscription<vlc.PlaybackState>? _desktopVlcPlaybackSubscription;
   StreamSubscription<String>? _desktopVlcErrorSubscription;
@@ -127,6 +134,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Timer? _deferredAnimeAv1PlaybackErrorTimer;
   Timer? _playerOverlayHideTimer;
   Timer? _animeAv1SeekRecoveryTimer;
+  Timer? _youtubeWebStateTimer;
   Timer? _upcomingCardStartTimer;
   Timer? _upcomingCardSequenceTimer;
   DateTime? _lastPlayerBackKeyAt;
@@ -147,6 +155,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _remotePlaybackAccepted = false;
   bool _remoteVideoFrameReady = false;
   bool _remoteVideoFrameFallbackHandled = false;
+  bool _openedNativeYoutubePlayer = false;
+  bool _youtubeWebPlaying = false;
+  bool _youtubeWebEnded = false;
+  Duration _youtubeWebPosition = Duration.zero;
+  Duration _youtubeWebDuration = Duration.zero;
   int? _remoteVideoWidth;
   int? _remoteVideoHeight;
   int _remoteOpeningRecoveryAttempts = 0;
@@ -192,6 +205,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _simklScrobbleTimer?.cancel();
     _playerOverlayHideTimer?.cancel();
     _animeAv1SeekRecoveryTimer?.cancel();
+    _youtubeWebStateTimer?.cancel();
     _remoteOpeningRecoveryTimer?.cancel();
     _upcomingCardStartTimer?.cancel();
     _upcomingCardSequenceTimer?.cancel();
@@ -256,7 +270,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       androidExoController.removeListener(_handleAndroidExoValue);
       unawaited(androidExoController.dispose());
     }
-    unawaited(_disposeDesktopVlcPlayer());
+    unawaited(_disposeYoutubeWebPlayer());
+    unawaited(_disposeDesktopVlcPlayer(delayForBiliBili: true));
     super.dispose();
   }
 
@@ -391,8 +406,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await widget.controller.setCurrentEntry(widget.episode);
     _cancelRemoteVideoFrameWatchdog();
     _resetUpcomingCards();
+    await _disposeYoutubeWebPlayer();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
+    _openedNativeYoutubePlayer = false;
     _remotePlaybackAccepted = false;
     _remoteOpeningRecoveryAttempts = 0;
     _playerOverlaysVisible = true;
@@ -479,7 +496,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }
 
-    if (widget.episode.isRemote && !_looksLikeDirectVideo(path)) {
+    final pathLooksDirect = _looksLikeDirectVideo(path);
+    final isResolvedRemotePlayback = _isCurrentResolvedPlaybackPath(path);
+    if (widget.episode.isRemote &&
+        !pathLooksDirect &&
+        !isResolvedRemotePlayback) {
+      _debugPlayerEvent(
+        'open rejected unresolved remote path path=${_debugMediaLabel(path)}',
+      );
       setState(() {
         _error =
             'Esta entrada remota necesita resolver web antes de entregar HLS, DASH o MP4.';
@@ -489,15 +513,26 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     _currentPlaybackPath = path;
+    _debugPlayerEvent(
+      'open playback path ready resolved=$isResolvedRemotePlayback '
+      'direct=$pathLooksDirect mounted=$mounted ticket=$openTicket/'
+      '$_openEpisodeTicket usesVideoPlayer=$_usesAndroidExoPlayer '
+      'usesDesktopVlc=$_usesDesktopVlcPlayer path=${_debugMediaLabel(path)}',
+    );
     if (!mounted || openTicket != _openEpisodeTicket) {
       _debugPlayerEvent('open discarded stale playback path');
       return;
     }
+    if (await _openYoutubeSeriesWebPlayerIfNeeded(path, openTicket)) {
+      return;
+    }
     if (_usesAndroidExoPlayer) {
+      _debugPlayerEvent('open routing to video_player backend');
       await _openAndroidExoPlayer(path);
       return;
     }
     if (_usesDesktopVlcPlayer) {
+      _debugPlayerEvent('open routing to desktop VLC backend');
       await _openDesktopVlcPlayer(path);
       return;
     }
@@ -583,8 +618,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _openAndroidExoPlayer(String path) async {
+    _debugPlayerEvent(
+      'ExoPlayer prepare path=${_debugMediaLabel(path)} '
+      'provider=${_currentResolvedStream?.provider?.id ?? 'none'} '
+      'kind=${_currentResolvedStream?.playbackKind ?? 'unknown'}',
+    );
     final previous = _androidExoController;
     if (previous != null) {
+      _debugPlayerEvent('ExoPlayer dispose previous controller');
       previous.removeListener(_handleAndroidExoValue);
       await previous.dispose();
     }
@@ -620,7 +661,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
 
     try {
+      _debugPlayerEvent('ExoPlayer initialize start');
       await controller.initialize().timeout(const Duration(seconds: 30));
+      _debugPlayerEvent(
+        'ExoPlayer initialize ok duration='
+        '${_formatPlaybackTime(controller.value.duration)} '
+        'size=${controller.value.size.width.toStringAsFixed(0)}x'
+        '${controller.value.size.height.toStringAsFixed(0)}',
+      );
       final resumePosition =
           widget.controller.resumePositionForEpisode(widget.episode);
       await controller.seekTo(resumePosition ?? Duration.zero);
@@ -628,7 +676,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _lastDuration = controller.value.duration;
       _lastPositionChangeAt = DateTime.now();
       await _applyAndroidExoSubtitleTrack();
+      _debugPlayerEvent('ExoPlayer play start');
       await controller.play();
+      _debugPlayerEvent('ExoPlayer play requested');
       _remotePlaybackAccepted = true;
       _startSimklScrobble();
       if (!mounted || _androidExoController != controller) {
@@ -663,7 +713,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _openDesktopVlcPlayer(String path) async {
-    await _disposeDesktopVlcPlayer();
+    await _disposeDesktopVlcPlayer(delayForBiliBili: true);
     _desktopVlcCompletionHandled = false;
     _setPlayerBuffering(true);
 
@@ -738,10 +788,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       _debugPlayerEvent('VLC error: $error');
       _setPlayerBuffering(false);
-      setState(() {
-        _status = 'Error de reproduccion';
-        _error = 'VLC no pudo reproducir el video: $error';
-      });
+      unawaited(
+        _handleRemotePlaybackError(
+          'VLC: $error',
+          forceImmediate: true,
+        ),
+      );
     });
     _desktopVlcDimensionsSubscription =
         player.videoDimensionsStream.listen((dimensions) {
@@ -785,7 +837,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
     } catch (error) {
-      await _disposeDesktopVlcPlayer();
+      await _disposeDesktopVlcPlayer(delayForBiliBili: true);
       if (!mounted) {
         return;
       }
@@ -860,7 +912,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return vlc.Media.network(playbackPath, startTime: startTime);
   }
 
-  Future<void> _disposeDesktopVlcPlayer() async {
+  Future<void> _disposeDesktopVlcPlayer({
+    bool delayForBiliBili = false,
+  }) async {
     final subscriptions = <StreamSubscription<dynamic>?>[
       _desktopVlcPositionSubscription,
       _desktopVlcPlaybackSubscription,
@@ -871,6 +925,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _desktopVlcPlaybackSubscription = null;
     _desktopVlcErrorSubscription = null;
     _desktopVlcDimensionsSubscription = null;
+    final wasBiliBili =
+        _currentResolvedStream?.provider == RemoteProvider.bilibili;
     for (final subscription in subscriptions) {
       await subscription?.cancel();
     }
@@ -880,9 +936,288 @@ class _PlayerScreenState extends State<PlayerScreen> {
       try {
         player.stop();
       } catch (_) {}
-      player.dispose();
+      if (delayForBiliBili && wasBiliBili) {
+        // libVLC can still be reading the local BiliBili proxy after stop().
+        // Disposing that native player while it is buffering is what freezes
+        // or crashes Linux when the user changes source or leaves the screen.
+        _retiredBiliBiliVlcPlayers.add(player);
+        _setPlayerBuffering(false);
+        return;
+      }
+      try {
+        player.dispose();
+      } catch (error) {
+        _debugPlayerEvent('VLC dispose ignored error: $error');
+      }
     }
     _setPlayerBuffering(false);
+  }
+
+  Future<bool> _openYoutubeSeriesWebPlayerIfNeeded(
+    String path,
+    int openTicket,
+  ) async {
+    if (_currentResolvedStream?.provider != RemoteProvider.youtube ||
+        _openedNativeYoutubePlayer) {
+      return false;
+    }
+    final videoId = youtubeVideoIdFromUrl(
+      _currentResolvedStream?.pageUrl.trim().isNotEmpty == true
+          ? _currentResolvedStream!.pageUrl
+          : path,
+    );
+    if (videoId.isEmpty) {
+      return false;
+    }
+    _openedNativeYoutubePlayer = true;
+    _debugPlayerEvent('open routing YouTube to series WebView id=$videoId');
+    final resumePosition =
+        widget.controller.resumePositionForEpisode(widget.episode);
+    final startPosition = initialMediaStartPosition(
+          resumePosition: resumePosition,
+          canStartAtPosition: true,
+        ) ??
+        Duration.zero;
+    final controller = WebViewController();
+    if (controller.platform is AndroidWebViewController) {
+      await (controller.platform as AndroidWebViewController)
+          .setMediaPlaybackRequiresUserGesture(false);
+    }
+    await controller.setJavaScriptMode(JavaScriptMode.unrestricted);
+    await controller.setBackgroundColor(Colors.black);
+    await controller.setNavigationDelegate(
+      NavigationDelegate(
+        onWebResourceError: (error) {
+          _debugPlayerEvent(
+            'YouTube WebView resource error ${error.errorCode}: '
+            '${error.description}',
+          );
+        },
+      ),
+    );
+    await controller.addJavaScriptChannel(
+      'TanukiSeriesYoutube',
+      onMessageReceived: (message) {
+        _handleYoutubeWebMessage(message.message);
+      },
+    );
+    _youtubeWebController = controller;
+    _youtubeWebPlaying = false;
+    _youtubeWebEnded = false;
+    _youtubeWebPosition = startPosition;
+    _youtubeWebDuration = _expectedRemoteDuration;
+    _lastPosition = startPosition;
+    _lastDuration = _youtubeWebDuration;
+    _lastPositionChangeAt = DateTime.now();
+    _setPlayerBuffering(true);
+    if (mounted) {
+      setState(() {
+        _openedMedia = true;
+        _error = '';
+        _status = startPosition > Duration.zero
+            ? 'YouTube reanudado en ${_formatPlaybackTime(startPosition)}'
+            : 'Reproduciendo YouTube';
+      });
+    }
+    await controller.loadHtmlString(
+      _youtubeSeriesWebPlayerHtml(
+        videoId: videoId,
+        startPosition: startPosition,
+        title: widget.episode.displayName,
+        sourceLabel: _sourceStatus().label,
+        desktopControls: _usesDesktopYoutubeWebControls,
+      ),
+      baseUrl: 'https://www.youtube-nocookie.com',
+    );
+    if (!mounted || openTicket != _openEpisodeTicket) {
+      return true;
+    }
+    _startYoutubeWebStateTimer();
+    _remotePlaybackAccepted = true;
+    _startSimklScrobble();
+    _scheduleOpeningUpcomingCards();
+    _schedulePlayerOverlayHide();
+    return true;
+  }
+
+  Future<void> _disposeYoutubeWebPlayer() async {
+    _youtubeWebStateTimer?.cancel();
+    _youtubeWebStateTimer = null;
+    final controller = _youtubeWebController;
+    _youtubeWebController = null;
+    _youtubeWebPlaying = false;
+    _youtubeWebEnded = false;
+    _youtubeWebPosition = Duration.zero;
+    _youtubeWebDuration = Duration.zero;
+    if (controller == null) {
+      return;
+    }
+    try {
+      await controller.runJavaScript('try { tanukiPause(); } catch (e) {}');
+      await controller.loadHtmlString(
+        '<!doctype html><html><body style="margin:0;background:#000"></body></html>',
+        baseUrl: 'about:blank',
+      );
+    } catch (_) {}
+  }
+
+  void _startYoutubeWebStateTimer() {
+    _youtubeWebStateTimer?.cancel();
+    _youtubeWebStateTimer =
+        Timer.periodic(const Duration(milliseconds: 750), (_) {
+      final controller = _youtubeWebController;
+      if (!mounted || controller == null) {
+        return;
+      }
+      unawaited(
+        controller.runJavaScript('try { tanukiNotifyState(); } catch (e) {}'),
+      );
+    });
+  }
+
+  void _handleYoutubeWebMessage(String payload) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(payload);
+    } catch (error) {
+      _debugPlayerEvent('YouTube WebView ignored message: $error');
+      return;
+    }
+    if (decoded is! Map) {
+      return;
+    }
+    final message = decoded;
+    final type = '${message['type'] ?? ''}';
+    if (type == 'command') {
+      _handleYoutubeWebCommand('${message['command'] ?? ''}');
+      return;
+    }
+    if (type == 'ready') {
+      _setPlayerBuffering(false);
+      return;
+    }
+    if (type == 'buffering') {
+      _setPlayerBuffering(true);
+      return;
+    }
+    if (type == 'error') {
+      if (mounted) {
+        setState(() {
+          _status = 'Error de YouTube';
+          _error =
+              'YouTube no pudo reproducir este video (${message['detail'] ?? 'error'}).';
+        });
+      }
+      _setPlayerBuffering(false);
+      return;
+    }
+    if (type == 'ended') {
+      _youtubeWebEnded = true;
+      _youtubeWebPlaying = false;
+      _setPlayerBuffering(false);
+      if (!_completionCommitted) {
+        unawaited(_commitPlaybackCompletion());
+        if (mounted) {
+          unawaited(_playNext());
+        }
+      }
+      return;
+    }
+    if (type != 'state') {
+      return;
+    }
+    final positionSeconds = _readYoutubeWebSeconds(message['position']);
+    final durationSeconds = _readYoutubeWebSeconds(message['duration']);
+    final state = '${message['state'] ?? ''}';
+    final previous = _youtubeWebPosition;
+    _youtubeWebPosition =
+        Duration(milliseconds: (positionSeconds * 1000).round());
+    if (durationSeconds > 0) {
+      _youtubeWebDuration =
+          Duration(milliseconds: (durationSeconds * 1000).round());
+    }
+    _youtubeWebPlaying = state == 'playing';
+    _youtubeWebEnded = state == 'ended';
+    _lastPosition = _youtubeWebPosition;
+    _lastDuration = _youtubeWebDuration;
+    if (_youtubeWebPosition != previous) {
+      _lastPositionChangeAt = DateTime.now();
+    }
+    _maybeScheduleUpcomingCards(_youtubeWebPosition);
+    _persistPlaybackThrottled();
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _handleYoutubeWebCommand(String command) {
+    _showPlayerOverlays();
+    switch (command) {
+      case 'back':
+        Navigator.of(context).maybePop();
+        return;
+      case 'previous':
+        unawaited(_playPrevious());
+        return;
+      case 'next':
+        unawaited(_playNext());
+        return;
+      case 'settings':
+        unawaited(_showPlayerSettingsDialog());
+        return;
+      case 'episodes':
+        unawaited(_showEpisodeListPanel());
+        return;
+      case 'fullscreen':
+        unawaited(_toggleFullscreenMode());
+        return;
+      default:
+        return;
+    }
+  }
+
+  double _readYoutubeWebSeconds(Object? value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    return double.tryParse('$value') ?? 0;
+  }
+
+  bool get _usesDesktopYoutubeWebControls {
+    if (_currentResolvedStream?.provider != RemoteProvider.youtube) {
+      return false;
+    }
+    return defaultTargetPlatform == TargetPlatform.linux ||
+        defaultTargetPlatform == TargetPlatform.windows;
+  }
+
+  Future<void> _toggleYoutubeWebPlayback() async {
+    final controller = _youtubeWebController;
+    if (controller == null) {
+      return;
+    }
+    if (_youtubeWebEnded) {
+      await _seekYoutubeWebPlayer(Duration.zero);
+      _youtubeWebEnded = false;
+    }
+    await controller.runJavaScript('try { tanukiToggle(); } catch (e) {}');
+    _showPlayerOverlays();
+  }
+
+  Future<void> _seekYoutubeWebPlayer(Duration target) async {
+    final controller = _youtubeWebController;
+    if (controller == null) {
+      return;
+    }
+    final seconds = max(0, target.inMilliseconds / 1000).toStringAsFixed(3);
+    await controller
+        .runJavaScript('try { tanukiSeekTo($seconds); } catch (e) {}');
+    _youtubeWebPosition = target;
+    _lastPosition = target;
+    _lastPositionChangeAt = DateTime.now();
+    _youtubeWebEnded = false;
+    unawaited(_persistPlayback(force: true));
+    _showPlayerOverlays();
   }
 
   Future<void> _toggleDesktopVlcPlayback() async {
@@ -1575,7 +1910,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await androidExoController.dispose();
         _androidExoController = null;
       }
-      await _disposeDesktopVlcPlayer();
+      await _disposeDesktopVlcPlayer(delayForBiliBili: true);
       await _player?.stop();
       if (!mounted) {
         return;
@@ -1922,6 +2257,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           : 'Servidor',
       RemoteProvider.facebook =>
         widget.controller.facebookModeForEpisode(widget.episode).buttonLabel,
+      RemoteProvider.internetArchive => stream?.server.trim().isNotEmpty == true
+          ? remoteServerLabel(stream!.server)
+          : 'Directo',
       RemoteProvider.bilibili => stream?.server.trim().isNotEmpty == true
           ? remoteServerLabel(stream!.server)
           : 'DASH',
@@ -1960,6 +2298,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.animeAv1,
       RemoteProvider.jkAnime,
       RemoteProvider.latAnime,
+      RemoteProvider.internetArchive,
       RemoteProvider.bilibili,
       RemoteProvider.youtube,
       RemoteProvider.facebook,
@@ -2121,6 +2460,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final nextEntries = _nextEntriesAfterCurrent();
     final visibleUpcomingCard = _visibleUpcomingCardEpisode(nextEntries);
     final sourceStatus = _sourceStatus();
+    final useDesktopYoutubeWebControls = _openedMedia &&
+        _youtubeWebController != null &&
+        _usesDesktopYoutubeWebControls;
     return Scaffold(
       backgroundColor: Colors.black,
       body: Focus(
@@ -2141,30 +2483,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         fit: _boxFitForVideoScaleMode(_videoScaleMode),
                         subtitlesEnabled: _subtitlesEnabled,
                       )
-                    : _openedMedia && _desktopVlcPlayer != null
-                        ? vlc.Video(
-                            player: _desktopVlcPlayer!,
-                            fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                            showControls: false,
+                    : _openedMedia && _youtubeWebController != null
+                        ? _YoutubeWebVideoSurface(
+                            controller: _youtubeWebController!,
                           )
-                        : _openedMedia && _videoController != null
-                            ? _TanukiVideoTheme(
-                                child: Video(
-                                  controller: _videoController!,
-                                  fit:
-                                      _boxFitForVideoScaleMode(_videoScaleMode),
-                                  subtitleViewConfiguration:
-                                      SubtitleViewConfiguration(
-                                    visible: _subtitlesEnabled,
-                                  ),
-                                ),
+                        : _openedMedia && _desktopVlcPlayer != null
+                            ? vlc.Video(
+                                player: _desktopVlcPlayer!,
+                                fit: _boxFitForVideoScaleMode(_videoScaleMode),
+                                showControls: false,
                               )
-                            : _PlayerFallback(
-                                episode: episode,
-                                error: _error,
-                              ),
+                            : _openedMedia && _videoController != null
+                                ? _TanukiVideoTheme(
+                                    child: Video(
+                                      controller: _videoController!,
+                                      fit: _boxFitForVideoScaleMode(
+                                          _videoScaleMode),
+                                      subtitleViewConfiguration:
+                                          SubtitleViewConfiguration(
+                                        visible: _subtitlesEnabled,
+                                      ),
+                                    ),
+                                  )
+                                : _PlayerFallback(
+                                    episode: episode,
+                                    error: _error,
+                                  ),
               ),
-              if (_openedMedia && _playerBuffering)
+              if (_openedMedia &&
+                  _playerBuffering &&
+                  !useDesktopYoutubeWebControls)
                 Positioned.fill(
                   child: IgnorePointer(
                     child: _PlayerBufferingOverlay(
@@ -2175,44 +2523,46 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ),
                   ),
                 ),
-              Positioned(
-                left: 0,
-                top: 0,
-                right: 0,
-                child: IgnorePointer(
-                  ignoring: _openedMedia && !_playerOverlaysVisible,
-                  child: AnimatedOpacity(
-                    opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
-                    duration: const Duration(milliseconds: 220),
-                    child: _PlayerTopBar(
-                      episode: episode,
-                      status: sourceStatus.label,
-                      statusIcon: sourceStatus.icon,
-                      statusColor: sourceStatus.color,
-                      onBack: () => Navigator.of(context).maybePop(),
-                      onPrevious: _playPrevious,
-                      onNext: _playNext,
-                      subtitlesEnabled: _subtitlesEnabled,
-                      videoScaleMode: _videoScaleMode,
-                      onToggleSubtitles: _toggleSubtitles,
-                      onToggleViewMode: _cycleVideoScaleMode,
-                      onSettings: _showPlayerSettingsDialog,
-                      onEpisodes: () => unawaited(_showEpisodeListPanel()),
-                      onFullscreen: () => unawaited(_toggleFullscreenMode()),
-                      onControlFocusChanged: _setPlayerControlsFocused,
-                      backButtonFocusNode: _playerBackButtonFocusNode,
-                      previousButtonFocusNode: _playerPreviousButtonFocusNode,
-                      nextButtonFocusNode: _playerNextButtonFocusNode,
-                      subtitlesButtonFocusNode: _playerSubtitlesButtonFocusNode,
-                      fitButtonFocusNode: _playerFitButtonFocusNode,
-                      settingsButtonFocusNode: _playerSettingsButtonFocusNode,
-                      episodesButtonFocusNode: _playerEpisodesButtonFocusNode,
-                      fullscreenButtonFocusNode:
-                          _playerFullscreenButtonFocusNode,
+              if (!useDesktopYoutubeWebControls)
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  right: 0,
+                  child: IgnorePointer(
+                    ignoring: _openedMedia && !_playerOverlaysVisible,
+                    child: AnimatedOpacity(
+                      opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
+                      duration: const Duration(milliseconds: 220),
+                      child: _PlayerTopBar(
+                        episode: episode,
+                        status: sourceStatus.label,
+                        statusIcon: sourceStatus.icon,
+                        statusColor: sourceStatus.color,
+                        onBack: () => Navigator.of(context).maybePop(),
+                        onPrevious: _playPrevious,
+                        onNext: _playNext,
+                        subtitlesEnabled: _subtitlesEnabled,
+                        videoScaleMode: _videoScaleMode,
+                        onToggleSubtitles: _toggleSubtitles,
+                        onToggleViewMode: _cycleVideoScaleMode,
+                        onSettings: _showPlayerSettingsDialog,
+                        onEpisodes: () => unawaited(_showEpisodeListPanel()),
+                        onFullscreen: () => unawaited(_toggleFullscreenMode()),
+                        onControlFocusChanged: _setPlayerControlsFocused,
+                        backButtonFocusNode: _playerBackButtonFocusNode,
+                        previousButtonFocusNode: _playerPreviousButtonFocusNode,
+                        nextButtonFocusNode: _playerNextButtonFocusNode,
+                        subtitlesButtonFocusNode:
+                            _playerSubtitlesButtonFocusNode,
+                        fitButtonFocusNode: _playerFitButtonFocusNode,
+                        settingsButtonFocusNode: _playerSettingsButtonFocusNode,
+                        episodesButtonFocusNode: _playerEpisodesButtonFocusNode,
+                        fullscreenButtonFocusNode:
+                            _playerFullscreenButtonFocusNode,
+                      ),
                     ),
                   ),
                 ),
-              ),
               if (widget.controller.state.showPlaylistUpcomingCards &&
                   visibleUpcomingCard != null)
                 Positioned(
@@ -2246,6 +2596,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         controller: _androidExoController!,
                         onTogglePlayback: _toggleAndroidExoPlayback,
                         onSeek: _seekAndroidExoPlayer,
+                        formatTime: _formatPlaybackTime,
+                        onFocusChanged: _setPlayerControlsFocused,
+                        playButtonFocusNode: _playerBottomPlayFocusNode,
+                        progressFocusNode: _playerBottomProgressFocusNode,
+                      ),
+                    ),
+                  ),
+                ),
+              if (_openedMedia &&
+                  _youtubeWebController != null &&
+                  !useDesktopYoutubeWebControls)
+                Positioned(
+                  left: 14,
+                  right: 14,
+                  bottom: 10,
+                  child: IgnorePointer(
+                    ignoring: !_playerOverlaysVisible,
+                    child: AnimatedOpacity(
+                      opacity: _playerOverlaysVisible ? 1 : 0,
+                      duration: const Duration(milliseconds: 220),
+                      child: _YoutubeWebControls(
+                        isPlaying: _youtubeWebPlaying,
+                        position: _youtubeWebPosition,
+                        duration: _youtubeWebDuration,
+                        onTogglePlayback: _toggleYoutubeWebPlayback,
+                        onSeek: _seekYoutubeWebPlayer,
                         formatTime: _formatPlaybackTime,
                         onFocusChanged: _setPlayerControlsFocused,
                         playButtonFocusNode: _playerBottomPlayFocusNode,
@@ -2461,6 +2837,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (_playerBottomPlayFocusNode.hasFocus) {
       if (_usesAndroidExoPlayer) {
         unawaited(_toggleAndroidExoPlayback());
+      } else if (_youtubeWebController != null) {
+        unawaited(_toggleYoutubeWebPlayback());
       } else if (_usesDesktopVlcPlayer) {
         unawaited(_toggleDesktopVlcPlayback());
       } else {
@@ -3076,6 +3454,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   style: TextStyle(color: TanukiColors.muted),
                 );
               }
+              if (provider == RemoteProvider.internetArchive) {
+                return const Text(
+                  'Internet Archive usa el archivo de video encontrado automaticamente.',
+                  style: TextStyle(color: TanukiColors.muted),
+                );
+              }
               if (provider == RemoteProvider.youtube) {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -3134,6 +3518,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               RemoteProvider.animeAv1,
               RemoteProvider.jkAnime,
               RemoteProvider.latAnime,
+              RemoteProvider.internetArchive,
               RemoteProvider.bilibili,
               RemoteProvider.youtube,
               if (widget.controller.canUsePlaybackProviderForEpisode(
@@ -3344,6 +3729,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 RemoteProvider.animeAv1,
                 RemoteProvider.jkAnime,
                 RemoteProvider.latAnime,
+                RemoteProvider.internetArchive,
                 RemoteProvider.bilibili,
                 if (widget.controller.canUsePlaybackProviderForEpisode(
                   widget.episode,
@@ -3625,6 +4011,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.animeAv1 => 'AnimeAV1 - ${animeAv1Mode.dialogLabel}',
       RemoteProvider.jkAnime => 'JKAnime - ${jkAnimeServer.label}',
       RemoteProvider.latAnime => 'LatAnime',
+      RemoteProvider.internetArchive => 'Internet Archive',
       RemoteProvider.bilibili => 'BiliBili - DASH',
       RemoteProvider.youtube => 'YouTube',
       RemoteProvider.animeFlv => 'AnimeFLV',
@@ -3705,12 +4092,416 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
+  bool _isCurrentResolvedPlaybackPath(String value) {
+    final playbackUrl = _currentResolvedStream?.playbackUrl.trim();
+    return playbackUrl != null &&
+        playbackUrl.isNotEmpty &&
+        playbackUrl == value;
+  }
+
   BoxFit _boxFitForVideoScaleMode(VideoScaleMode mode) {
     return switch (mode) {
       VideoScaleMode.stretch => BoxFit.fill,
       _ => BoxFit.contain,
     };
   }
+}
+
+String _youtubeSeriesWebPlayerHtml({
+  required String videoId,
+  required Duration startPosition,
+  required String title,
+  required String sourceLabel,
+  required bool desktopControls,
+}) {
+  final jsVideoId = jsonEncode(videoId);
+  final jsTitle = jsonEncode(title.trim().isEmpty ? 'Episodio' : title.trim());
+  final jsSourceLabel = jsonEncode(
+    sourceLabel.trim().isEmpty ? 'YouTube' : sourceLabel.trim(),
+  );
+  final jsDesktopControls = desktopControls ? 'true' : 'false';
+  final startSeconds = max(0, startPosition.inSeconds);
+  return '''
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #fff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #player {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+    }
+    iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #000;
+    }
+    .chrome {
+      position: fixed;
+      left: 0;
+      right: 0;
+      z-index: 3;
+      color: #fff;
+      pointer-events: auto;
+    }
+    body:not(.desktop-controls) .chrome {
+      display: none;
+    }
+    #topbar {
+      top: 0;
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: linear-gradient(180deg, rgba(0,0,0,0.72), rgba(0,0,0,0));
+    }
+    #bottombar {
+      bottom: 0;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 12px;
+      padding: 0 16px 14px;
+      background: linear-gradient(0deg, rgba(0,0,0,0.76), rgba(0,0,0,0));
+    }
+    .icon-button {
+      width: 42px;
+      height: 42px;
+      flex: 0 0 42px;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(15, 23, 32, 0.52);
+      color: #fff;
+      display: inline-grid;
+      place-items: center;
+      padding: 0;
+      cursor: pointer;
+    }
+    .icon-button:hover,
+    .icon-button:focus {
+      outline: 0;
+      background: rgba(255, 138, 42, 0.24);
+    }
+    .icon-button svg {
+      width: 23px;
+      height: 23px;
+      fill: currentColor;
+    }
+    #text {
+      min-width: 0;
+      flex: 1 1 auto;
+      padding-left: 2px;
+    }
+    #title {
+      font-size: 16px;
+      line-height: 20px;
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #source {
+      margin-top: 2px;
+      color: #ff8a2a;
+      font-size: 13px;
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #play {
+      background: transparent;
+    }
+    #time {
+      min-width: 112px;
+      color: rgba(226, 232, 240, 0.84);
+      font-size: 13px;
+      font-weight: 700;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    #progress {
+      width: 100%;
+      accent-color: #ff8a2a;
+      cursor: pointer;
+    }
+    #loading {
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      color: rgba(226, 232, 240, 0.82);
+      font-size: 14px;
+      font-weight: 800;
+    }
+    body.playing #loading,
+    body.paused #loading,
+    body.ended #loading {
+      display: none;
+    }
+    #spinner {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      border: 4px solid rgba(255, 138, 42, 0.18);
+      border-top-color: #ff8a2a;
+      animation: spin 0.9s linear infinite;
+      margin: 0 auto 14px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+  <script src="https://www.youtube.com/iframe_api" referrerpolicy="strict-origin-when-cross-origin"></script>
+</head>
+<body>
+  <div id="player"></div>
+  <div id="loading">
+    <div>
+      <div id="spinner"></div>
+      <div>Cargando video...</div>
+    </div>
+  </div>
+  <div id="topbar" class="chrome">
+    <button id="back" class="icon-button" title="Volver" aria-label="Volver">
+      <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.42-1.41L7.83 13H20v-2z"></path></svg>
+    </button>
+    <button id="previous" class="icon-button" title="Capitulo anterior" aria-label="Capitulo anterior">
+      <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6V6zm3.5 6L18 18V6l-8.5 6z"></path></svg>
+    </button>
+    <button id="next" class="icon-button" title="Capitulo siguiente" aria-label="Capitulo siguiente">
+      <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2V6z"></path></svg>
+    </button>
+    <div id="text">
+      <div id="title"></div>
+      <div id="source"></div>
+    </div>
+    <button id="episodes" class="icon-button" title="Episodios" aria-label="Episodios">
+      <svg viewBox="0 0 24 24"><path d="M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h16v2H4v-2z"></path></svg>
+    </button>
+    <button id="settings" class="icon-button" title="Configuracion" aria-label="Configuracion">
+      <svg viewBox="0 0 24 24"><path d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65-2-3.46-2.49 1a7.28 7.28 0 0 0-1.69-.98L15 3h-4l-.36 2.93c-.6.23-1.16.56-1.69.98l-2.49-1-2 3.46 2.11 1.65c-.04.32-.07.65-.07.98s.02.66.07.98l-2.11 1.65 2 3.46 2.49-1c.52.4 1.09.73 1.69.98L11 21h4l.36-2.93c.6-.23 1.16-.56 1.69-.98l2.49 1 2-3.46-2.11-1.65zM13 15.5A3.5 3.5 0 1 1 13 8a3.5 3.5 0 0 1 0 7.5z"></path></svg>
+    </button>
+    <button id="fullscreen" class="icon-button" title="Pantalla completa" aria-label="Pantalla completa">
+      <svg viewBox="0 0 24 24"><path d="M5 5h6v2H7v4H5V5zm12 2h-4V5h6v6h-2V7zM7 13v4h4v2H5v-6h2zm12 0v6h-6v-2h4v-4h2z"></path></svg>
+    </button>
+  </div>
+  <div id="bottombar" class="chrome">
+    <button id="play" class="icon-button" title="Play/Pausa" aria-label="Play/Pausa">
+      <svg id="playIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"></path></svg>
+    </button>
+    <input id="progress" type="range" min="0" max="1" step="0.01" value="0" aria-label="Progreso">
+    <div id="time">0:00 / 0:00</div>
+  </div>
+  <script>
+    let player = null;
+    let ready = false;
+    const desktopControls = $jsDesktopControls;
+    const titleText = $jsTitle;
+    const sourceText = $jsSourceLabel;
+    const playIcon = document.getElementById('playIcon');
+    const progress = document.getElementById('progress');
+    const timeLabel = document.getElementById('time');
+    document.body.classList.toggle('desktop-controls', desktopControls);
+    document.getElementById('title').textContent = titleText;
+    document.getElementById('source').textContent = sourceText;
+    function post(type, extra) {
+      const message = Object.assign({
+        type: type,
+        state: stateLabel(),
+        position: currentTime(),
+        duration: duration()
+      }, extra || {});
+      try {
+        TanukiSeriesYoutube.postMessage(JSON.stringify(message));
+      } catch (error) {}
+    }
+    function postCommand(command) {
+      post('command', { command: command });
+    }
+    function currentTime() {
+      try { return player && player.getCurrentTime ? player.getCurrentTime() || 0 : 0; }
+      catch (error) { return 0; }
+    }
+    function duration() {
+      try { return player && player.getDuration ? player.getDuration() || 0 : 0; }
+      catch (error) { return 0; }
+    }
+    function stateLabel() {
+      try {
+        if (!player || !player.getPlayerState) return 'idle';
+        const state = player.getPlayerState();
+        if (state === YT.PlayerState.PLAYING) return 'playing';
+        if (state === YT.PlayerState.PAUSED) return 'paused';
+        if (state === YT.PlayerState.BUFFERING) return 'buffering';
+        if (state === YT.PlayerState.ENDED) return 'ended';
+        if (state === YT.PlayerState.CUED) return 'cued';
+        return 'idle';
+      } catch (error) {
+        return 'idle';
+      }
+    }
+    function formatTime(seconds) {
+      seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (h > 0) {
+        return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+      }
+      return m + ':' + String(s).padStart(2, '0');
+    }
+    function renderChrome() {
+      const state = stateLabel();
+      document.body.classList.remove('playing', 'paused', 'ended', 'buffering', 'idle');
+      document.body.classList.add(state);
+      const pos = currentTime();
+      const dur = duration();
+      progress.max = dur > 0 ? String(dur) : '1';
+      progress.value = dur > 0 ? String(Math.min(pos, dur)) : '0';
+      timeLabel.textContent = formatTime(pos) + ' / ' + formatTime(dur);
+      playIcon.innerHTML = state === 'playing'
+        ? '<path d="M6 5h4v14H6V5zm8 0h4v14h-4V5z"></path>'
+        : '<path d="M8 5v14l11-7z"></path>';
+    }
+    function playWhenReady() {
+      if (!player) return;
+      try { player.unMute(); } catch (error) {}
+      [0, 250, 900, 1800].forEach(function(delay) {
+        window.setTimeout(function() {
+          try { player.playVideo(); } catch (error) {}
+        }, delay);
+      });
+    }
+    function tanukiPlay() {
+      try { if (player) player.playVideo(); } catch (error) {}
+      window.setTimeout(tanukiNotifyState, 100);
+    }
+    function tanukiPause() {
+      try { if (player) player.pauseVideo(); } catch (error) {}
+      window.setTimeout(tanukiNotifyState, 100);
+    }
+    function tanukiToggle() {
+      if (stateLabel() === 'playing') {
+        tanukiPause();
+      } else {
+        tanukiPlay();
+      }
+    }
+    function tanukiSeekTo(seconds) {
+      try {
+        if (player) {
+          player.seekTo(Math.max(0, Number(seconds) || 0), true);
+          player.playVideo();
+        }
+      } catch (error) {}
+      window.setTimeout(tanukiNotifyState, 100);
+      window.setTimeout(tanukiNotifyState, 900);
+    }
+    function tanukiNotifyState() {
+      renderChrome();
+      post('state');
+    }
+    function bindControls() {
+      document.getElementById('back').addEventListener('click', function() { postCommand('back'); });
+      document.getElementById('previous').addEventListener('click', function() { postCommand('previous'); });
+      document.getElementById('next').addEventListener('click', function() { postCommand('next'); });
+      document.getElementById('episodes').addEventListener('click', function() { postCommand('episodes'); });
+      document.getElementById('settings').addEventListener('click', function() { postCommand('settings'); });
+      document.getElementById('fullscreen').addEventListener('click', function() {
+        try {
+          const root = document.documentElement;
+          if (!document.fullscreenElement && root.requestFullscreen) {
+            root.requestFullscreen();
+          } else if (document.exitFullscreen) {
+            document.exitFullscreen();
+          }
+        } catch (error) {}
+        postCommand('fullscreen');
+      });
+      document.getElementById('play').addEventListener('click', tanukiToggle);
+      progress.addEventListener('input', function() {
+        tanukiSeekTo(Number(progress.value) || 0);
+      });
+    }
+    bindControls();
+    function onYouTubeIframeAPIReady() {
+      player = new YT.Player('player', {
+        host: 'https://www.youtube-nocookie.com',
+        width: '100%',
+        height: '100%',
+        videoId: $jsVideoId,
+        playerVars: {
+          autoplay: 1,
+          controls: 0,
+          disablekb: 1,
+          fs: 0,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          iv_load_policy: 3,
+          enablejsapi: 1,
+          start: $startSeconds,
+          origin: 'https://www.youtube-nocookie.com'
+        },
+        events: {
+          onReady: function(event) {
+            player = event.target;
+            ready = true;
+            try {
+              const iframe = player.getIframe();
+              if (iframe) {
+                iframe.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture';
+                iframe.allowFullscreen = true;
+                iframe.referrerPolicy = 'strict-origin-when-cross-origin';
+              }
+            } catch (error) {}
+            renderChrome();
+            post('ready');
+            playWhenReady();
+            window.setInterval(tanukiNotifyState, 750);
+          },
+          onStateChange: function(event) {
+            renderChrome();
+            if (event.data === YT.PlayerState.BUFFERING) {
+              post('buffering');
+            } else if (event.data === YT.PlayerState.ENDED) {
+              post('ended');
+            } else {
+              post('state');
+            }
+          },
+          onError: function(event) {
+            post('error', { detail: String(event && event.data ? event.data : 'youtube') });
+          }
+        }
+      });
+    }
+  </script>
+</body>
+</html>
+''';
 }
 
 class _PlayerDialogSectionTitle extends StatelessWidget {
@@ -3726,6 +4517,182 @@ class _PlayerDialogSectionTitle extends StatelessWidget {
         color: TanukiColors.amber,
         fontSize: 12,
         fontWeight: FontWeight.w900,
+      ),
+    );
+  }
+}
+
+class _YoutubeWebVideoSurface extends StatelessWidget {
+  const _YoutubeWebVideoSurface({
+    required this.controller,
+  });
+
+  final WebViewController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: Colors.black,
+      child: WebViewWidget(controller: controller),
+    );
+  }
+}
+
+class _YoutubeWebControls extends StatefulWidget {
+  const _YoutubeWebControls({
+    required this.isPlaying,
+    required this.position,
+    required this.duration,
+    required this.onTogglePlayback,
+    required this.onSeek,
+    required this.formatTime,
+    required this.onFocusChanged,
+    this.playButtonFocusNode,
+    this.progressFocusNode,
+  });
+
+  final bool isPlaying;
+  final Duration position;
+  final Duration duration;
+  final Future<void> Function() onTogglePlayback;
+  final Future<void> Function(Duration target) onSeek;
+  final String Function(Duration duration) formatTime;
+  final ValueChanged<bool> onFocusChanged;
+  final FocusNode? playButtonFocusNode;
+  final FocusNode? progressFocusNode;
+
+  @override
+  State<_YoutubeWebControls> createState() => _YoutubeWebControlsState();
+}
+
+class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
+  double? _dragPositionMs;
+
+  KeyEventResult _handleProgressKey(
+      Duration position, Duration duration, FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key != LogicalKeyboardKey.arrowLeft &&
+        key != LogicalKeyboardKey.arrowRight) {
+      return KeyEventResult.ignored;
+    }
+    final direction = key == LogicalKeyboardKey.arrowRight ? 1 : -1;
+    final target = position + Duration(seconds: 10 * direction);
+    final clamped = Duration(
+      milliseconds: target.inMilliseconds
+          .clamp(0, max(1, duration.inMilliseconds))
+          .toInt(),
+    );
+    setState(() {
+      _dragPositionMs = clamped.inMilliseconds.toDouble();
+    });
+    unawaited(widget.onSeek(clamped).whenComplete(() {
+      if (mounted) {
+        setState(() {
+          _dragPositionMs = null;
+        });
+      }
+    }));
+    return KeyEventResult.handled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final durationMs = widget.duration.inMilliseconds.clamp(1, 1 << 53);
+    final currentMs = _dragPositionMs ??
+        widget.position.inMilliseconds.clamp(0, durationMs).toDouble();
+    return FocusTraversalGroup(
+      policy: OrderedTraversalPolicy(),
+      child: Focus(
+        onFocusChange: widget.onFocusChanged,
+        child: SizedBox(
+          height: 48,
+          child: Row(
+            children: [
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(1),
+                child: IconButton(
+                  focusNode: widget.playButtonFocusNode,
+                  tooltip: widget.isPlaying ? 'Pausar' : 'Reproducir',
+                  onPressed: () => unawaited(widget.onTogglePlayback()),
+                  icon: Icon(
+                    widget.isPlaying ? Icons.pause : Icons.play_arrow,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 54,
+                child: Text(
+                  widget.formatTime(
+                    Duration(milliseconds: currentMs.round()),
+                  ),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: TanukiColors.text,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+              Expanded(
+                child: FocusTraversalOrder(
+                  order: const NumericFocusOrder(2),
+                  child: Focus(
+                    focusNode: widget.progressFocusNode,
+                    onKeyEvent: (node, event) => _handleProgressKey(
+                      Duration(milliseconds: currentMs.round()),
+                      widget.duration,
+                      node,
+                      event,
+                    ),
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        activeTrackColor: TanukiColors.orange,
+                        inactiveTrackColor: const Color(0x668A939E),
+                        thumbColor: Colors.white,
+                        overlayColor: const Color(0x33F0B760),
+                        trackHeight: 2,
+                      ),
+                      child: Slider(
+                        min: 0,
+                        max: durationMs.toDouble(),
+                        value: currentMs.clamp(0, durationMs.toDouble()),
+                        onChanged: (position) {
+                          setState(() {
+                            _dragPositionMs = position;
+                          });
+                        },
+                        onChangeEnd: (position) {
+                          setState(() {
+                            _dragPositionMs = null;
+                          });
+                          unawaited(
+                            widget.onSeek(
+                              Duration(milliseconds: position.round()),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 54,
+                child: Text(
+                  widget.formatTime(widget.duration),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: TanukiColors.muted,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -5003,6 +5970,7 @@ String remoteServerLabel(String server) {
     'uqload' => 'Uqload',
     'stape' => 'Stape',
     'netu' => 'Netu',
+    'archive-direct' => 'Directo',
     'bilibili-1' => 'BiliBili 1',
     'bilibili-2' => 'BiliBili 2',
     'youtube-sub-1' => 'SUB Opcion 1',

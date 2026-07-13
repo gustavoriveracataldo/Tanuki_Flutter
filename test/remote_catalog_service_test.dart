@@ -123,6 +123,7 @@ void main() {
   test('aggregate search skips disabled AnimeFLV provider', () async {
     final requestedHosts = <String>[];
     final service = RemoteCatalogService(
+      myAnimeListClientId: '',
       client: MockClient((request) async {
         requestedHosts.add(request.url.host);
         expect(request.url.host, isNot('www4.animeflv.net'));
@@ -142,6 +143,112 @@ void main() {
     expect(requestedHosts, isNot(contains('www4.animeflv.net')));
   });
 
+  test('aggregate search keeps catalog variants before provider results',
+      () async {
+    final service = RemoteCatalogService(
+      myAnimeListClientId: 'mal-client',
+      client: MockClient((request) async {
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response(
+            jsonEncode({
+              'data': [
+                {
+                  'mal_id': 39535,
+                  'title': 'Mushoku Tensei: Isekai Ittara Honki Dasu',
+                  'type': 'TV',
+                  'episodes': 11,
+                  'score': 8.3,
+                  'year': 2021,
+                  'images': {
+                    'jpg': {'large_image_url': 'https://jikan.test/s1.jpg'},
+                  },
+                },
+              ],
+            }),
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'graphql.anilist.co') {
+          return http.Response(
+            jsonEncode({
+              'data': {
+                'Page': {
+                  'media': [
+                    {
+                      'id': 178789,
+                      'idMal': 59193,
+                      'title': {
+                        'romaji':
+                            'Mushoku Tensei III: Isekai Ittara Honki Dasu',
+                      },
+                      'episodes': 14,
+                      'format': 'TV',
+                      'averageScore': 89,
+                      'startDate': {'year': 2026},
+                      'coverImage': {
+                        'large': 'https://anilist.test/s3.jpg',
+                      },
+                    },
+                  ],
+                },
+              },
+            }),
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'api.myanimelist.net') {
+          return http.Response(
+            jsonEncode({
+              'data': [
+                {
+                  'node': {
+                    'id': 51179,
+                    'title': 'Mushoku Tensei II: Isekai Ittara Honki Dasu',
+                    'main_picture': {
+                      'large': 'https://mal.test/s2.jpg',
+                    },
+                    'start_date': '2023-07-03',
+                    'media_type': 'tv',
+                    'num_episodes': 12,
+                    'mean': 8.2,
+                  },
+                },
+              ],
+            }),
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'animeav1.com') {
+          return http.Response(
+            '''
+            <article class="group/item">
+              <img src="https://animeav1.test/mushoku-provider.jpg">
+              <div class="rounded bg-line">TV</div>
+              <h3>Mushoku Provider</h3>
+              <a href="/media/mushoku-provider"></a>
+            </article>
+            ''',
+            200,
+            request: request,
+          );
+        }
+        return http.Response('', 200, request: request);
+      }),
+    );
+
+    final results = await service.search('mushoku');
+
+    expect(results.take(3).map((candidate) => candidate.provider),
+        everyElement(RemoteProvider.catalog));
+    expect(results.take(3).map((candidate) => candidate.catalogId),
+        containsAllInOrder([39535, 51179, 59193]));
+    expect(results.skip(3).map((candidate) => candidate.provider),
+        contains(RemoteProvider.animeAv1));
+  });
+
   test('falls back to MyAnimeList catalog search when Jikan fails', () async {
     final requestedHosts = <String>[];
     final service = RemoteCatalogService(
@@ -155,47 +262,66 @@ void main() {
             request: request,
           );
         }
-        expect(request.url.host, 'api.myanimelist.net');
-        expect(request.headers['X-MAL-CLIENT-ID'], 'mal-client');
-        expect(request.url.path, '/v2/anime');
-        expect(request.url.queryParameters['q'], 'kirarin');
-        return http.Response.bytes(
-          utf8.encode('''
-          {
-            "data": [
-              {
-                "node": {
-                  "id": 1516,
-                  "title": "Kirarin☆Revolution",
-                  "main_picture": {
-                    "medium": "https://cdn.example.test/kirarin.jpg",
-                    "large": "https://cdn.example.test/kirarin-large.jpg"
-                  },
-                  "alternative_titles": {
-                    "synonyms": [],
-                    "en": "Kirarin Revolution",
-                    "ja": "きらりん☆レボリューション"
-                  },
-                  "start_date": "2006-04-07",
-                  "media_type": "tv",
-                  "num_episodes": 153,
-                  "synopsis": "Kirari demo",
-                  "mean": 7.05
+        if (request.url.host == 'graphql.anilist.co') {
+          return http.Response(
+            '{"data":{"Page":{"media":[]}}}',
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'api.myanimelist.net') {
+          expect(request.headers['X-MAL-CLIENT-ID'], 'mal-client');
+          expect(request.url.path, '/v2/anime');
+          expect(request.url.queryParameters['q'], 'kirarin');
+          return http.Response.bytes(
+            utf8.encode('''
+            {
+              "data": [
+                {
+                  "node": {
+                    "id": 1516,
+                    "title": "Kirarin☆Revolution",
+                    "main_picture": {
+                      "medium": "https://cdn.example.test/kirarin.jpg",
+                      "large": "https://cdn.example.test/kirarin-large.jpg"
+                    },
+                    "alternative_titles": {
+                      "synonyms": [],
+                      "en": "Kirarin Revolution",
+                      "ja": "きらりん☆レボリューション"
+                    },
+                    "start_date": "2006-04-07",
+                    "media_type": "tv",
+                    "num_episodes": 153,
+                    "synopsis": "Kirari demo",
+                    "mean": 7.05
+                  }
                 }
-              }
-            ]
-          }
-          '''),
+              ]
+            }
+            '''),
+            200,
+            request: request,
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        expect(request.url.host, 'myanimelist.net');
+        return http.Response(
+          '<h2 id="anime">Anime</h2><article></article>',
           200,
           request: request,
-          headers: {'content-type': 'application/json; charset=utf-8'},
         );
       }),
     );
 
     final results = await service.searchCatalog('kirarin');
 
-    expect(requestedHosts, ['api.jikan.moe', 'api.myanimelist.net']);
+    expect(requestedHosts, [
+      'api.jikan.moe',
+      'api.myanimelist.net',
+      'myanimelist.net',
+      'graphql.anilist.co',
+    ]);
     expect(results, hasLength(1));
     expect(results.first.provider, RemoteProvider.catalog);
     expect(results.first.catalogId, 1516);
@@ -205,6 +331,213 @@ void main() {
     expect(results.first.episodeCount, 153);
     expect(results.first.releaseYear, 2006);
     expect(results.first.rating, '7.0');
+  });
+
+  test('uses public MyAnimeList web search when API client is unavailable',
+      () async {
+    final requestedHosts = <String>[];
+    final service = RemoteCatalogService(
+      myAnimeListClientId: '',
+      client: MockClient((request) async {
+        requestedHosts.add(request.url.host);
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response('{"data":[]}', 200, request: request);
+        }
+        if (request.url.host == 'graphql.anilist.co') {
+          return http.Response(
+            '{"data":{"Page":{"media":[]}}}',
+            200,
+            request: request,
+          );
+        }
+        expect(request.url.host, 'myanimelist.net');
+        expect(request.url.path, '/search/all');
+        expect(request.url.queryParameters['q'], 'mushoku');
+        expect(request.url.queryParameters['cat'], 'anime');
+        return http.Response(
+          '''
+          <h2 id="anime">Anime</h2>
+          <article>
+            <div class="list di-t w100">
+              <div class="picSurround di-tc thumb">
+                <a href="https://myanimelist.net/anime/59193/Mushoku_Tensei_III__Isekai_Ittara_Honki_Dasu">
+                  <img data-src="https://cdn.myanimelist.net/r/100x140/images/anime/1527/158340.jpg?s=demo"
+                       alt="Mushoku Tensei III: Isekai Ittara Honki Dasu">
+                </a>
+              </div>
+              <div class="information di-tc va-t pt4 pl8">
+                <div class="title">
+                  <a data-l-content-type="anime"
+                     href="https://myanimelist.net/anime/59193/Mushoku_Tensei_III__Isekai_Ittara_Honki_Dasu">
+                    Mushoku Tensei III: Isekai Ittara Honki Dasu
+                  </a>
+                </div>
+                <div class="pt8 fs10 lh14 fn-grey4">
+                  <a>TV</a> (14 eps)<br>
+                  Scored 8.92<br>
+                  260,867 members<br>
+                </div>
+              </div>
+            </div>
+          </article>
+          ''',
+          200,
+          request: request,
+        );
+      }),
+    );
+
+    final results = await service.searchCatalog('mushoku');
+
+    expect(requestedHosts,
+        ['api.jikan.moe', 'myanimelist.net', 'graphql.anilist.co']);
+    expect(results, hasLength(1));
+    expect(results.first.catalogId, 59193);
+    expect(results.first.title, 'Mushoku Tensei III: Isekai Ittara Honki Dasu');
+    expect(results.first.imageUrl,
+        'https://cdn.myanimelist.net/images/anime/1527/158340.jpg');
+    expect(results.first.format, 'TV');
+    expect(results.first.episodeCount, 14);
+    expect(results.first.rating, '8.92');
+  });
+
+  test('falls back to AniList catalog search when Jikan fails', () async {
+    final requestedHosts = <String>[];
+    final service = RemoteCatalogService(
+      myAnimeListClientId: 'mal-client',
+      client: MockClient((request) async {
+        requestedHosts.add(request.url.host);
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response(
+            '{"status":504,"message":"Jikan failed"}',
+            504,
+            request: request,
+          );
+        }
+        if (request.url.host == 'api.myanimelist.net') {
+          return http.Response('{"data":[]}', 200, request: request);
+        }
+        if (request.url.host == 'myanimelist.net') {
+          return http.Response(
+            '<h2 id="anime">Anime</h2><article></article>',
+            200,
+            request: request,
+          );
+        }
+        expect(request.url.host, 'graphql.anilist.co');
+        final body = jsonDecode(request.body) as Map<String, dynamic>;
+        expect(body['variables']['search'], 'oshi no ko');
+        return http.Response(
+          jsonEncode({
+            'data': {
+              'Page': {
+                'media': [
+                  {
+                    'id': 182587,
+                    'idMal': 60058,
+                    'title': {
+                      'romaji': '[Oshi no Ko] 3rd Season',
+                      'english': 'OSHI NO KO Season 3',
+                      'native': '【推しの子】第3期',
+                    },
+                    'synonyms': ['My Star Season 3'],
+                    'description': 'AniList demo',
+                    'episodes': 11,
+                    'format': 'TV',
+                    'averageScore': 86,
+                    'startDate': {
+                      'year': 2026,
+                      'month': 1,
+                      'day': 14,
+                    },
+                    'coverImage': {
+                      'extraLarge': 'https://anilist.test/cover.jpg',
+                    },
+                    'bannerImage': 'https://anilist.test/banner.jpg',
+                    'trailer': {
+                      'site': 'youtube',
+                      'id': 'trailer123',
+                    },
+                  }
+                ],
+              },
+            },
+          }),
+          200,
+          request: request,
+          headers: {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    final results = await service.searchCatalog('oshi no ko');
+
+    expect(requestedHosts, [
+      'api.jikan.moe',
+      'api.myanimelist.net',
+      'myanimelist.net',
+      'graphql.anilist.co',
+    ]);
+    expect(results, hasLength(1));
+    expect(results.first.catalogId, 60058);
+    expect(results.first.title, '[Oshi no Ko] 3rd Season');
+    expect(results.first.aliases, contains('My Star Season 3'));
+    expect(results.first.episodeCount, 11);
+    expect(results.first.releaseYear, 2026);
+    expect(results.first.airDateIso, '2026-01-14');
+    expect(results.first.rating, '8.6');
+    expect(
+        results.first.trailerUrl, 'https://www.youtube.com/watch?v=trailer123');
+  });
+
+  test('falls back to AniList random when Jikan random fails', () async {
+    final requestedHosts = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedHosts.add(request.url.host);
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response(
+            '{"status":504,"message":"Jikan failed"}',
+            504,
+            request: request,
+          );
+        }
+        expect(request.url.host, 'graphql.anilist.co');
+        return http.Response(
+          jsonEncode({
+            'data': {
+              'Page': {
+                'media': [
+                  {
+                    'id': 178789,
+                    'idMal': 59193,
+                    'title': {
+                      'romaji': 'Mushoku Tensei III',
+                    },
+                    'episodes': 14,
+                    'format': 'TV',
+                    'averageScore': 88,
+                    'startDate': {'year': 2026},
+                    'coverImage': {
+                      'large': 'https://anilist.test/mushoku.jpg',
+                    },
+                  }
+                ],
+              },
+            },
+          }),
+          200,
+          request: request,
+        );
+      }),
+    );
+
+    final candidate = await service.fetchCatalogRandomFallback(attempts: 1);
+
+    expect(requestedHosts, ['api.jikan.moe', 'graphql.anilist.co']);
+    expect(candidate?.catalogId, 59193);
+    expect(candidate?.title, 'Mushoku Tensei III');
+    expect(candidate?.format, 'TV');
   });
 
   test('fetches Jikan catalog recommendations as candidates', () async {
@@ -646,6 +979,151 @@ void main() {
         'https://image.tmdb.org/t/p/w780/season3-14.jpg');
   });
 
+  test('uses AniList episodes as catalog base and TMDB only for dated stills',
+      () async {
+    final requestedTmdbPaths = <String>[];
+    final service = RemoteCatalogService(
+      tmdbApiKey: 'tmdb-key',
+      client: MockClient((request) async {
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response('Jikan unavailable', 504, request: request);
+        }
+        if (request.url.host == 'animeav1.com') {
+          return http.Response('', 404, request: request);
+        }
+        if (request.url.host == 'graphql.anilist.co') {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          final query = body['query'] as String;
+          if (query.contains('AnimeDetail')) {
+            return http.Response.bytes(
+              utf8.encode(jsonEncode({
+                'data': {
+                  'Media': {
+                    'id': 182587,
+                    'idMal': 60058,
+                    'title': {
+                      'romaji': '[Oshi no Ko] 3rd Season',
+                      'native': '【推しの子】第3期',
+                    },
+                    'synonyms': ['My Star Season 3'],
+                    'description': 'AniList detail',
+                    'episodes': 11,
+                    'format': 'TV',
+                    'averageScore': 87,
+                    'startDate': {
+                      'year': 2026,
+                      'month': 1,
+                      'day': 14,
+                    },
+                    'coverImage': {
+                      'extraLarge': 'https://anilist.test/oshi3.jpg',
+                    },
+                    'bannerImage': 'https://anilist.test/oshi3-bg.jpg',
+                  },
+                },
+              })),
+              200,
+              request: request,
+              headers: {'content-type': 'application/json; charset=utf-8'},
+            );
+          }
+          if (query.contains('AnimeAiring')) {
+            return http.Response(
+              jsonEncode({
+                'data': {
+                  'Media': {
+                    'airingSchedule': {
+                      'nodes': [
+                        {'episode': 1, 'airingAt': 1768399200},
+                      ],
+                      'pageInfo': {'hasNextPage': false},
+                    },
+                  },
+                },
+              }),
+              200,
+              request: request,
+            );
+          }
+        }
+        if (request.url.host == 'api.themoviedb.org') {
+          requestedTmdbPaths.add(request.url.path);
+          return switch (request.url.path) {
+            '/3/tv/203737' => http.Response.bytes(
+                utf8.encode(jsonEncode({
+                  'id': 203737,
+                  'name': 'Oshi no Ko',
+                  'original_name': '【推しの子】',
+                  'first_air_date': '2023-04-12',
+                  'overview': 'TMDB detail',
+                  'poster_path': '/poster.jpg',
+                  'backdrop_path': '/backdrop.jpg',
+                  'external_ids': {'tvdb_id': 0},
+                  'seasons': [
+                    {
+                      'season_number': 1,
+                      'episode_count': 11,
+                      'air_date': '2023-04-12',
+                    },
+                    {
+                      'season_number': 3,
+                      'episode_count': 11,
+                      'air_date': '2026-01-14',
+                    },
+                  ],
+                })),
+                200,
+                request: request,
+                headers: {'content-type': 'application/json; charset=utf-8'},
+              ),
+            '/3/tv/203737/images' ||
+            '/3/tv/203737/season/3/images' =>
+              http.Response('{"logos":[],"posters":[]}', 200, request: request),
+            '/3/tv/203737/season/3' => http.Response(
+                jsonEncode({
+                  'episodes': [
+                    {
+                      'episode_number': 13,
+                      'name': 'TMDB absolute episode',
+                      'overview': 'TMDB image source',
+                      'still_path': '/oshi-absolute-13.jpg',
+                      'runtime': 24,
+                      'air_date': '2026-01-14',
+                    },
+                  ],
+                }),
+                200,
+                request: request,
+              ),
+            _ => http.Response('{"results":[]}', 200, request: request),
+          };
+        }
+        return http.Response('', 404, request: request);
+      }),
+    );
+
+    final series = await service.buildImportSeries(
+      const RemoteSearchCandidate(
+        provider: RemoteProvider.catalog,
+        slug: '60058',
+        title: '[Oshi no Ko] 3rd Season',
+        watchUrl: 'https://myanimelist.net/anime/60058',
+        episodeCount: 11,
+        format: 'TV',
+        releaseYear: 2026,
+        catalogId: 60058,
+      ),
+      existingNames: const [],
+    );
+
+    expect(series.episodes, hasLength(11));
+    expect(requestedTmdbPaths, contains('/3/tv/203737/season/3'));
+    expect(series.episodes.first.episodeNumber, 1);
+    expect(series.episodes.first.airDateIso, '2026-01-14T14:00:00.000Z');
+    expect(series.episodes.first.imageUrl,
+        'https://image.tmdb.org/t/p/w780/oshi-absolute-13.jpg');
+  });
+
   test('enriches imported catalog series with Jikan episodes and cast',
       () async {
     final service = RemoteCatalogService(
@@ -714,6 +1192,100 @@ void main() {
     expect(series.episodes.single.durationLabel, '25 min');
     expect(series.episodes.single.airDateIso, '2024-05-06T00:00:00+00:00');
     expect(series.episodes.single.imageUrl, 'https://jikan.test/episode-1.jpg');
+  });
+
+  test('enriches imported catalog series with AniList detail when Jikan fails',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response('Jikan failed', 504, request: request);
+        }
+        if (request.url.host == 'api.myanimelist.net') {
+          return http.Response('MAL failed', 500, request: request);
+        }
+        if (request.url.host == 'animeav1.com') {
+          return http.Response('', 404, request: request);
+        }
+        if (request.url.host == 'graphql.anilist.co') {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          final query = body['query'] as String;
+          if (query.contains('AnimeDetail')) {
+            return http.Response.bytes(
+              utf8.encode(jsonEncode({
+                'data': {
+                  'Media': {
+                    'id': 182587,
+                    'idMal': 60058,
+                    'title': {
+                      'romaji': '[Oshi no Ko] 3rd Season',
+                      'native': '【推しの子】第3期',
+                    },
+                    'synonyms': ['My Star Season 3'],
+                    'description': 'AniList detail',
+                    'episodes': 11,
+                    'format': 'TV',
+                    'averageScore': 87,
+                    'startDate': {
+                      'year': 2026,
+                      'month': 1,
+                      'day': 14,
+                    },
+                    'coverImage': {
+                      'extraLarge': 'https://anilist.test/oshi3.jpg',
+                    },
+                    'bannerImage': 'https://anilist.test/oshi3-bg.jpg',
+                  },
+                },
+              })),
+              200,
+              request: request,
+              headers: {'content-type': 'application/json; charset=utf-8'},
+            );
+          }
+          if (query.contains('AnimeAiring')) {
+            return http.Response(
+              jsonEncode({
+                'data': {
+                  'Media': {
+                    'airingSchedule': {
+                      'nodes': [
+                        {'episode': 1, 'airingAt': 1768399200},
+                        {'episode': 2, 'airingAt': 1769004000},
+                      ],
+                      'pageInfo': {'hasNextPage': false},
+                    },
+                  },
+                },
+              }),
+              200,
+              request: request,
+            );
+          }
+        }
+        return http.Response('', 404, request: request);
+      }),
+    );
+
+    final series = await service.buildImportSeries(
+      const RemoteSearchCandidate(
+        provider: RemoteProvider.catalog,
+        slug: '60058',
+        title: '[Oshi no Ko] 3rd Season',
+        watchUrl: 'https://myanimelist.net/anime/60058',
+        episodeCount: 11,
+        format: 'TV',
+        releaseYear: 2026,
+        catalogId: 60058,
+      ),
+      existingNames: const [],
+    );
+
+    expect(series.name, '[Oshi no Ko] 3rd Season');
+    expect(series.episodes, hasLength(11));
+    expect(series.episodes.first.airDateIso, '2026-01-14T14:00:00.000Z');
+    expect(series.episodes[1].airDateIso, '2026-01-21T14:00:00.000Z');
+    expect(series.episodes.first.imageUrl, 'https://anilist.test/oshi3.jpg');
   });
 
   test('resolves a catalog episode through provider search', () async {
@@ -1311,6 +1883,12 @@ void main() {
     expect(stream?.pageUrl, targetUrl);
     expect(stream?.playbackUrl, startsWith('http'));
     expect(stream?.playbackKind, anyOf('mp4', 'direct'));
+
+    final probe = await _probeMediaUrlWithFfprobe(stream!.playbackUrl);
+    expect(probe.exitCode, 0, reason: probe.stderr);
+    expect(probe.streamTypes, contains('video'));
+    expect(probe.streamTypes, contains('audio'));
+    expect(probe.duration, greaterThan(1400));
   }, skip: io.Platform.environment['RUN_YOUTUBE_STREAM_PROBE'] != '1');
 
   test('probes real YouTube with yt-dlp direct stream', () async {
@@ -1444,6 +2022,168 @@ void main() {
     expect(stream?.server, 'bilibili-2');
     expect(stream?.pageUrl, 'https://www.bilibili.tv/en/video/222');
     expect(requestedUrls, contains(page222));
+  });
+
+  test('resolves Internet Archive episode and rejects longplay results',
+      () async {
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        if (request.url.host == 'archive.org' &&
+            request.url.path == '/advancedsearch.php') {
+          expect(
+            request.url.queryParameters['q'],
+            'Kaitou Saint Tail AND mediatype:movies',
+          );
+          expect(
+            request.url.queryParametersAll['fl[]'],
+            containsAll(['identifier', 'title', 'description']),
+          );
+          return http.Response(
+            jsonEncode({
+              'response': {
+                'docs': [
+                  {
+                    'identifier': 'kaitou-saint-tail-longplay',
+                    'title': 'Sega Master System Longplay - Kaitou Saint Tail',
+                    'description': 'Video game longplay',
+                    'year': 2025,
+                  },
+                  {
+                    'identifier': 'las-aventuras-de-saint-tail',
+                    'title': 'Las Aventuras de Saint Tail',
+                    'description': 'Serie completa',
+                    'year': 2014,
+                  },
+                ],
+              },
+            }),
+            200,
+            request: request,
+          );
+        }
+        if (request.url.toString() ==
+            'https://archive.org/metadata/las-aventuras-de-saint-tail') {
+          return http.Response(
+            jsonEncode({
+              'files': [
+                {
+                  'name':
+                      'Las Aventuras de Saint Tail Capitulo 01 Espanol Latino HD.avi',
+                  'source': 'original',
+                  'format': 'AVI',
+                  'length': '1495',
+                },
+                {
+                  'name':
+                      'Las Aventuras de Saint Tail Capitulo 01 Espanol Latino HD.mp4',
+                  'source': 'derivative',
+                  'format': 'MPEG4',
+                  'length': '1495',
+                },
+                {
+                  'name':
+                      'Las Aventuras de Saint Tail Capitulo 02 Espanol Latino HD.mp4',
+                  'source': 'derivative',
+                  'format': 'MPEG4',
+                  'length': '1764',
+                },
+                {
+                  'name':
+                      'Las Aventuras de Saint Tail 100% extra Capitulo 99.mp4',
+                  'source': 'derivative',
+                  'format': 'MPEG4',
+                  'length': '60',
+                },
+              ],
+            }),
+            200,
+            request: request,
+          );
+        }
+        if (request.url.toString() ==
+            'https://archive.org/details/las-aventuras-de-saint-tail/'
+                'Las%20Aventuras%20de%20Saint%20Tail%20Capitulo%2001%20Espanol%20Latino%20HD.mp4') {
+          final playlist = jsonEncode([
+            {
+              'title':
+                  'Las Aventuras de Saint Tail Capitulo 01 Espanol Latino HD',
+              'orig':
+                  'Las Aventuras de Saint Tail Capitulo 01 Espanol Latino HD.mp4',
+              'duration': 1495,
+              'sources': [
+                {
+                  'file':
+                      '/download/las-aventuras-de-saint-tail/Las%20Aventuras%20de%20Saint%20Tail%20Capitulo%2001%20Espanol%20Latino%20HD.mp4',
+                  'type': 'mp4',
+                  'height': '1080',
+                },
+              ],
+            },
+            {
+              'title':
+                  'Las Aventuras de Saint Tail Capitulo 02 Espanol Latino HD',
+              'orig':
+                  'Las Aventuras de Saint Tail Capitulo 02 Espanol Latino HD.mp4',
+              'duration': 1764,
+              'sources': [
+                {
+                  'file':
+                      '/download/las-aventuras-de-saint-tail/Las%20Aventuras%20de%20Saint%20Tail%20Capitulo%2002%20Espanol%20Latino%20HD.mp4',
+                  'type': 'mp4',
+                  'height': '1080',
+                },
+              ],
+            },
+          ]).replaceAll('"', '&quot;');
+          return http.Response(
+            '<html><body><play-av playlist="$playlist"></play-av></body></html>',
+            200,
+            request: request,
+          );
+        }
+        return http.Response('', 404, request: request);
+      }),
+    );
+    addTearDown(service.close);
+
+    final resolvedEpisode = await service.resolveProviderEpisode(
+      series: _kaitouSaintTailSeries(),
+      episode: _kaitouSaintTailEpisode(),
+      provider: RemoteProvider.internetArchive,
+    );
+
+    expect(resolvedEpisode, isNotNull);
+    expect(resolvedEpisode?.provider, RemoteProvider.internetArchive);
+    expect(
+      resolvedEpisode?.filePath,
+      'https://archive.org/download/las-aventuras-de-saint-tail/'
+      'Las%20Aventuras%20de%20Saint%20Tail%20Capitulo%2001%20Espanol%20Latino%20HD.mp4',
+    );
+    expect(
+      resolvedEpisode?.watchUrl,
+      'https://archive.org/details/las-aventuras-de-saint-tail/'
+      'Las%20Aventuras%20de%20Saint%20Tail%20Capitulo%2001%20Espanol%20Latino%20HD.mp4',
+    );
+    expect(resolvedEpisode?.relativePath, contains('Internet Archive /'));
+    expect(resolvedEpisode?.durationLabel, '24:55');
+    expect(
+      requestedUrls,
+      isNot(
+          contains('https://archive.org/metadata/kaitou-saint-tail-longplay')),
+    );
+
+    final stream = await service.resolveDirectStream(resolvedEpisode!);
+    expect(stream?.provider, RemoteProvider.internetArchive);
+    expect(stream?.server, 'archive-direct');
+    expect(
+      stream?.playbackUrl,
+      'https://archive.org/download/las-aventuras-de-saint-tail/'
+      'Las%20Aventuras%20de%20Saint%20Tail%20Capitulo%2001%20Espanol%20Latino%20HD.mp4',
+    );
+    expect(stream?.pageUrl, resolvedEpisode.watchUrl);
+    expect(stream?.httpHeaders['X-Tanuki-Duration-Seconds'], '1495');
   });
 
   test('filters JKAnime hosts by payload server labels', () async {
@@ -3216,6 +3956,53 @@ EpisodeItem _episode({
     provider: provider,
     slug: slug,
     watchUrl: watchUrl,
+  );
+}
+
+Future<
+    ({
+      int exitCode,
+      Set<String> streamTypes,
+      double duration,
+      String stderr
+    })> _probeMediaUrlWithFfprobe(String url) async {
+  final probe = await io.Process.run(
+    'ffprobe',
+    [
+      '-v',
+      'error',
+      '-print_format',
+      'json',
+      '-show_streams',
+      '-show_format',
+      url,
+    ],
+  ).timeout(const Duration(seconds: 45));
+  if (probe.exitCode != 0) {
+    return (
+      exitCode: probe.exitCode,
+      streamTypes: <String>{},
+      duration: 0.0,
+      stderr: '${probe.stderr}\n${probe.stdout}',
+    );
+  }
+  final decoded = jsonDecode('${probe.stdout}') as Map<String, dynamic>;
+  final streams = (decoded['streams'] as List? ?? const [])
+      .whereType<Map<String, dynamic>>()
+      .toList();
+  final streamTypes = streams
+      .map((entry) => '${entry['codec_type']}'.trim())
+      .where((entry) => entry.isNotEmpty)
+      .toSet();
+  final duration = double.tryParse(
+        '${(decoded['format'] as Map<String, dynamic>?)?['duration']}',
+      ) ??
+      0;
+  return (
+    exitCode: probe.exitCode,
+    streamTypes: streamTypes,
+    duration: duration,
+    stderr: '${probe.stderr}',
   );
 }
 

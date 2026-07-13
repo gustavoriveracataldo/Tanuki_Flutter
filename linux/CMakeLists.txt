@@ -137,6 +137,15 @@ if(TARGET media_kit_video_plugin)
   )
 endif()
 
+# dart_vlc has a warning in its native wrapper with newer GCC/Clang. The app
+# still builds with project-wide -Werror, so keep that warning from failing the
+# Linux desktop player backend.
+if(TARGET dart_vlc_plugin)
+  target_compile_options(dart_vlc_plugin PRIVATE
+    -Wno-error=delete-incomplete
+  )
+endif()
+
 # === Installation ===
 # By default, "installing" just makes a relocatable bundle in the build
 # directory.

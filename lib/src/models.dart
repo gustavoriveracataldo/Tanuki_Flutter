@@ -10,6 +10,7 @@ enum RemoteProvider {
   latAnime,
   animeFlv,
   facebook,
+  internetArchive,
   bilibili,
   youtube,
   catalog,
@@ -33,6 +34,7 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.latAnime => 'latanime',
       RemoteProvider.animeFlv => 'animeflv',
       RemoteProvider.facebook => 'facebook',
+      RemoteProvider.internetArchive => 'internetarchive',
       RemoteProvider.bilibili => 'bilibili',
       RemoteProvider.youtube => 'youtube',
       RemoteProvider.catalog => 'catalog',
@@ -47,6 +49,7 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.latAnime => 'LatAnime',
       RemoteProvider.animeFlv => 'AnimeFLV',
       RemoteProvider.facebook => 'Facebook',
+      RemoteProvider.internetArchive => 'Internet Archive',
       RemoteProvider.bilibili => 'BiliBili',
       RemoteProvider.youtube => 'YouTube',
       RemoteProvider.catalog => 'Catalogo',
@@ -526,6 +529,28 @@ class SeriesEpisodeMetadata {
   final String imageUrl;
   final String durationLabel;
   final String airDateIso;
+
+  factory SeriesEpisodeMetadata.fromJson(Map<String, dynamic> json) {
+    return SeriesEpisodeMetadata(
+      episodeNumber: _readInt(json['episodeNumber']),
+      title: _readString(json['title']),
+      description: _readString(json['description']),
+      imageUrl: _readString(json['imageUrl']),
+      durationLabel: _readString(json['durationLabel']),
+      airDateIso: _readString(json['airDateIso']),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'episodeNumber': episodeNumber,
+      'title': title,
+      'description': description,
+      'imageUrl': imageUrl,
+      'durationLabel': durationLabel,
+      'airDateIso': airDateIso,
+    };
+  }
 }
 
 class RemoteSearchCandidate {
@@ -1079,6 +1104,7 @@ class CandidateVisualCacheEntry {
     this.japaneseTitle = '',
     this.aliases = const [],
     this.cast = const [],
+    this.episodeDetails = const [],
     this.cachedAtMs = 0,
   });
 
@@ -1091,6 +1117,7 @@ class CandidateVisualCacheEntry {
   final String japaneseTitle;
   final List<String> aliases;
   final List<String> cast;
+  final List<SeriesEpisodeMetadata> episodeDetails;
   final int cachedAtMs;
 
   bool get hasMeaningfulContent =>
@@ -1102,7 +1129,8 @@ class CandidateVisualCacheEntry {
       rating.isNotEmpty ||
       japaneseTitle.isNotEmpty ||
       aliases.isNotEmpty ||
-      cast.isNotEmpty;
+      cast.isNotEmpty ||
+      episodeDetails.isNotEmpty;
 
   factory CandidateVisualCacheEntry.fromJson(Map<String, dynamic> json) {
     return CandidateVisualCacheEntry(
@@ -1115,6 +1143,7 @@ class CandidateVisualCacheEntry {
       japaneseTitle: _readString(json['japaneseTitle']),
       aliases: _readStringList(json['aliases']),
       cast: _readStringList(json['cast']),
+      episodeDetails: _readEpisodeMetadataList(json['episodeDetails']),
       cachedAtMs: _readInt(json['cachedAtMs']),
     );
   }
@@ -1130,9 +1159,24 @@ class CandidateVisualCacheEntry {
       'japaneseTitle': japaneseTitle,
       'aliases': aliases,
       'cast': cast,
+      'episodeDetails':
+          episodeDetails.map((episode) => episode.toJson()).toList(),
       'cachedAtMs': cachedAtMs,
     };
   }
+}
+
+List<SeriesEpisodeMetadata> _readEpisodeMetadataList(Object? value) {
+  if (value is! List) {
+    return const [];
+  }
+  return value
+      .whereType<Map>()
+      .map((entry) => SeriesEpisodeMetadata.fromJson(
+            entry.map((key, value) => MapEntry('$key', value)),
+          ))
+      .where((entry) => entry.episodeNumber >= 0)
+      .toList(growable: false);
 }
 
 class PlaylistPlaybackOrder {

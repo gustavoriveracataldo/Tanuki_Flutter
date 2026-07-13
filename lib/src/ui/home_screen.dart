@@ -45,16 +45,19 @@ class _HomeScreenState extends State<HomeScreen> {
   List<RemoteSearchCandidate> _similarResults = const [];
   List<RemoteSearchCandidate> _detailSimilarResults = const [];
   List<RemoteSearchCandidate> _homeTrendingResults = const [];
+  List<RemoteSearchCandidate> _homeAiringResults = const [];
   List<RemoteSearchCandidate> _homeMovieResults = const [];
   bool _similarLoading = false;
   bool _detailSimilarLoading = false;
   bool _homeTrendingLoading = false;
+  bool _homeAiringLoading = false;
   bool _homeMoviesLoading = false;
   bool _randomLoading = false;
   bool _detailImporting = false;
   double _animePanelScrollOffset = 0.0;
   int _detailSimilarRequest = 0;
   int _homeTrendingVisualRequest = 0;
+  int _homeAiringVisualRequest = 0;
   int _homeMovieVisualRequest = 0;
   int _handledTrailerDetailRequestId = 0;
   String _similarStatus = '';
@@ -69,6 +72,7 @@ class _HomeScreenState extends State<HomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         unawaited(_loadHomeTrending());
+        unawaited(_loadHomeAiring());
         unawaited(_loadHomeMovies());
         _handlePendingTrailerDetailRequest();
       }
@@ -215,6 +219,8 @@ class _HomeScreenState extends State<HomeScreen> {
       detailImporting: _detailImporting,
       trendingCandidates: _homeTrendingResults,
       trendingLoading: _homeTrendingLoading,
+      airingCandidates: _homeAiringResults,
+      airingLoading: _homeAiringLoading,
       movieCandidates: _homeMovieResults,
       moviesLoading: _homeMoviesLoading,
       scrollOffset: _animePanelScrollOffset,
@@ -526,6 +532,7 @@ class _HomeScreenState extends State<HomeScreen> {
   ) {
     final candidates = <RemoteSearchCandidate>[
       ..._homeTrendingResults,
+      ..._homeAiringResults,
       ..._homeMovieResults,
       ...widget.controller.remoteResults,
       ..._similarResults,
@@ -565,27 +572,58 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_homeTrendingLoading) {
       return;
     }
-    if (widget.controller.remoteResults.isNotEmpty) {
-      setState(() {
-        _homeTrendingResults =
-            widget.controller.remoteResults.take(14).toList(growable: false);
-      });
-      unawaited(_refreshHomeTrendingVisuals(_homeTrendingResults));
-      return;
-    }
     setState(() {
       _homeTrendingLoading = true;
     });
-    await widget.controller.searchRemote('');
-    if (!mounted) {
+    try {
+      final results = await widget.controller.loadHomeSeasonCandidates(
+        pages: 2,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _homeTrendingResults = results.take(18).toList(growable: false);
+        _homeTrendingLoading = false;
+      });
+      unawaited(_refreshHomeTrendingVisuals(_homeTrendingResults));
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _homeTrendingLoading = false;
+      });
+    }
+  }
+
+  Future<void> _loadHomeAiring() async {
+    if (_homeAiringLoading) {
       return;
     }
     setState(() {
-      _homeTrendingResults =
-          widget.controller.remoteResults.take(14).toList(growable: false);
-      _homeTrendingLoading = false;
+      _homeAiringLoading = true;
     });
-    unawaited(_refreshHomeTrendingVisuals(_homeTrendingResults));
+    try {
+      final results = await widget.controller.loadHomeAiringCandidates(
+        pages: 1,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _homeAiringResults = results.take(18).toList(growable: false);
+        _homeAiringLoading = false;
+      });
+      unawaited(_refreshHomeAiringVisuals(_homeAiringResults));
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _homeAiringLoading = false;
+      });
+    }
   }
 
   Future<void> _loadHomeMovies() async {
@@ -623,7 +661,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final request = ++_homeTrendingVisualRequest;
     final refreshed = await widget.controller.refreshCandidateVisuals(
       candidates,
-      limit: 14,
+      limit: 8,
+      catalogMetadataOnly: true,
     );
     if (!mounted || request != _homeTrendingVisualRequest) {
       return;
@@ -657,13 +696,32 @@ class _HomeScreenState extends State<HomeScreen> {
     final request = ++_homeMovieVisualRequest;
     final refreshed = await widget.controller.refreshCandidateVisuals(
       candidates,
-      limit: 14,
+      limit: 6,
     );
     if (!mounted || request != _homeMovieVisualRequest) {
       return;
     }
     setState(() {
       _homeMovieResults = refreshed.take(18).toList(growable: false);
+    });
+  }
+
+  Future<void> _refreshHomeAiringVisuals(
+      List<RemoteSearchCandidate> candidates) async {
+    if (candidates.isEmpty) {
+      return;
+    }
+    final request = ++_homeAiringVisualRequest;
+    final refreshed = await widget.controller.refreshCandidateVisuals(
+      candidates,
+      limit: 14,
+      catalogMetadataOnly: true,
+    );
+    if (!mounted || request != _homeAiringVisualRequest) {
+      return;
+    }
+    setState(() {
+      _homeAiringResults = refreshed.take(18).toList(growable: false);
     });
   }
 
@@ -2197,6 +2255,8 @@ class _AnimePanel extends StatelessWidget {
     required this.detailImporting,
     required this.trendingCandidates,
     required this.trendingLoading,
+    required this.airingCandidates,
+    required this.airingLoading,
     required this.movieCandidates,
     required this.moviesLoading,
     required this.scrollOffset,
@@ -2223,6 +2283,8 @@ class _AnimePanel extends StatelessWidget {
   final bool detailImporting;
   final List<RemoteSearchCandidate> trendingCandidates;
   final bool trendingLoading;
+  final List<RemoteSearchCandidate> airingCandidates;
+  final bool airingLoading;
   final List<RemoteSearchCandidate> movieCandidates;
   final bool moviesLoading;
   final double scrollOffset;
@@ -2245,10 +2307,13 @@ class _AnimePanel extends StatelessWidget {
         heroPreviewSeries ??
         (library.isEmpty ? null : library.first);
     final continueWatching = _continueWatchingEntries(controller);
-    final upcoming = _upcomingCandidates(trendingCandidates);
-    final latestMovies = _latestMovieCandidates(
-      [...movieCandidates, ...trendingCandidates],
-    );
+    final visibleAiring = _airingShelfCandidates(airingCandidates);
+    final latestMovies = movieCandidates.isNotEmpty
+        ? movieCandidates.take(10).toList(growable: false)
+        : _latestMovieCandidates(trendingCandidates);
+    final seasonTitle = controller.currentSeasonFilter.summaryLabel.isEmpty
+        ? 'Temporada actual'
+        : controller.currentSeasonFilter.summaryLabel;
 
     final screenHeight = MediaQuery.sizeOf(context).height;
     final heroHeight = (screenHeight * 0.36).clamp(320.0, 480.0);
@@ -2295,6 +2360,7 @@ class _AnimePanel extends StatelessWidget {
       panelChildren.add(fadeSection(
         nextSectionTop,
         _TrendingPosterShelf(
+          title: seasonTitle,
           controller: controller,
           candidates: trendingCandidates,
           loading: trendingLoading,
@@ -2306,11 +2372,16 @@ class _AnimePanel extends StatelessWidget {
       panelChildren.add(const SizedBox(height: sectionGap));
       nextSectionTop += sectionHeight + sectionGap;
     }
-    if (upcoming.isNotEmpty) {
+    if (visibleAiring.isNotEmpty || airingLoading) {
       panelChildren.add(fadeSection(
         nextSectionTop,
         _UpcomingPosterShelf(
-          candidates: upcoming,
+          title: 'En Emision',
+          trailing: airingLoading && visibleAiring.isEmpty
+              ? 'Cargando...'
+              : '${visibleAiring.length} series',
+          candidates: visibleAiring,
+          loading: airingLoading,
           controller: controller,
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
@@ -3934,6 +4005,7 @@ class _SpaceDialogOption extends StatelessWidget {
 
 class _TrendingPosterShelf extends StatelessWidget {
   const _TrendingPosterShelf({
+    required this.title,
     required this.controller,
     required this.candidates,
     required this.loading,
@@ -3942,6 +4014,7 @@ class _TrendingPosterShelf extends StatelessWidget {
     required this.onPlayTrailers,
   });
 
+  final String title;
   final AppController controller;
   final List<RemoteSearchCandidate> candidates;
   final bool loading;
@@ -3966,7 +4039,7 @@ class _TrendingPosterShelf extends StatelessWidget {
           children: [
             Expanded(
               child: _SectionHeader(
-                title: 'Tendencias',
+                title: title,
                 trailing: loading
                     ? 'Cargando portada...'
                     : '${visibleCandidates.length} series',
@@ -4302,8 +4375,10 @@ class _ContinueWatchingShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final posterHeight = _homeShelfPosterHeight(context, screenFactor: 0.235);
-    final posterWidth = posterHeight * 0.7;
+    final cardHeight =
+        (_homeShelfPosterHeight(context, screenFactor: 0.205) * 0.58)
+            .clamp(142.0, 188.0);
+    final cardWidth = cardHeight * (16 / 9);
 
     void focusEntry(_ContinueWatchingEntry entry) {
       _ensureFocusedShelfVisible(context);
@@ -4322,7 +4397,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         SizedBox(
-          height: posterHeight + 16,
+          height: cardHeight + 16,
           child: _HorizontalFocusShelf(
             child: ListView.separated(
               clipBehavior: Clip.none,
@@ -4331,10 +4406,12 @@ class _ContinueWatchingShelf extends StatelessWidget {
               itemBuilder: (context, index) {
                 final entry = entries[index];
                 return _ContinueWatchingPosterCard(
-                  width: posterWidth,
-                  height: posterHeight,
+                  width: cardWidth,
+                  height: cardHeight,
                   entry: entry,
-                  onTap: () => onPlayEpisode(entry.episode),
+                  onTap: entry.enabled
+                      ? () => onPlayEpisode(entry.episode)
+                      : () {},
                   onGoToSeries: entry.series == null
                       ? null
                       : () => onGoToSeries(entry.series!),
@@ -4375,6 +4452,12 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final episodeTitle = entry.episode.displayName.trim();
+    final baseEpisodeLabel = 'Episodio ${entry.episode.episodeNumber}';
+    final episodeLabel =
+        episodeTitle.isEmpty || episodeTitle == baseEpisodeLabel
+            ? baseEpisodeLabel
+            : '$baseEpisodeLabel - $episodeTitle';
     return SizedBox(
       width: width,
       height: height,
@@ -4388,31 +4471,15 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            _Poster(imageUrl: entry.imageUrl, title: entry.seriesName),
-            Positioned(
-              left: 5,
-              top: 5,
-              child: Container(
-                width: 28,
-                height: 28,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: const Color(0xD6101822),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: TanukiColors.orangeHot, width: 2),
-                ),
-                child: Text(
-                  entry.episodeCount > 0 ? '${entry.episodeCount}' : '?',
-                  maxLines: 1,
-                  overflow: TextOverflow.fade,
-                  style: const TextStyle(
-                    color: TanukiColors.text,
-                    fontSize: 9,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
+            _FadeInNetworkImage(
+              imageUrl: entry.imageUrl,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => _Poster(
+                imageUrl: entry.series?.imageUrl ?? '',
+                title: entry.seriesName,
               ),
             ),
+            if (!entry.enabled) const ColoredBox(color: Color(0x99000000)),
             Positioned(
               left: 0,
               right: 0,
@@ -4429,34 +4496,52 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
               left: 0,
               right: 0,
               bottom: 3,
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
-                color: const Color(0xB010161D),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      entry.seriesName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: TanukiColors.text,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w800,
+              child: DecoratedBox(
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Colors.transparent, Color(0xE010161D)],
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 26, 10, 9),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        entry.seriesName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: TanukiColors.text,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      _formatContinueWatchingMeta(entry),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Color(0xFFB1C0CF),
-                        fontSize: 9,
+                      const SizedBox(height: 3),
+                      Text(
+                        episodeLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xFFB1C0CF),
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
-                    ),
-                  ],
+                      if (entry.scheduleLabel.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: _ScheduleChip(
+                            text: entry.scheduleLabel,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -5034,7 +5119,7 @@ class _SearchResultPosterCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheduleLabel = _scheduleChipLabel(candidate.airDateIso);
+    final scheduleLabel = _candidateScheduleChipLabel(candidate);
     return _FocusablePosterSurface(
       onTap: onTap,
       onFocused: onFocused,
@@ -5787,6 +5872,8 @@ class _ContinueWatchingEntry {
     required this.watchedCount,
     required this.progress,
     required this.isCurrent,
+    required this.enabled,
+    required this.scheduleLabel,
   });
 
   final SeriesItem? series;
@@ -5797,6 +5884,8 @@ class _ContinueWatchingEntry {
   final int watchedCount;
   final double progress;
   final bool isCurrent;
+  final bool enabled;
+  final String scheduleLabel;
 }
 
 List<_ContinueWatchingEntry> _continueWatchingEntries(
@@ -5836,13 +5925,19 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
       continue;
     }
 
-    final episode = currentForSeries
-        ? current
-        : partialEpisode ?? controller.firstPlayableEpisode(series);
+    final episode = _continueWatchingEpisodeForSeries(
+      controller,
+      series,
+      current: current,
+      currentForSeries: currentForSeries,
+      partialEpisode: partialEpisode,
+      watched: watched,
+    );
     if (episode == null) {
       continue;
     }
 
+    final futureEpisode = _episodeAirsInFuture(episode.airDateIso);
     final playback = controller.playbackForEpisode(episode);
     final playbackProgress = _playbackProgress(playback);
     final seriesProgress =
@@ -5852,12 +5947,15 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         series: series,
         seriesName: series.name,
         imageUrl:
-            series.imageUrl.isNotEmpty ? series.imageUrl : episode.imageUrl,
+            episode.imageUrl.isNotEmpty ? episode.imageUrl : series.imageUrl,
         episode: episode,
         episodeCount: total,
         watchedCount: watched,
         progress: playbackProgress > 0 ? playbackProgress : seriesProgress,
         isCurrent: currentForSeries,
+        enabled: !futureEpisode,
+        scheduleLabel:
+            futureEpisode ? _scheduleChipLabel(episode.airDateIso) : '',
       ),
     );
     seenKeys.add(seriesKey);
@@ -5880,6 +5978,10 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         watchedCount: 0,
         progress: _playbackProgress(playback),
         isCurrent: true,
+        enabled: !_episodeAirsInFuture(current.airDateIso),
+        scheduleLabel: _episodeAirsInFuture(current.airDateIso)
+            ? _scheduleChipLabel(current.airDateIso)
+            : '',
       ),
     );
   }
@@ -6000,6 +6102,32 @@ EpisodeItem? _partialPlaybackEpisode(
   return null;
 }
 
+EpisodeItem? _continueWatchingEpisodeForSeries(
+  AppController controller,
+  SeriesItem series, {
+  required EpisodeItem? current,
+  required bool currentForSeries,
+  required EpisodeItem? partialEpisode,
+  required int watched,
+}) {
+  if (currentForSeries) {
+    return current;
+  }
+  if (partialEpisode != null) {
+    return partialEpisode;
+  }
+  final episodes = [...series.episodes]..sort(
+      (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
+    );
+  if (episodes.isEmpty) {
+    return null;
+  }
+  if (watched >= 0 && watched < episodes.length) {
+    return episodes[watched];
+  }
+  return controller.firstPlayableEpisode(series);
+}
+
 double _playbackProgress(EpisodePlaybackRecord? playback) {
   if (playback == null) {
     return 0;
@@ -6020,24 +6148,15 @@ String _seriesKeyForEpisode(EpisodeItem episode) {
       : normalizeSeriesKey(episode.seriesName);
 }
 
-String _formatContinueWatchingMeta(_ContinueWatchingEntry entry) {
-  final parts = [
-    'Ep ${entry.episode.episodeNumber}',
-    if (entry.episodeCount > 0)
-      '${(entry.episodeCount - entry.watchedCount).clamp(0, entry.episodeCount)} pendientes',
-  ];
-  return parts.join(' | ');
-}
-
 List<RemoteSearchCandidate> _upcomingCandidates(
   Iterable<RemoteSearchCandidate> candidates,
 ) {
   final upcoming = candidates
-      .where((candidate) => _scheduleChipLabel(candidate.airDateIso).isNotEmpty)
+      .where((candidate) => _candidateScheduleChipLabel(candidate).isNotEmpty)
       .toList();
   upcoming.sort((left, right) {
-    final leftDate = _candidateAirDate(left);
-    final rightDate = _candidateAirDate(right);
+    final leftDate = _candidateNextAirDate(left);
+    final rightDate = _candidateNextAirDate(right);
     if (leftDate == null && rightDate == null) {
       return left.title.toLowerCase().compareTo(right.title.toLowerCase());
     }
@@ -6054,6 +6173,45 @@ List<RemoteSearchCandidate> _upcomingCandidates(
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
   return upcoming.take(10).toList(growable: false);
+}
+
+List<RemoteSearchCandidate> _airingShelfCandidates(
+  Iterable<RemoteSearchCandidate> candidates,
+) {
+  final byTitle = <String, RemoteSearchCandidate>{};
+  for (final candidate in candidates) {
+    final key = _seriesTitleDedupeKey(candidate.title);
+    if (key.isEmpty) {
+      continue;
+    }
+    final current = byTitle[key];
+    if (current == null ||
+        _candidateSortDate(candidate).compareTo(_candidateSortDate(current)) <
+            0) {
+      byTitle[key] = candidate;
+    }
+  }
+  final ordered = byTitle.values.toList(growable: false);
+  ordered.sort((left, right) {
+    final leftNext = _candidateNextAirDate(left);
+    final rightNext = _candidateNextAirDate(right);
+    if (leftNext != null && rightNext != null) {
+      final dateCompare = leftNext.compareTo(rightNext);
+      if (dateCompare != 0) {
+        return dateCompare;
+      }
+    } else if (leftNext != null) {
+      return -1;
+    } else if (rightNext != null) {
+      return 1;
+    }
+    final yearCompare = right.releaseYear.compareTo(left.releaseYear);
+    if (yearCompare != 0) {
+      return yearCompare;
+    }
+    return left.title.toLowerCase().compareTo(right.title.toLowerCase());
+  });
+  return ordered.take(10).toList(growable: false);
 }
 
 List<RemoteSearchCandidate> _latestMovieCandidates(
@@ -6099,7 +6257,44 @@ bool _candidateLooksMovieForHome(RemoteSearchCandidate candidate) {
 }
 
 DateTime? _candidateAirDate(RemoteSearchCandidate candidate) {
-  final normalized = candidate.airDateIso.trim();
+  return _parseAirDate(candidate.airDateIso);
+}
+
+DateTime _candidateSortDate(RemoteSearchCandidate candidate) {
+  return _candidateNextAirDate(candidate) ??
+      _candidateAirDate(candidate) ??
+      DateTime(9999);
+}
+
+DateTime? _candidateNextAirDate(RemoteSearchCandidate candidate) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final datedEpisodes = candidate.episodeDetails
+      .map((episode) => _parseAirDate(episode.airDateIso))
+      .whereType<DateTime>()
+      .where((date) => !date.isBefore(today))
+      .toList(growable: false)
+    ..sort();
+  if (datedEpisodes.isNotEmpty) {
+    return datedEpisodes.first;
+  }
+  final candidateDate = _candidateAirDate(candidate);
+  if (candidateDate != null && !candidateDate.isBefore(today)) {
+    return candidateDate;
+  }
+  return null;
+}
+
+String _candidateScheduleChipLabel(RemoteSearchCandidate candidate) {
+  final date = _candidateNextAirDate(candidate);
+  if (date == null) {
+    return '';
+  }
+  return _scheduleChipLabel(date.toIso8601String());
+}
+
+DateTime? _parseAirDate(String airDateIso) {
+  final normalized = airDateIso.trim();
   if (normalized.isEmpty) {
     return null;
   }

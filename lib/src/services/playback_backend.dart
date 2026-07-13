@@ -24,8 +24,6 @@ class PlaybackBackend {
       _mediaKitAvailable = false;
       _initializationError = error;
       debugPrint('media_kit unavailable: $error');
-
-      rethrow;
     } finally {
       _initialized = true;
     }

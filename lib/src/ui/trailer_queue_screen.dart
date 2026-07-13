@@ -4,8 +4,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:webview_all/webview_all.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
 import 'toonami_theme.dart';
 
@@ -672,6 +672,10 @@ String _extractYouTubeVideoId(String trailerUrl) {
     }
   }
   return '';
+}
+
+String youtubeVideoIdFromUrl(String url) {
+  return _extractYouTubeVideoId(url);
 }
 
 bool isYouTubeTrailerUrl(String trailerUrl) {

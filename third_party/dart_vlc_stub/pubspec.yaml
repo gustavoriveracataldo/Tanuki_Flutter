@@ -1,0 +1,11 @@
+name: dart_vlc
+description: Local compile-time stub used when native VLC is disabled.
+version: 0.4.0
+publish_to: "none"
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter

@@ -1385,6 +1385,7 @@ class AppController extends ChangeNotifier {
   Future<List<RemoteSearchCandidate>> refreshCandidateVisuals(
     List<RemoteSearchCandidate> candidates, {
     int limit = 12,
+    bool catalogMetadataOnly = false,
   }) async {
     final cached = _applyVisualCacheToCandidates(candidates);
     final targets = cached
@@ -1402,7 +1403,9 @@ class AppController extends ChangeNotifier {
     );
     for (final candidate in targets) {
       try {
-        final enriched = await _remoteCatalog.enrichCandidateVisuals(candidate);
+        final enriched = catalogMetadataOnly
+            ? await _remoteCatalog.enrichCatalogCandidateMetadata(candidate)
+            : await _remoteCatalog.enrichCandidateVisuals(candidate);
         final key = _visualCacheKeyForCandidate(enriched);
         final entry = _visualCacheEntryForCandidate(enriched);
         if (key.isNotEmpty &&
@@ -1443,6 +1446,54 @@ class AppController extends ChangeNotifier {
       _applyVisualCacheToCandidates(_activeRemoteCandidates(results)),
     );
   }
+
+  Future<List<RemoteSearchCandidate>> loadHomeSeasonCandidates({
+    int pages = 2,
+  }) async {
+    final current = currentSeasonFilter;
+    final targetPages = pages.clamp(1, 4).toInt();
+    final results = <RemoteSearchCandidate>[];
+    for (var page = 1; page <= targetPages; page += 1) {
+      final pageResults = await _remoteCatalog.discoverCatalogBySeason(
+        season: current.season,
+        year: current.year,
+        page: page,
+      );
+      results.addAll(pageResults);
+      if (pageResults.length < 20) {
+        break;
+      }
+    }
+    return _dedupeCandidates(
+      _applyVisualCacheToCandidates(_activeRemoteCandidates(results)),
+    );
+  }
+
+  Future<List<RemoteSearchCandidate>> loadHomeAiringCandidates({
+    int pages = 1,
+  }) async {
+    final targetPages = pages.clamp(1, 4).toInt();
+    final results = <RemoteSearchCandidate>[];
+    for (var page = 1; page <= targetPages; page += 1) {
+      final pageResults = await _remoteCatalog.discoverCatalogAiring(
+        page: page,
+        limit: 25,
+      );
+      results.addAll(pageResults);
+      if (pageResults.length < 20) {
+        break;
+      }
+    }
+    return _dedupeCandidates(
+      _applyVisualCacheToCandidates(_activeRemoteCandidates(results)),
+    );
+  }
+
+  SearchSeasonFilter get currentSeasonFilter =>
+      SearchSeasonFilter.options().firstWhere(
+        (filter) => !filter.isAll,
+        orElse: () => const SearchSeasonFilter(),
+      );
 
   Future<void> _refreshRemoteResultVisuals() async {
     final source = _remoteBaseResults;
@@ -1794,37 +1845,34 @@ class AppController extends ChangeNotifier {
             episodes: [episode],
             releaseYear: episode.releaseYear,
           );
-      if (series != null) {
-        for (final provider in _dynamicRemoteProviderOrder(preferredProvider)
-            .where((provider) => !excluded.contains(provider))) {
-          _debugRemotePlayback('lookup provider candidate ${provider.id}');
-          final libraryEpisode = _resolvePreferredRemoteEpisode(
-            episode,
-            provider,
-          );
-          final providerEpisode = libraryEpisode != episode
-              ? libraryEpisode
-              : await _remoteCatalog.resolveProviderEpisode(
-                  series: series,
-                  episode: episode,
-                  provider: provider,
-                );
-          if (providerEpisode == null) {
-            _debugRemotePlayback(
-                'provider ${provider.id} has no episode match');
-            continue;
-          }
-          final stream = await resolve(providerEpisode);
-          if (stream != null) {
-            final tagged = _tagDirectStreamProvider(stream, provider);
-            _debugRemotePlayback(
-              'lookup selected provider=${provider.id} '
-              '${_debugStreamLabel(tagged)}',
-            );
-            return tagged;
-          }
-          _debugRemotePlayback('provider ${provider.id} returned null stream');
+      for (final provider in _dynamicRemoteProviderOrder(preferredProvider)
+          .where((provider) => !excluded.contains(provider))) {
+        _debugRemotePlayback('lookup provider candidate ${provider.id}');
+        final libraryEpisode = _resolvePreferredRemoteEpisode(
+          episode,
+          provider,
+        );
+        final providerEpisode = libraryEpisode != episode
+            ? libraryEpisode
+            : await _remoteCatalog.resolveProviderEpisode(
+                series: series,
+                episode: episode,
+                provider: provider,
+              );
+        if (providerEpisode == null) {
+          _debugRemotePlayback('provider ${provider.id} has no episode match');
+          continue;
         }
+        final stream = await resolve(providerEpisode);
+        if (stream != null) {
+          final tagged = _tagDirectStreamProvider(stream, provider);
+          _debugRemotePlayback(
+            'lookup selected provider=${provider.id} '
+            '${_debugStreamLabel(tagged)}',
+          );
+          return tagged;
+        }
+        _debugRemotePlayback('provider ${provider.id} returned null stream');
       }
       if (episode.provider == RemoteProvider.catalog) {
         _debugRemotePlayback('resolve finished null after catalog lookup');
@@ -1901,6 +1949,7 @@ class AppController extends ChangeNotifier {
       RemoteProvider.animeAv1,
       RemoteProvider.jkAnime,
       RemoteProvider.latAnime,
+      RemoteProvider.internetArchive,
       RemoteProvider.bilibili,
       RemoteProvider.youtube,
     ];
@@ -2351,7 +2400,9 @@ class AppController extends ChangeNotifier {
       airDateIso: candidate.airDateIso,
       catalogId: candidate.catalogId,
       cast: candidate.cast.isNotEmpty ? candidate.cast : cached.cast,
-      episodeDetails: candidate.episodeDetails,
+      episodeDetails: candidate.episodeDetails.isNotEmpty
+          ? candidate.episodeDetails
+          : cached.episodeDetails,
     );
   }
 
@@ -2382,11 +2433,16 @@ class AppController extends ChangeNotifier {
         before.rating != after.rating ||
         before.japaneseTitle != after.japaneseTitle ||
         before.aliases.join('\n') != after.aliases.join('\n') ||
-        before.cast.join('\n') != after.cast.join('\n');
+        before.cast.join('\n') != after.cast.join('\n') ||
+        before.episodeDetails.length != after.episodeDetails.length ||
+        before.episodeDetails.map((entry) => entry.airDateIso).join('\n') !=
+            after.episodeDetails.map((entry) => entry.airDateIso).join('\n') ||
+        before.episodeDetails.map((entry) => entry.imageUrl).join('\n') !=
+            after.episodeDetails.map((entry) => entry.imageUrl).join('\n');
   }
 
   String _visualCacheKeyForCandidate(RemoteSearchCandidate candidate) {
-    const cachePrefix = 'visual-v4';
+    const cachePrefix = 'visual-v5';
     if (candidate.catalogId > 0) {
       final yearSuffix =
           candidate.releaseYear > 0 ? ':${candidate.releaseYear}' : '';
@@ -2414,6 +2470,7 @@ class AppController extends ChangeNotifier {
       japaneseTitle: candidate.japaneseTitle,
       aliases: candidate.aliases,
       cast: candidate.cast,
+      episodeDetails: candidate.episodeDetails,
       cachedAtMs: DateTime.now().millisecondsSinceEpoch,
     );
   }
@@ -2568,6 +2625,7 @@ class AppController extends ChangeNotifier {
     return provider == RemoteProvider.animeAv1 ||
         provider == RemoteProvider.jkAnime ||
         provider == RemoteProvider.latAnime ||
+        provider == RemoteProvider.internetArchive ||
         provider == RemoteProvider.bilibili ||
         provider == RemoteProvider.youtube;
   }
@@ -4237,7 +4295,7 @@ class AppController extends ChangeNotifier {
     return value
         .replaceAll(
           RegExp(
-            r'\s*\((AnimeAV1|AnimeKai|JKAnime|LatAnime|AnimeFLV|Facebook|Catalogo)(\s+\d+)?\)\s*$',
+            r'\s*\((AnimeAV1|AnimeKai|JKAnime|LatAnime|AnimeFLV|Facebook|Internet Archive|BiliBili|YouTube|Catalogo)(\s+\d+)?\)\s*$',
             caseSensitive: false,
           ),
           '',
