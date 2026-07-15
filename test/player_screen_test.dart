@@ -5,6 +5,21 @@ import 'package:toonami_viernes_noche_flutter/src/models.dart';
 import 'package:toonami_viernes_noche_flutter/src/ui/player_screen.dart';
 
 void main() {
+  test('parses WebVTT cues with spaces around the timestamp separator', () {
+    final cues = parseRemoteCaptionCues('''WEBVTT
+
+00:00:19.510 --> 00:00:22.930
+<i>Solo en el silencio, la palabra.</i>
+Solo en la oscuridad, la luz.
+''');
+
+    expect(cues, hasLength(1));
+    expect(cues.single.start, const Duration(seconds: 19, milliseconds: 510));
+    expect(cues.single.end, const Duration(seconds: 22, milliseconds: 930));
+    expect(cues.single.text,
+        'Solo en el silencio, la palabra.\nSolo en la oscuridad, la luz.');
+  });
+
   const animeAv1ZillaStream = RemoteDirectStream(
     playbackUrl:
         'https://player.zilla-networks.com/m3u8/b340aa7e8c596a6c376adf1f44d8e2e1',

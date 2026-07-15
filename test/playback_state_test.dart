@@ -779,9 +779,14 @@ void main() {
       RemoteProvider.jkAnime,
     );
 
-    final stream = await controller.resolveRemoteDirectStream(catalogEpisode);
+    final attempts = <RemoteProvider?>[];
+    final stream = await controller.resolveRemoteDirectStream(
+      catalogEpisode,
+      onProviderAttempt: attempts.add,
+    );
 
     expect(stream?.playbackUrl, 'https://cdn.example.test/catalog-demo.m3u8');
+    expect(attempts, [RemoteProvider.jkAnime]);
     expect(
         fakeCatalog.providerRequests.single.provider, RemoteProvider.jkAnime);
     expect(fakeCatalog.providerRequests.single.episode, catalogEpisode);
@@ -997,10 +1002,15 @@ void main() {
     );
     await controller.initialize();
 
-    final stream = await controller.resolveRemoteDirectStream(catalogEpisode);
+    final attempts = <RemoteProvider?>[];
+    final stream = await controller.resolveRemoteDirectStream(
+      catalogEpisode,
+      onProviderAttempt: attempts.add,
+    );
 
     expect(stream?.provider, RemoteProvider.jkAnime);
     expect(stream?.playbackUrl, 'https://cdn.example.test/disabled-demo.m3u8');
+    expect(attempts, [RemoteProvider.animeAv1, RemoteProvider.jkAnime]);
     expect(
       fakeCatalog.providerRequests.map((request) => request.provider),
       isNot(contains(RemoteProvider.animeFlv)),
@@ -1063,6 +1073,42 @@ void main() {
     expect(stream?.server, 'uqload');
     expect(fakeCatalog.directStreamEpisodes, [latEpisode]);
     expect(fakeCatalog.excludedServerRequests.single, {'yourupload'});
+  });
+
+  test('remembers the provider and server that resolved successfully',
+      () async {
+    const episode = EpisodeItem(
+      seriesName: 'Remembered Source',
+      episodeIndex: 0,
+      episodeNumber: 1,
+      displayName: 'Episode 1',
+      relativePath: 'Episode 1',
+      filePath: 'https://catalog.test/remembered',
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.catalog,
+    );
+    final controller = AppController(
+      store: _MemoryAppStore(const AppState()),
+      remoteCatalog: _FakeRemoteCatalog(const []),
+    );
+    await controller.initialize();
+
+    await controller.rememberResolvedPlaybackForEpisode(
+      episode,
+      const RemoteDirectStream(
+        playbackUrl: 'https://ani.pm/api/anime/src/hls?t=video',
+        playbackKind: 'hls',
+        pageUrl: 'https://ani.pm/ani/182317',
+        provider: RemoteProvider.aniPm,
+        selectedMode: 'dub',
+        server: 'pulse-2',
+      ),
+    );
+
+    final preference = controller.playbackPreferenceForEpisode(episode);
+    expect(preference.provider, RemoteProvider.aniPm);
+    expect(preference.aniPmMode, 'dub');
+    expect(preference.aniPmServer, 'pulse-2');
   });
 
   test('selects profiles independently', () async {

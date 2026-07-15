@@ -43,6 +43,9 @@ class RemoteCatalogService {
   static const _animeAv1BaseUrl = 'https://animeav1.com';
   static const _jkAnimeBaseUrl = 'https://jkanime.net';
   static const _latAnimeBaseUrl = 'https://latanime.org';
+  static const _justAnimeBaseUrl = 'https://www.justanime.to';
+  static const _justAnimeApiBaseUrl = 'https://core.justanime.to/api';
+  static const _aniPmBaseUrl = 'https://ani.pm';
   static const _animeFlvBaseUrl = 'https://www4.animeflv.net';
   static const _bilibiliBaseUrl = 'https://www.bilibili.tv';
   static const _internetArchiveBaseUrl = 'https://archive.org';
@@ -63,6 +66,7 @@ class RemoteCatalogService {
   final String _fanartApiKey;
   final String _myAnimeListClientId;
   final List<_BiliBiliDashProxy> _bilibiliDashProxies = <_BiliBiliDashProxy>[];
+  final List<_JustAnimeHlsProxy> _justAnimeHlsProxies = [];
   final Map<int, Future<RemoteSearchCandidate?>> _aniListDetailCache = {};
   final Map<int, Future<List<SeriesEpisodeMetadata>>> _aniListEpisodeCache = {};
   DateTime? _aniListBlockedUntil;
@@ -122,6 +126,10 @@ class RemoteCatalogService {
           () => searchJkAnime(normalized, releaseYear: releaseYear)),
       _safeProviderSearch(
           () => searchLatAnime(normalized, releaseYear: releaseYear)),
+      _safeProviderSearch(
+          () => searchJustAnime(normalized, releaseYear: releaseYear)),
+      _safeProviderSearch(
+          () => searchAniPm(normalized, releaseYear: releaseYear)),
     ]);
     return _dedupe([...catalog, ...providerResults.expand((entry) => entry)]);
   }
@@ -168,31 +176,20 @@ class RemoteCatalogService {
     final normalizedLimit = limit.clamp(1, 25).toInt();
     final normalizedPage = page < 1 ? 1 : page;
     final providerResults = await Future.wait([
-      _safeProviderSearch(() async {
-        final uri = Uri.https('api.jikan.moe', '/v4/anime', {
-          'type': 'movie',
-          'status': 'complete',
-          'order_by': 'start_date',
-          'sort': 'desc',
-          'page': '$normalizedPage',
-          'limit': '$normalizedLimit',
-          'sfw': 'true',
-        });
-        final response = await _get(uri);
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw RemoteCatalogException(
-            'Jikan peliculas respondio ${response.statusCode}',
-          );
-        }
-        return _parseJikanCandidateList(response.body)
-            .where((candidate) => _candidateLooksMovie(candidate))
-            .toList(growable: false);
-      }),
       _safeProviderSearch(
-        () => _discoverAniListMovies(limit: normalizedLimit, page: page),
+        () => _discoverJkAnimeMovies(
+          limit: normalizedLimit,
+          page: normalizedPage,
+        ),
+      ),
+      _safeProviderSearch(
+        () => _discoverAnimeAv1Movies(
+          limit: normalizedLimit,
+          page: normalizedPage,
+        ),
       ),
     ]);
-    return _dedupe(providerResults.expand((entry) => entry).toList())
+    return _dedupe(_interleaveCandidateLists(providerResults))
         .take(normalizedLimit)
         .toList(growable: false);
   }
@@ -213,7 +210,9 @@ class RemoteCatalogService {
       ),
     ]);
     final results = providerResults.expand((entry) => entry).toList();
-    return _dedupe(results).take(limit.clamp(1, 50).toInt()).toList();
+    return _dedupePreferAiringMetadata(results)
+        .take(limit.clamp(1, 50).toInt())
+        .toList();
   }
 
   Future<List<RemoteSearchCandidate>> _discoverJikanAiring({
@@ -286,6 +285,210 @@ class RemoteCatalogService {
         .where((candidate) => candidate.title.isNotEmpty)
         .take(targetLimit)
         .toList();
+  }
+
+  Future<List<RemoteSearchCandidate>> fetchMyAnimeListWebRecommendations(
+    int malId, {
+    int limit = 15,
+  }) async {
+    if (malId <= 0) return const [];
+    final response = await _get(
+      Uri.https('myanimelist.net', '/anime/$malId/_/userrecs'),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'MyAnimeList recomendaciones respondio ${response.statusCode}',
+      );
+    }
+    final candidates = <RemoteSearchCandidate>[];
+    final seen = <int>{};
+    final pattern = RegExp(
+      r'''<div\s+class="picSurround"><a\s+href="(https://myanimelist\.net/anime/(\d+)/[^"]+)"[\s\S]*?<img[^>]+data-src="([^"]+)"[^>]+alt="Anime:\s*([^"]+)"''',
+      caseSensitive: false,
+    );
+    for (final match in pattern.allMatches(response.body)) {
+      final id = int.tryParse(match.group(2) ?? '') ?? 0;
+      if (id <= 0 || !seen.add(id)) continue;
+      candidates.add(RemoteSearchCandidate(
+        provider: RemoteProvider.catalog,
+        slug: '$id',
+        title: _decodeHtml(match.group(4) ?? '').trim(),
+        watchUrl: _decodeHtml(match.group(1) ?? ''),
+        seriesUrl: _decodeHtml(match.group(1) ?? ''),
+        imageUrl: _normalizeMyAnimeListImageUrl(
+          _decodeHtml(match.group(3) ?? ''),
+        ),
+        catalogId: id,
+      ));
+      if (candidates.length >= limit.clamp(1, 25)) break;
+    }
+    return candidates;
+  }
+
+  Future<List<RemoteSearchCandidate>> fetchAniListRecommendationsForSeries(
+    SeriesItem series, {
+    int limit = 15,
+  }) async {
+    final anilistId = _anilistIdFromSeries(series);
+    final targetLimit = limit.clamp(1, 25).toInt();
+    final decoded = await _postAniList({
+      'query': anilistId > 0
+          ? r'''query Recommendations($id: Int, $limit: Int) {
+              Media(id: $id, type: ANIME) {
+                relations {
+                  edges { relationType(version: 2) node { ...RecommendationMedia } }
+                }
+                recommendations(sort: RATING_DESC, perPage: $limit) {
+                  nodes { rating mediaRecommendation { ...RecommendationMedia } }
+                }
+              }
+            }
+            fragment RecommendationMedia on Media {
+              id idMal type title { romaji english native } synonyms
+              coverImage { extraLarge large } bannerImage description
+              averageScore episodes format startDate { year month day }
+            }'''
+          : r'''query Recommendations($search: String, $year: Int, $limit: Int) {
+              Media(search: $search, seasonYear: $year, type: ANIME) {
+                relations {
+                  edges { relationType(version: 2) node { ...RecommendationMedia } }
+                }
+                recommendations(sort: RATING_DESC, perPage: $limit) {
+                  nodes { rating mediaRecommendation { ...RecommendationMedia } }
+                }
+              }
+            }
+            fragment RecommendationMedia on Media {
+              id idMal type title { romaji english native } synonyms
+              coverImage { extraLarge large } bannerImage description
+              averageScore episodes format startDate { year month day }
+            }''',
+      'variables': {
+        if (anilistId > 0) 'id': anilistId else 'search': series.name,
+        if (anilistId <= 0 && series.releaseYear > 0)
+          'year': series.releaseYear,
+        'limit': targetLimit,
+      },
+    });
+    final data = decoded['data'];
+    final media = data is Map ? data['Media'] : null;
+    final recommendations = media is Map ? media['recommendations'] : null;
+    final nodes = recommendations is Map ? recommendations['nodes'] : null;
+    final relations = media is Map ? media['relations'] : null;
+    final edges = relations is Map ? relations['edges'] : null;
+    final relatedMedia = <Map<String, dynamic>>[
+      if (edges is List)
+        ...edges
+            .whereType<Map>()
+            .map((edge) => edge['node'])
+            .whereType<Map>()
+            .where(
+              (node) => _readString(node['type']).toUpperCase() == 'ANIME',
+            )
+            .map((node) => Map<String, dynamic>.from(node)),
+      if (nodes is List)
+        ...nodes
+            .whereType<Map>()
+            .map((node) => node['mediaRecommendation'])
+            .whereType<Map>()
+            .map(
+              (node) => Map<String, dynamic>.from(node),
+            ),
+    ];
+    final seen = <String>{};
+    return relatedMedia
+        .map(_candidateFromAniList)
+        .where((candidate) => candidate.title.isNotEmpty)
+        .where((candidate) => seen.add(candidate.catalogId > 0
+            ? 'mal:${candidate.catalogId}'
+            : normalizeSeriesKey(candidate.title)))
+        .take(targetLimit)
+        .toList(growable: false);
+  }
+
+  int _anilistIdFromSeries(SeriesItem series) {
+    final urls = [series.watchUrl, ...series.episodes.map((e) => e.watchUrl)];
+    for (final value in urls) {
+      final uri = Uri.tryParse(value);
+      if (uri == null) continue;
+      final pattern = uri.host.contains('anilist.co')
+          ? RegExp(r'/anime/(\d+)')
+          : uri.host.contains('ani.pm')
+              ? RegExp(r'/ani/(\d+)')
+              : null;
+      final id =
+          int.tryParse(pattern?.firstMatch(uri.path)?.group(1) ?? '') ?? 0;
+      if (id > 0) return id;
+    }
+    if (series.provider == RemoteProvider.justAnime) {
+      return series.catalogId;
+    }
+    return 0;
+  }
+
+  Future<int> resolveMyAnimeListIdForSeries(SeriesItem series) async {
+    final urls = [series.watchUrl, ...series.episodes.map((e) => e.watchUrl)];
+    for (final value in urls) {
+      final uri = Uri.tryParse(value);
+      if (uri == null || !uri.host.contains('myanimelist.net')) continue;
+      final match = RegExp(r'/anime/(\d+)').firstMatch(uri.path);
+      final id = int.tryParse(match?.group(1) ?? '') ?? 0;
+      if (id > 0) return id;
+    }
+
+    final anilistId = _anilistIdFromSeries(series);
+
+    try {
+      final decoded = await _postAniList({
+        'query': anilistId > 0
+            ? r'''query MalId($id: Int) { Media(id: $id, type: ANIME) { idMal } }'''
+            : r'''query MalId($search: String, $year: Int) {
+                Media(search: $search, seasonYear: $year, type: ANIME) { idMal }
+              }''',
+        'variables': anilistId > 0
+            ? {'id': anilistId}
+            : {
+                'search': series.name,
+                if (series.releaseYear > 0) 'year': series.releaseYear,
+              },
+      });
+      final media =
+          decoded['data'] is Map ? (decoded['data'] as Map)['Media'] : null;
+      final malId = media is Map ? _readInt(media['idMal']) : 0;
+      if (malId > 0) return malId;
+    } catch (error) {
+      _debugResolver('AniList MAL id lookup failed: $error');
+    }
+
+    try {
+      final matches = await searchMyAnimeListCatalog(series.name, limit: 10);
+      final requestedTitle = normalizeSeriesKey(series.name);
+      RemoteSearchCandidate? best;
+      var bestScore = -1;
+      for (final match in matches) {
+        var score =
+            normalizeSeriesKey(match.title) == requestedTitle ? 1000 : 0;
+        if (series.releaseYear > 0 && match.releaseYear > 0) {
+          final difference = (series.releaseYear - match.releaseYear).abs();
+          if (difference == 0) score += 500;
+          if (difference > 2) continue;
+        }
+        if (score > bestScore) {
+          best = match;
+          bestScore = score;
+        }
+      }
+      if (best != null && bestScore >= 1000 && best.catalogId > 0) {
+        return best.catalogId;
+      }
+    } catch (error) {
+      _debugResolver('MyAnimeList MAL id lookup failed: $error');
+    }
+
+    // catalogId is safe as a MAL id only when its URL explicitly came from
+    // MyAnimeList. Provider APIs such as Ani.pm and JustAnime expose AniList
+    // ids in the same field.
+    return 0;
   }
 
   Future<List<RemoteSearchCandidate>> _safeProviderSearch(
@@ -915,6 +1118,7 @@ class RemoteCatalogService {
       extraArgs: 'status: RELEASING',
       type: 'tv',
       sort: '[POPULARITY_DESC, TRENDING_DESC]',
+      includeAiringSchedule: true,
     );
   }
 
@@ -925,7 +1129,7 @@ class RemoteCatalogService {
     return _discoverAniListPage(
       page: page,
       limit: limit,
-      extraArgs: 'status_not: NOT_YET_RELEASED',
+      extraArgs: 'status: FINISHED',
       type: 'movie',
       sort: '[START_DATE_DESC, POPULARITY_DESC]',
     );
@@ -937,6 +1141,7 @@ class RemoteCatalogService {
     required String extraArgs,
     required String type,
     required String sort,
+    bool includeAiringSchedule = false,
   }) async {
     final normalizedLimit = limit.clamp(1, 50).toInt();
     final formatFilter = switch (type.trim().toLowerCase()) {
@@ -953,6 +1158,16 @@ class RemoteCatalogService {
       'isAdult: false',
       'sort: $sort',
     ].where((entry) => entry.trim().isNotEmpty).join('\n                    ');
+    final airingScheduleFields = includeAiringSchedule
+        ? '''
+              airingSchedule(notYetAired: true, page: 1, perPage: 6) {
+                nodes {
+                  episode
+                  airingAt
+                }
+              }
+'''
+        : '';
     final decoded = await _postAniList({
       'query': '''
         query CatalogDiscover(\$page: Int, \$perPage: Int) {
@@ -986,6 +1201,7 @@ class RemoteCatalogService {
                 id
                 site
               }
+$airingScheduleFields
             }
           }
         }
@@ -1065,6 +1281,27 @@ class RemoteCatalogService {
     return _parseAnimeAv1Results(response.body);
   }
 
+  Future<List<RemoteSearchCandidate>> _discoverAnimeAv1Movies({
+    required int limit,
+    required int page,
+  }) async {
+    final uri = Uri.https('animeav1.com', '/catalogo', {
+      'category': 'pelicula',
+      'order': 'latest_released',
+      if (page > 1) 'page': '$page',
+    });
+    final response = await _get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'AnimeAV1 peliculas respondio ${response.statusCode}',
+      );
+    }
+    return _parseAnimeAv1Results(response.body)
+        .where((candidate) => _candidateLooksMovie(candidate))
+        .take(limit)
+        .toList(growable: false);
+  }
+
   Future<List<RemoteSearchCandidate>> searchJkAnime(String query,
       {int releaseYear = 0}) async {
     final normalized = query.trim();
@@ -1088,6 +1325,105 @@ class RemoteCatalogService {
       }
     }
     return _searchJkAnimeByDirectSlug(normalized, releaseYear: releaseYear);
+  }
+
+  Future<List<RemoteSearchCandidate>> searchJustAnime(String query,
+      {int releaseYear = 0}) async {
+    final normalized = query.trim();
+    if (normalized.isEmpty) return const [];
+    final response = await _getRemoteProviderWithRetry(
+      Uri.parse('$_justAnimeApiBaseUrl/search').replace(
+        queryParameters: {'query': normalized},
+      ),
+      referer: _justAnimeBaseUrl,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return const [];
+    }
+    final decoded = jsonDecode(response.body);
+    final results = decoded is Map ? decoded['results'] : null;
+    if (results is! List) return const [];
+    return results.whereType<Map>().map((raw) {
+      final entry = Map<String, dynamic>.from(raw);
+      final id = _readInt(entry['id']);
+      final titles = entry['title'] is Map
+          ? Map<String, dynamic>.from(entry['title'] as Map)
+          : const <String, dynamic>{};
+      final title = _cleanRemoteText(
+        _readString(titles['english']).isNotEmpty
+            ? _readString(titles['english'])
+            : _readString(titles['romaji']),
+      );
+      final slug = title
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+          .replaceAll(RegExp(r'^-+|-+$'), '');
+      final seriesUrl = '$_justAnimeBaseUrl/anime/$id/$slug';
+      return RemoteSearchCandidate(
+        provider: RemoteProvider.justAnime,
+        slug: '$id',
+        title: title,
+        seriesUrl: seriesUrl,
+        watchUrl: seriesUrl,
+        imageUrl: _readString(entry['cover']),
+        episodeCount: _readInt(entry['episodes']),
+        format: _readString(entry['type']),
+        releaseYear: _readInt(entry['year']),
+        catalogId: id,
+      );
+    }).where((candidate) {
+      return candidate.catalogId > 0 &&
+          candidate.title.isNotEmpty &&
+          (releaseYear <= 0 || candidate.releaseYear == releaseYear);
+    }).toList(growable: false);
+  }
+
+  Future<List<RemoteSearchCandidate>> searchAniPm(String query,
+      {int releaseYear = 0}) async {
+    final normalized = query.trim();
+    if (normalized.isEmpty) return const [];
+    final response = await _getRemoteProviderWithRetry(
+      Uri.parse('$_aniPmBaseUrl/api/anime/search').replace(
+        queryParameters: {'q': normalized},
+      ),
+      referer: _aniPmBaseUrl,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return const [];
+    }
+    final decoded = jsonDecode(response.body);
+    final items = decoded is Map ? decoded['items'] : null;
+    if (items is! List) return const [];
+    return items
+        .whereType<Map>()
+        .map((raw) {
+          final entry = Map<String, dynamic>.from(raw);
+          final id = _readInt(entry['id']);
+          final source = _readString(entry['source']).toLowerCase();
+          final route = source == 'anilist' ? 'ani' : 'anime';
+          final title = _cleanRemoteText(_readString(entry['title']));
+          return RemoteSearchCandidate(
+            provider: RemoteProvider.aniPm,
+            slug: '$route:$id',
+            title: title,
+            seriesUrl: '$_aniPmBaseUrl/$route/$id',
+            watchUrl: '$_aniPmBaseUrl/$route/$id',
+            imageUrl: _readString(entry['poster']),
+            backgroundUrl: _readString(entry['banner']),
+            description: _readString(entry['synopsis']),
+            rating: _readString(entry['score']),
+            episodeCount: _readInt(entry['episodeCount']),
+            format: _readString(entry['type']),
+            japaneseTitle: _cleanRemoteText(_readString(entry['native'])),
+            releaseYear: _readInt(entry['year']),
+            catalogId: _readInt(entry['anilistId']),
+          );
+        })
+        .where((candidate) =>
+            candidate.slug.split(':').last != '0' &&
+            candidate.title.isNotEmpty &&
+            (releaseYear <= 0 || candidate.releaseYear == releaseYear))
+        .toList(growable: false);
   }
 
   Future<List<RemoteSearchCandidate>> searchLatAnime(String query,
@@ -1320,6 +1656,10 @@ class RemoteCatalogService {
           existingNames: existingNames),
       RemoteProvider.latAnime => await _buildLatAnimeSeries(enrichedCandidate,
           existingNames: existingNames),
+      RemoteProvider.justAnime =>
+        enrichedCandidate.toSeries(existingNames: existingNames),
+      RemoteProvider.aniPm =>
+        enrichedCandidate.toSeries(existingNames: existingNames),
       RemoteProvider.animeFlv => await _buildAnimeFlvSeries(enrichedCandidate,
           existingNames: existingNames),
       RemoteProvider.bilibili =>
@@ -1410,6 +1750,9 @@ class RemoteCatalogService {
       RemoteProvider.jkAnime => searchJkAnime(query, releaseYear: releaseYear),
       RemoteProvider.latAnime =>
         searchLatAnime(query, releaseYear: releaseYear),
+      RemoteProvider.justAnime =>
+        searchJustAnime(query, releaseYear: releaseYear),
+      RemoteProvider.aniPm => searchAniPm(query, releaseYear: releaseYear),
       RemoteProvider.animeFlv =>
         searchAnimeFlv(query, releaseYear: releaseYear),
       RemoteProvider.internetArchive => searchInternetArchive(query),
@@ -2801,6 +3144,26 @@ class RemoteCatalogService {
       );
       return resolved;
     }
+    if (entry.provider == RemoteProvider.justAnime) {
+      final resolved = await _resolveJustAnimeDirectStream(
+        entry,
+        preferredMode: preferredMode,
+        preferredServer: preferredServer,
+        excludedServers: excludedServers,
+      );
+      _debugResolver('justanime resolved ${_debugStreamLabel(resolved)}');
+      return resolved;
+    }
+    if (entry.provider == RemoteProvider.aniPm) {
+      final resolved = await _resolveAniPmDirectStream(
+        entry,
+        preferredMode: preferredMode,
+        preferredServer: preferredServer,
+        excludedServers: excludedServers,
+      );
+      _debugResolver('anipm resolved ${_debugStreamLabel(resolved)}');
+      return resolved;
+    }
     if (entry.provider != RemoteProvider.animeAv1) {
       final resolved = await _resolveGenericDirectStream(
         entry,
@@ -2977,6 +3340,404 @@ class RemoteCatalogService {
     final tagged = resolved.copyWith(provider: provider, server: server);
     _debugResolver('platform web resolved ${_debugStreamLabel(tagged)}');
     return tagged;
+  }
+
+  Future<RemoteDirectStream?> _resolveJustAnimeDirectStream(
+    EpisodeItem entry, {
+    required String preferredMode,
+    required String preferredServer,
+    required Set<String> excludedServers,
+  }) async {
+    final animeId = int.tryParse(entry.slug.trim()) ?? 0;
+    if (animeId <= 0) return null;
+    final episode = entry.episodeNumber < 1 ? 1 : entry.episodeNumber;
+    final language = justAnimePlaybackModeFromId(preferredMode).id;
+    final requestedServer = justAnimeServerPreferenceFromId(preferredServer);
+    final servers = <JustAnimeServerPreference>[
+      requestedServer,
+      ...JustAnimeServerPreference.values
+          .where((item) => item != requestedServer),
+    ];
+    final subtitles = await _fetchJustAnimeMomoSubtitles(
+      animeId,
+      episode,
+      language,
+    );
+    for (final server in servers) {
+      if (excludedServers.contains(server.id)) continue;
+      if (server == JustAnimeServerPreference.neko && language == 'dub') {
+        continue;
+      }
+      final endpoint = server == JustAnimeServerPreference.neko
+          ? 'anineko/$language/hd1'
+          : 'animegg';
+      final response = await _getJustAnimeApi(
+        '/watch/$animeId/episode/$episode/$endpoint',
+      );
+      if (response == null) continue;
+      final selected = server == JustAnimeServerPreference.gigi
+          ? (response[language] is Map
+              ? Map<String, dynamic>.from(response[language] as Map)
+              : null)
+          : response;
+      if (selected == null || selected['sources'] is! List) continue;
+      final sources = (selected['sources'] as List).whereType<Map>().toList();
+      if (sources.isEmpty) continue;
+      final source = Map<String, dynamic>.from(sources.first);
+      final rawUrl = _readString(source['url']);
+      if (rawUrl.isEmpty) continue;
+      final isHls = source['isM3U8'] == true || rawUrl.contains('.m3u8');
+      var playbackUrl = rawUrl;
+      if (server == JustAnimeServerPreference.neko) {
+        final upstream = Uri.parse('https://neko.justanime.to/m3u8-proxy')
+            .replace(queryParameters: {'url': rawUrl}).toString();
+        final proxy = await _JustAnimeHlsProxy.start(
+          client: _client,
+          upstreamUrl: upstream,
+          userAgent: _defaultFetchUserAgent,
+        );
+        _justAnimeHlsProxies.add(proxy);
+        playbackUrl = proxy.playlistUrl;
+      }
+      final ownTracks = _parseJustAnimeSubtitleTracks(
+        selected['subtitles'] ?? selected['tracks'],
+        proxy: server == JustAnimeServerPreference.neko,
+      );
+      return RemoteDirectStream(
+        playbackUrl: playbackUrl,
+        playbackKind: isHls ? 'hls' : 'http',
+        pageUrl:
+            '$_justAnimeBaseUrl/watch/$animeId/${entry.slug}/episode/$episode',
+        availableModes: JustAnimeServerPreference.values
+            .where((item) =>
+                language != 'dub' || item != JustAnimeServerPreference.neko)
+            .map((item) => item.id)
+            .toSet(),
+        selectedMode: language,
+        provider: RemoteProvider.justAnime,
+        server: server.id,
+        subtitleTracks: _mergeJustAnimeSubtitleTracks(subtitles, ownTracks),
+        httpHeaders: server == JustAnimeServerPreference.neko
+            ? const {'User-Agent': _defaultFetchUserAgent}
+            : const {
+                'Referer': 'https://www.animegg.org/',
+                'User-Agent': _defaultFetchUserAgent,
+              },
+      );
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> _getJustAnimeApi(String path) async {
+    try {
+      final response = await _getRemoteProviderWithRetry(
+        Uri.parse('$_justAnimeApiBaseUrl$path'),
+        referer: _justAnimeBaseUrl,
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      final decoded = jsonDecode(response.body);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<RemoteDirectStream?> _resolveAniPmDirectStream(
+    EpisodeItem entry, {
+    required String preferredMode,
+    required String preferredServer,
+    required Set<String> excludedServers,
+  }) async {
+    final slugParts = entry.slug.trim().split(':');
+    final route =
+        slugParts.length > 1 && slugParts.first == 'anime' ? 'series' : 'ani';
+    final id = int.tryParse(slugParts.last) ?? 0;
+    if (id <= 0) return null;
+    final detail = await _getAniPmJson('/api/anime/$route/$id');
+    if (detail == null) return null;
+    final title = _readString(detail['title']);
+    if (title.isEmpty) return null;
+    final episode = entry.episodeNumber < 1 ? 1 : entry.episodeNumber;
+    final query = <String, String>{
+      'title': title,
+      'ep': '$episode',
+      if (_readInt(detail['year']) > 0) 'year': '${_readInt(detail['year'])}',
+      if (_readString(detail['anilistId']).isNotEmpty)
+        'anilistId': _readString(detail['anilistId']),
+      if (_readString(detail['malId']).isNotEmpty)
+        'malId': _readString(detail['malId']),
+    };
+    final servers = await _getAniPmJson(
+      Uri.parse('$_aniPmBaseUrl/api/anime/src/servers')
+          .replace(queryParameters: query)
+          .toString(),
+      absolute: true,
+    );
+    if (servers == null) return null;
+    final mode = aniPmPlaybackModeFromId(preferredMode).id;
+    final rawServers = servers[mode];
+    if (rawServers is! List || rawServers.isEmpty) return null;
+    final candidates = rawServers
+        .whereType<Map>()
+        .map((raw) {
+          final item = Map<String, dynamic>.from(raw);
+          return (item: item, key: _aniPmServerKey(item));
+        })
+        .where((candidate) =>
+            candidate.key.isNotEmpty &&
+            !excludedServers.contains(candidate.key) &&
+            !excludedServers.contains(_aniPmServerFamily(candidate.key)))
+        .toList();
+    if (candidates.isEmpty) return null;
+    final preferred = preferredServer.trim().toLowerCase();
+    candidates.sort((left, right) {
+      int score(({Map<String, dynamic> item, String key}) candidate) {
+        final family = _aniPmServerFamily(candidate.key);
+        final preferredScore = candidate.key == preferred
+            ? 100000
+            : family == preferred
+                ? 50000
+                : 0;
+        return preferredScore + _readInt(candidate.item['priority']);
+      }
+
+      return score(right).compareTo(score(left));
+    });
+    final availableServers = candidates.map((item) => item.key).toSet();
+    for (final candidate in candidates) {
+      final item = candidate.item;
+      var playbackUrl = _aniPmAbsoluteUrl(_readString(item['url']));
+      var kind = _readString(item['kind']).toLowerCase();
+      var tracks = _parseAniPmSubtitleTracks(item['tracks']);
+      var pageUrl = playbackUrl;
+      if (playbackUrl.isEmpty) continue;
+      if (kind == 'embed') {
+        final embedded = await _getAniPmJson(
+          Uri.parse('$_aniPmBaseUrl/api/anime/src/embed-direct').replace(
+            queryParameters: {'u': playbackUrl},
+          ).toString(),
+          absolute: true,
+        );
+        if (embedded == null) continue;
+        final rawResolved = [
+          embedded['m3u8'],
+          embedded['file'],
+          embedded['url'],
+        ]
+            .map(_readString)
+            .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+        if (rawResolved.isEmpty) continue;
+        playbackUrl = _aniPmAbsoluteUrl(rawResolved);
+        kind = rawResolved.contains('.m3u8') || embedded['direct'] == false
+            ? 'hls'
+            : 'http';
+        tracks = [
+          ...tracks,
+          ..._parseAniPmSubtitleTracks(
+              embedded['tracks'] ?? embedded['subtitles']),
+        ];
+        if (_aniPmServerFamily(candidate.key) == 'pulse') {
+          tracks = [
+            ...tracks,
+            ...await _fetchAniPmEmbedSubtitleTracks(pageUrl)
+          ];
+        }
+      }
+      return RemoteDirectStream(
+        playbackUrl: playbackUrl,
+        playbackKind: kind == 'hls' ? 'hls' : 'http',
+        pageUrl: pageUrl,
+        availableModes: availableServers,
+        selectedMode: mode,
+        provider: RemoteProvider.aniPm,
+        server: candidate.key,
+        subtitleTracks: _dedupeAniPmSubtitleTracks(tracks),
+        httpHeaders: const {
+          'Referer': 'https://ani.pm/',
+          'Origin': 'https://ani.pm',
+          'User-Agent': _defaultFetchUserAgent,
+        },
+      );
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> _getAniPmJson(String path,
+      {bool absolute = false}) async {
+    try {
+      final uri = Uri.parse(absolute ? path : '$_aniPmBaseUrl$path');
+      final response =
+          await _getRemoteProviderWithRetry(uri, referer: _aniPmBaseUrl);
+      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      final decoded = jsonDecode(response.body);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<http.Response> _getRemoteProviderWithRetry(
+    Uri uri, {
+    required String referer,
+  }) async {
+    late http.Response response;
+    for (var attempt = 0; attempt < 2; attempt += 1) {
+      response = await _get(
+        uri,
+        referer: referer,
+        headers: const {'Accept': 'application/json'},
+      );
+      if (response.statusCode != 429 && response.statusCode < 500) {
+        return response;
+      }
+      if (attempt == 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+    }
+    return response;
+  }
+
+  String _aniPmAbsoluteUrl(String value) {
+    final trimmed = value.trim();
+    if (trimmed.startsWith('/')) return '$_aniPmBaseUrl$trimmed';
+    return trimmed;
+  }
+
+  String _aniPmServerKey(Map<String, dynamic> item) {
+    final provider = _readString(item['provider']).toLowerCase().replaceAll(
+          RegExp(r'[^a-z0-9]+'),
+          '-',
+        );
+    final name = _readString(item['name']).toLowerCase();
+    final numberMatches = RegExp(r'(\d+)').allMatches(name).toList();
+    final number =
+        numberMatches.isEmpty ? '' : numberMatches.last.group(1) ?? '';
+    return [provider, if (number.isNotEmpty) number]
+        .where((part) => part.isNotEmpty)
+        .join('-');
+  }
+
+  String _aniPmServerFamily(String key) => key.split('-').first;
+
+  List<RemoteSubtitleTrack> _parseAniPmSubtitleTracks(Object? value) {
+    if (value is! List) return const [];
+    return value
+        .whereType<Map>()
+        .map((raw) {
+          final item = Map<String, dynamic>.from(raw);
+          final url = _aniPmAbsoluteUrl(_readString(item['url']).isNotEmpty
+              ? _readString(item['url'])
+              : _readString(item['file']));
+          final label = _readString(item['label']).isNotEmpty
+              ? _readString(item['label'])
+              : _readString(item['language']);
+          return RemoteSubtitleTrack(
+            url: url,
+            label: label.isEmpty ? 'Subtitulo' : label,
+            language: _readString(item['language']),
+            mimeType:
+                url.toLowerCase().contains('.ass') ? 'text/x-ssa' : 'text/vtt',
+            isDefault: item['default'] == true,
+          );
+        })
+        .where((track) => track.url.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  Future<List<RemoteSubtitleTrack>> _fetchAniPmEmbedSubtitleTracks(
+      String url) async {
+    try {
+      final response = await _get(Uri.parse(url), referer: _aniPmBaseUrl);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return const [];
+      }
+      final matches = RegExp(
+        r'''\{url:["']([^"']+\.(?:ass|vtt|srt))[^}]*language:["']([^"']*)["'][^}]*\}''',
+        caseSensitive: false,
+      ).allMatches(response.body);
+      return matches.map((match) {
+        final trackUrl = match.group(1) ?? '';
+        return RemoteSubtitleTrack(
+          url: trackUrl,
+          label: match.group(2) ?? 'Subtitulo',
+          language: match.group(2) ?? '',
+          mimeType: trackUrl.toLowerCase().endsWith('.ass')
+              ? 'text/x-ssa'
+              : 'text/vtt',
+          isDefault: response.body
+              .substring(match.start, match.end)
+              .contains('default:true'),
+        );
+      }).toList(growable: false);
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  List<RemoteSubtitleTrack> _dedupeAniPmSubtitleTracks(
+      List<RemoteSubtitleTrack> tracks) {
+    final result = <String, RemoteSubtitleTrack>{};
+    for (final track in tracks) {
+      result[track.url] = track;
+    }
+    return result.values.toList(growable: false);
+  }
+
+  Future<List<RemoteSubtitleTrack>> _fetchJustAnimeMomoSubtitles(
+    int animeId,
+    int episode,
+    String language,
+  ) async {
+    final response = await _getJustAnimeApi(
+      '/watch/$animeId/episode/$episode/megaplay',
+    );
+    final stream = response?[language];
+    if (stream is! Map) return const [];
+    return _parseJustAnimeSubtitleTracks(stream['subtitles'], proxy: true);
+  }
+
+  List<RemoteSubtitleTrack> _parseJustAnimeSubtitleTracks(
+    Object? value, {
+    required bool proxy,
+  }) {
+    if (value is! List) return const [];
+    return value
+        .whereType<Map>()
+        .map((raw) {
+          final track = Map<String, dynamic>.from(raw);
+          final direct = _readString(track['file']).isNotEmpty
+              ? _readString(track['file'])
+              : _readString(track['url']);
+          final label = _readString(track['label']).isNotEmpty
+              ? _readString(track['label'])
+              : _readString(track['lang']);
+          return RemoteSubtitleTrack(
+            url: proxy && direct.isNotEmpty
+                ? Uri.parse('https://momo.calm-koi.workers.dev/proxy').replace(
+                    queryParameters: {'url': direct},
+                  ).toString()
+                : direct,
+            label: label,
+            language: label,
+            mimeType: 'text/vtt',
+            isDefault: track['default'] == true,
+          );
+        })
+        .where((track) => track.url.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  List<RemoteSubtitleTrack> _mergeJustAnimeSubtitleTracks(
+    List<RemoteSubtitleTrack> preferred,
+    List<RemoteSubtitleTrack> fallback,
+  ) {
+    final result = <RemoteSubtitleTrack>[];
+    final seen = <String>{};
+    for (final track in [...preferred, ...fallback]) {
+      final key = '${track.label.toLowerCase()}|${track.url}';
+      if (seen.add(key)) result.add(track);
+    }
+    return result;
   }
 
   Future<RemoteDirectStream?> _resolveBiliBiliDirectStream(
@@ -3916,6 +4677,26 @@ class RemoteCatalogService {
     return const [];
   }
 
+  Future<List<RemoteSearchCandidate>> _discoverJkAnimeMovies({
+    required int limit,
+    required int page,
+  }) async {
+    final uri = Uri.https('jkanime.net', '/directorio', {
+      'tipo': 'peliculas',
+      if (page > 1) 'p': '$page',
+    });
+    final response = await _get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'JKAnime peliculas respondio ${response.statusCode}',
+      );
+    }
+    return _parseJkAnimeResults(response.body, 0)
+        .where((candidate) => _candidateLooksMovie(candidate))
+        .take(limit)
+        .toList(growable: false);
+  }
+
   String _cleanBiliBiliSearchQuery(String value) {
     final buffer = StringBuffer();
     var previousWasSpace = true;
@@ -3993,8 +4774,18 @@ class RemoteCatalogService {
       preferredServer: preferredServer,
       excludedServers: excludedServers,
     );
-    _debugResolver('generic html resolved ${_debugStreamLabel(resolved)}');
-    return resolved;
+    final availableServers = _extractHostCandidates(response.body, pageUrl)
+        .map(_normalizedCandidateServer)
+        .where((server) => server.isNotEmpty)
+        .toSet();
+    final resolvedWithServers = resolved?.copyWith(
+      availableServers: availableServers,
+    );
+    _debugResolver(
+      'generic html resolved ${_debugStreamLabel(resolvedWithServers)} '
+      'servers=${availableServers.join(',')}',
+    );
+    return resolvedWithServers;
   }
 
   Future<RemoteDirectStream?> _resolveDirectStreamFromHtml({
@@ -4151,9 +4942,10 @@ class RemoteCatalogService {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         continue;
       }
+      final effectiveHostUrl = response.request?.url.toString() ?? hostUrl;
       final resolved = await _resolveDirectStreamFromHtml(
         html: response.body,
-        pageUrl: hostUrl,
+        pageUrl: effectiveHostUrl,
         referer: pageUrl,
         visited: visited,
         preferredFacebookMode: preferredFacebookMode,
@@ -4510,6 +5302,27 @@ class RemoteCatalogService {
       if (synonyms is List) ...synonyms.map(_readString),
     }..removeWhere((value) => value.isEmpty || value == title);
     final airDateIso = _anilistDateIso(startDate);
+    final airingSchedule = entry['airingSchedule'] is Map
+        ? Map<String, dynamic>.from(entry['airingSchedule'] as Map)
+        : const <String, dynamic>{};
+    final scheduleNodes = airingSchedule['nodes'];
+    final episodeDetails = scheduleNodes is List
+        ? scheduleNodes
+            .whereType<Map>()
+            .map((rawNode) {
+              final node = Map<String, dynamic>.from(rawNode);
+              final episodeNumber = _readInt(node['episode']);
+              if (episodeNumber <= 0) {
+                return null;
+              }
+              return SeriesEpisodeMetadata(
+                episodeNumber: episodeNumber,
+                airDateIso: _anilistUnixDateIso(_readInt(node['airingAt'])),
+              );
+            })
+            .whereType<SeriesEpisodeMetadata>()
+            .toList(growable: false)
+        : const <SeriesEpisodeMetadata>[];
     return RemoteSearchCandidate(
       provider: RemoteProvider.catalog,
       slug: malId > 0
@@ -4547,6 +5360,7 @@ class RemoteCatalogService {
           fallback: _extractYearFromText(airDateIso)),
       airDateIso: airDateIso,
       catalogId: malId,
+      episodeDetails: episodeDetails,
     );
   }
 
@@ -4621,7 +5435,9 @@ class RemoteCatalogService {
       return await future;
     } catch (error) {
       _aniListDetailCache.remove(catalogId);
-      _debugResolver('AniList detail failed: $error');
+      if (!'$error'.contains('en espera por rate limit')) {
+        _debugResolver('AniList detail failed: $error');
+      }
       return null;
     }
   }
@@ -4716,7 +5532,9 @@ class RemoteCatalogService {
       return await future;
     } catch (error) {
       _aniListEpisodeCache.remove(catalogId);
-      _debugResolver('AniList episodes failed: $error');
+      if (!'$error'.contains('en espera por rate limit')) {
+        _debugResolver('AniList episodes failed: $error');
+      }
       return const [];
     }
   }
@@ -5535,6 +6353,7 @@ class RemoteCatalogService {
 
     _TmdbMatch? bestMatch;
     var bestScore = -100000;
+    final animeKeywordById = <int, bool>{};
     final queries = _buildTmdbLookupQueries(candidate);
     for (var queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
       final query = queries[queryIndex];
@@ -5581,12 +6400,23 @@ class RemoteCatalogService {
             backgroundUrl:
                 _tmdbImageUrl(_readString(result['backdrop_path']), 'w1280'),
           );
-          final score = _scoreTmdbMatch(
+          var score = _scoreTmdbMatch(
                 query: query,
                 candidate: candidate,
                 match: match,
               ) +
               max(0, 8 - queryIndex) * 25;
+          // TMDB's Animation genre is broader than anime and also appears on
+          // mixed/live-action records. For close title/year matches, use the
+          // explicit `anime` keyword as the discriminator instead.
+          if (score >= 1000) {
+            final hasAnimeKeyword = animeKeywordById[id] ??
+                await _tmdbHasAnimeKeyword(id, mediaType);
+            animeKeywordById[id] = hasAnimeKeyword;
+            if (hasAnimeKeyword) {
+              score += 1200;
+            }
+          }
           if (score > bestScore) {
             bestScore = score;
             bestMatch = match;
@@ -5595,6 +6425,17 @@ class RemoteCatalogService {
       }
     }
     return bestScore <= 0 ? null : bestMatch;
+  }
+
+  Future<bool> _tmdbHasAnimeKeyword(int id, String mediaType) async {
+    final payload = await _fetchTmdbJsonObject('/3/$mediaType/$id/keywords');
+    final rawKeywords = payload?[mediaType == 'movie' ? 'keywords' : 'results'];
+    if (rawKeywords is! List) {
+      return false;
+    }
+    return rawKeywords.whereType<Map>().any((rawKeyword) {
+      return _normalizeMatchText(_readString(rawKeyword['name'])) == 'anime';
+    });
   }
 
   _TmdbMatch? _forcedTmdbMatchForCandidate(
@@ -5646,6 +6487,21 @@ class RemoteCatalogService {
         title: 'Fire Force',
         originalTitle: 'Enen no Shouboutai',
         releaseYear: 2019,
+        imageUrl: '',
+        backgroundUrl: '',
+      );
+    }
+    // TMDB has an identically named live-action entry (110397) with a nearby
+    // air date. The anime record is 77237 and carries the `anime` keyword.
+    final isWakakoZake = baseTerms.any((term) {
+      return term == 'wakako zake' || term.contains('wakako zake');
+    });
+    if (isWakakoZake) {
+      return const _TmdbMatch(
+        id: 77237,
+        title: 'Wakako-zake',
+        originalTitle: 'ワカコ酒',
+        releaseYear: 2015,
         imageUrl: '',
         backgroundUrl: '',
       );
@@ -6824,7 +7680,36 @@ class RemoteCatalogService {
       unawaited(proxy.close());
     }
     _bilibiliDashProxies.clear();
+    for (final proxy in _justAnimeHlsProxies) {
+      unawaited(proxy.close());
+    }
+    _justAnimeHlsProxies.clear();
     _client.close();
+  }
+
+  void retirePlaybackProxy(String playbackUrl) {
+    final target = Uri.tryParse(playbackUrl.trim());
+    if (target == null ||
+        (target.host != '127.0.0.1' && target.host != 'localhost')) {
+      return;
+    }
+    final justAnime = _justAnimeHlsProxies
+        .where((proxy) => Uri.parse(proxy.playlistUrl).port == target.port)
+        .toList(growable: false);
+    final biliBili = _bilibiliDashProxies
+        .where((proxy) => Uri.parse(proxy.manifestUrl).port == target.port)
+        .toList(growable: false);
+    _justAnimeHlsProxies.removeWhere(justAnime.contains);
+    _bilibiliDashProxies.removeWhere(biliBili.contains);
+    if (justAnime.isEmpty && biliBili.isEmpty) return;
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 250), () async {
+      for (final proxy in justAnime) {
+        await proxy.close();
+      }
+      for (final proxy in biliBili) {
+        await proxy.close();
+      }
+    }));
   }
 
   Future<http.Response> _get(
@@ -7385,10 +8270,15 @@ class RemoteCatalogService {
   int _jkAnimeHostCandidateScoreBonus(String value) {
     return switch (_normalizeServerPreference(value)) {
       'desu' => 1000,
+      'magi' => 940,
       'streamwish' => 860,
+      'mp4upload' => 800,
       'vidhide' => 720,
       'mixdrop' => 560,
+      'voe' => 520,
+      'filemoon' => 480,
       'doodstream' => 420,
+      'stape' => 360,
       _ => 0,
     };
   }
@@ -7428,9 +8318,9 @@ class RemoteCatalogService {
   int _latAnimeHostCandidateScoreBonus(String value) {
     return switch (_normalizeServerPreference(value)) {
       'uqload' => 1000,
-      'yourupload' => 850,
-      'doodstream' => 650,
-      'mp4upload' => 450,
+      'mp4upload' => 900,
+      'doodstream' => 760,
+      'yourupload' => 420,
       _ => 0,
     };
   }
@@ -8288,6 +9178,9 @@ class RemoteCatalogService {
       'flaswish',
       'dood',
       'ds2play',
+      'dsvplay',
+      'd-s.io',
+      'playmogo',
       'myvidplay',
       'uqload',
       'yourupload',
@@ -8301,13 +9194,16 @@ class RemoteCatalogService {
       'sbembed',
       'sbplay',
       'vidhide',
+      'voe.sx',
       'vidmoly',
       'vidstream',
       'vidoza',
       'upcloud',
       'megacloud',
       'filemoon',
+      'bysekoze',
       'mixdrop',
+      'mxdrop',
       'ok.ru',
       'embedsito',
       'desu',
@@ -9017,6 +9913,72 @@ class RemoteCatalogService {
           '${candidate.provider.id}::${candidate.slug.isNotEmpty ? candidate.slug : candidate.title}';
       if (seen.add(key)) {
         results.add(candidate);
+      }
+    }
+    return results;
+  }
+
+  List<RemoteSearchCandidate> _dedupePreferAiringMetadata(
+    List<RemoteSearchCandidate> candidates,
+  ) {
+    final results = <RemoteSearchCandidate>[];
+    final indexes = <String, int>{};
+    for (final candidate in candidates) {
+      final key =
+          '${candidate.provider.id}::${candidate.slug.isNotEmpty ? candidate.slug : candidate.title}';
+      final existingIndex = indexes[key];
+      if (existingIndex == null) {
+        indexes[key] = results.length;
+        results.add(candidate);
+        continue;
+      }
+      final existing = results[existingIndex];
+      results[existingIndex] = _mergeAiringCandidateMetadata(
+        existing,
+        candidate,
+      );
+    }
+    return results;
+  }
+
+  RemoteSearchCandidate _mergeAiringCandidateMetadata(
+    RemoteSearchCandidate primary,
+    RemoteSearchCandidate supplemental,
+  ) {
+    final mergedEpisodes = _mergeEpisodeMetadata(
+      primary.episodeDetails,
+      supplemental.episodeDetails,
+    );
+    return _copyCandidate(
+      primary,
+      imageUrl: primary.imageUrl.isNotEmpty
+          ? primary.imageUrl
+          : supplemental.imageUrl,
+      backgroundUrl: primary.backgroundUrl.isNotEmpty
+          ? primary.backgroundUrl
+          : supplemental.backgroundUrl,
+      logoUrl:
+          primary.logoUrl.isNotEmpty ? primary.logoUrl : supplemental.logoUrl,
+      airDateIso: primary.airDateIso.isNotEmpty
+          ? primary.airDateIso
+          : supplemental.airDateIso,
+      episodeDetails: mergedEpisodes,
+    );
+  }
+
+  List<RemoteSearchCandidate> _interleaveCandidateLists(
+    List<List<RemoteSearchCandidate>> lists,
+  ) {
+    final results = <RemoteSearchCandidate>[];
+    final maxLength = lists.fold<int>(
+      0,
+      (max, list) => list.length > max ? list.length : max,
+    );
+    for (var index = 0; index < maxLength; index += 1) {
+      for (final list in lists) {
+        if (index < list.length) {
+          results.add(list[index]);
+        }
       }
     }
     return results;
@@ -9810,6 +10772,77 @@ class RemoteCatalogException implements Exception {
 
   @override
   String toString() => message;
+}
+
+class _JustAnimeHlsProxy {
+  _JustAnimeHlsProxy(this._server, this._client, this._userAgent);
+
+  final io.HttpServer _server;
+  final http.Client _client;
+  final String _userAgent;
+
+  String get playlistUrl =>
+      'http://127.0.0.1:${_server.port}/fetch?url=${Uri.encodeQueryComponent(_initialUrl)}';
+  late final String _initialUrl;
+
+  static Future<_JustAnimeHlsProxy> start({
+    required http.Client client,
+    required String upstreamUrl,
+    required String userAgent,
+  }) async {
+    final server = await io.HttpServer.bind(io.InternetAddress.loopbackIPv4, 0);
+    final proxy = _JustAnimeHlsProxy(server, client, userAgent)
+      .._initialUrl = upstreamUrl;
+    unawaited(proxy._serve());
+    return proxy;
+  }
+
+  Future<void> _serve() async {
+    await for (final request in _server) {
+      unawaited(_handle(request));
+    }
+  }
+
+  Future<void> _handle(io.HttpRequest request) async {
+    try {
+      final target = request.uri.queryParameters['url'] ?? '';
+      final uri = Uri.tryParse(target);
+      if (uri == null || uri.host != 'neko.justanime.to') {
+        request.response.statusCode = io.HttpStatus.badRequest;
+        await request.response.close();
+        return;
+      }
+      final upstream = await _client.get(uri, headers: {
+        'Origin': 'https://www.justanime.to',
+        'Referer': 'https://www.justanime.to/',
+        'User-Agent': _userAgent,
+        if (request.headers.value(io.HttpHeaders.rangeHeader) case final range?)
+          'Range': range,
+      });
+      request.response.statusCode = upstream.statusCode;
+      final type = upstream.headers[io.HttpHeaders.contentTypeHeader];
+      if (type != null) {
+        request.response.headers.contentType = io.ContentType.parse(type);
+      }
+      final decoded = utf8.decode(upstream.bodyBytes, allowMalformed: true);
+      if (decoded.startsWith('#EXTM3U')) {
+        var manifest = decoded;
+        manifest = manifest.replaceAllMapped(
+          RegExp(r'https://neko\.justanime\.to/[^\r\n]+'),
+          (match) =>
+              'http://127.0.0.1:${_server.port}/fetch?url=${Uri.encodeQueryComponent(match.group(0)!)}',
+        );
+        request.response.write(manifest);
+      } else {
+        request.response.add(upstream.bodyBytes);
+      }
+    } catch (_) {
+      request.response.statusCode = io.HttpStatus.badGateway;
+    }
+    await request.response.close();
+  }
+
+  Future<void> close() => _server.close(force: true);
 }
 
 class _BiliBiliDashProxy {

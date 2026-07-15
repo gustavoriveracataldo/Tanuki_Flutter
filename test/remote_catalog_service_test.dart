@@ -82,6 +82,145 @@ void main() {
     expect(candidate?.trailerUrl, 'https://www.youtube.com/watch?v=demo123');
   });
 
+  test('fetches AniList recommendations using the AniList id from Ani.pm',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(request.url.toString(), 'https://graphql.anilist.co');
+        final body = jsonDecode(request.body) as Map<String, dynamic>;
+        final variables = body['variables'] as Map<String, dynamic>;
+        expect(variables['id'], 21204);
+        expect(body['query'], contains('recommendations'));
+        return http.Response(
+          jsonEncode({
+            'data': {
+              'Media': {
+                'relations': {
+                  'edges': [
+                    {
+                      'relationType': 'SEQUEL',
+                      'node': {
+                        'id': 120204,
+                        'idMal': 40437,
+                        'type': 'ANIME',
+                        'title': {
+                          'romaji': 'Wakako-zake Movie',
+                          'english': null,
+                          'native': 'ワカコ酒 劇場版',
+                        },
+                        'episodes': 1,
+                        'format': 'MOVIE',
+                        'startDate': {'year': 2016, 'month': 1, 'day': 1},
+                      },
+                    },
+                    {
+                      'relationType': 'SOURCE',
+                      'node': {
+                        'id': 86339,
+                        'idMal': null,
+                        'type': 'MANGA',
+                        'title': {'romaji': 'Wakako-Zake'},
+                      },
+                    },
+                  ],
+                },
+                'recommendations': {
+                  'nodes': [
+                    {
+                      'rating': 20,
+                      'mediaRecommendation': {
+                        'id': 98657,
+                        'idMal': 35484,
+                        'title': {
+                          'romaji': 'Osake wa Fuufu ni Natte kara',
+                          'english': 'Love is Like a Cocktail',
+                          'native': 'お酒は夫婦になってから',
+                        },
+                        'episodes': 13,
+                        'format': 'TV_SHORT',
+                        'startDate': {'year': 2017, 'month': 10, 'day': 4},
+                      },
+                    },
+                    {
+                      'rating': 8,
+                      'mediaRecommendation': {
+                        'id': 99753,
+                        'idMal': 36108,
+                        'title': {
+                          'romaji': 'Takunomi.',
+                          'english': null,
+                          'native': 'たくのみ。',
+                        },
+                        'episodes': 12,
+                        'format': 'TV_SHORT',
+                        'startDate': {'year': 2018, 'month': 1, 'day': 12},
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+          request: request,
+        );
+      }),
+    );
+    final series = const RemoteSearchCandidate(
+      provider: RemoteProvider.aniPm,
+      slug: 'ani:21204',
+      title: 'Wakako-zake',
+      watchUrl: 'https://ani.pm/ani/21204',
+      seriesUrl: 'https://ani.pm/ani/21204',
+      releaseYear: 2015,
+      catalogId: 21204,
+      episodeCount: 12,
+    ).toSeries(existingNames: const []);
+
+    final recommendations =
+        await service.fetchAniListRecommendationsForSeries(series);
+
+    expect(
+      recommendations.map((candidate) => candidate.title),
+      [
+        'Wakako-zake Movie',
+        'Osake wa Fuufu ni Natte kara',
+        'Takunomi.',
+      ],
+    );
+    expect(recommendations.first.catalogId, 40437);
+  });
+
+  test('parses recommendations from the public MyAnimeList page', () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(
+          request.url.toString(),
+          'https://myanimelist.net/anime/30437/_/userrecs',
+        );
+        return http.Response('''
+          <div class="picSurround"><a href="https://myanimelist.net/anime/35484/Osake_wa_Fuufu_ni_Natte_kara" class="hoverinfo_trigger">
+            <img src="spacer.gif" data-src="https://cdn.myanimelist.net/r/50x70/images/anime/osake.jpg" alt="Anime: Osake wa Fuufu ni Natte kara">
+          </div>
+          <div class="picSurround"><a href="https://myanimelist.net/anime/36108/Takunomi" class="hoverinfo_trigger">
+            <img data-src="https://cdn.myanimelist.net/r/50x70/images/anime/takunomi.jpg" alt="Anime: Takunomi.">
+          </div>
+        ''', 200, request: request);
+      }),
+    );
+
+    final recommendations =
+        await service.fetchMyAnimeListWebRecommendations(30437);
+
+    expect(
+      recommendations.map((candidate) => candidate.title),
+      ['Osake wa Fuufu ni Natte kara', 'Takunomi.'],
+    );
+    expect(recommendations.map((candidate) => candidate.catalogId),
+        [35484, 36108]);
+  });
+
   test('normalizes Jikan youtube-nocookie trailer embeds', () async {
     final service = RemoteCatalogService(
       client: MockClient((request) async {
@@ -118,6 +257,170 @@ void main() {
       candidate?.trailerUrl,
       'https://www.youtube.com/watch?v=ODxfIvSgWuo',
     );
+  });
+
+  test('keeps AniList airing schedule when top airing result lacks dates',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        if (request.url.host == 'api.jikan.moe') {
+          return http.Response(
+            '''
+            {
+              "data": [
+                {
+                  "mal_id": 100,
+                  "title": "Airing Demo",
+                  "url": "https://myanimelist.net/anime/100",
+                  "type": "TV",
+                  "episodes": 12,
+                  "year": 2026,
+                  "images": {
+                    "jpg": {
+                      "large_image_url": "https://cdn.example.test/jikan.jpg"
+                    }
+                  }
+                }
+              ]
+            }
+            ''',
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'myanimelist.net') {
+          return http.Response('temporarily blocked', 503, request: request);
+        }
+        if (request.url.host == 'graphql.anilist.co') {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          expect(body['query'], contains('airingSchedule(notYetAired: true'));
+          return http.Response(
+            '''
+            {
+              "data": {
+                "Page": {
+                  "media": [
+                    {
+                      "id": 200,
+                      "idMal": 100,
+                      "title": {
+                        "romaji": "Airing Demo",
+                        "english": null,
+                        "native": "Airing Demo"
+                      },
+                      "synonyms": [],
+                      "description": "Demo",
+                      "episodes": 12,
+                      "format": "TV",
+                      "averageScore": 80,
+                      "startDate": {
+                        "year": 2026,
+                        "month": 7,
+                        "day": 1
+                      },
+                      "coverImage": {
+                        "extraLarge": "https://cdn.example.test/anilist.jpg",
+                        "large": "https://cdn.example.test/anilist-large.jpg"
+                      },
+                      "bannerImage": null,
+                      "trailer": null,
+                      "airingSchedule": {
+                        "nodes": [
+                          {
+                            "episode": 4,
+                            "airingAt": 4102444800
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+            ''',
+            200,
+            request: request,
+          );
+        }
+        return http.Response('not found', 404, request: request);
+      }),
+    );
+
+    final results = await service.discoverCatalogAiring(limit: 10);
+
+    expect(results, hasLength(1));
+    expect(results.single.title, 'Airing Demo');
+    expect(results.single.imageUrl, 'https://cdn.example.test/jikan.jpg');
+    expect(results.single.episodeDetails, hasLength(1));
+    expect(results.single.episodeDetails.single.episodeNumber, 4);
+    expect(
+      results.single.episodeDetails.single.airDateIso,
+      startsWith('2100-01-01'),
+    );
+  });
+
+  test('discovers latest movies from playable JKAnime and AnimeAV1 catalogs',
+      () async {
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        if (request.url.host == 'jkanime.net') {
+          expect(request.url.path, '/directorio');
+          expect(request.url.queryParameters['tipo'], 'peliculas');
+          return http.Response(
+            '''
+            <script>
+            var animes = {
+              "data": [
+                {
+                  "title": "JK Movie Demo",
+                  "image": "https://cdn.jkdesa.com/movie.jpg",
+                  "slug": "jk-movie-demo",
+                  "type": "Movie",
+                  "tipo": "Pelicula",
+                  "url": "https://jkanime.net/jk-movie-demo/"
+                }
+              ]
+            };
+            </script>
+            ''',
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'animeav1.com') {
+          expect(request.url.path, '/catalogo');
+          expect(request.url.queryParameters['category'], 'pelicula');
+          expect(request.url.queryParameters['order'], 'latest_released');
+          return http.Response(
+            '''
+            <article class="group/item relative text-body">
+              <img src="https://cdn.animeav1.com/covers/1.jpg" />
+              <div class="rounded bg-line px-2">Película</div>
+              <h3>AnimeAV1 Movie Demo</h3>
+              <a href="/media/animeav1-movie-demo">Ver</a>
+            </article>
+            ''',
+            200,
+            request: request,
+          );
+        }
+        return http.Response('not found', 404, request: request);
+      }),
+    );
+
+    final movies = await service.discoverCatalogMovies(limit: 10);
+
+    expect(requestedUrls, hasLength(2));
+    expect(movies.map((candidate) => candidate.provider), [
+      RemoteProvider.jkAnime,
+      RemoteProvider.animeAv1,
+    ]);
+    expect(movies.map((candidate) => candidate.title), [
+      'JK Movie Demo',
+      'AnimeAV1 Movie Demo',
+    ]);
   });
 
   test('aggregate search skips disabled AnimeFLV provider', () async {
@@ -1432,6 +1735,7 @@ void main() {
 
     expect(stream?.playbackKind, 'mp4');
     expect(stream?.playbackUrl, 'https://cdn.example.test/demo/video.mp4');
+    expect(stream?.availableServers, contains('mp4upload'));
   });
 
   test('resolves JKAnime window.servers payload through a host page', () async {
@@ -1728,6 +2032,82 @@ void main() {
     expect(audioResponse.bodyBytes, const [4, 5, 6, 7]);
     expect(requestedUrls, contains(audioUrl));
   });
+
+  test('probes real JKAnime servers with ffprobe', () async {
+    const pageUrl =
+        'https://jkanime.net/disney-twisted-wonderland-the-animation-episode-of-heartslabyul/1/';
+    const seriesUrl =
+        'https://jkanime.net/disney-twisted-wonderland-the-animation-episode-of-heartslabyul/';
+    const servers = [
+      'desu',
+      'magi',
+      'streamwish',
+      'mp4upload',
+      'vidhide',
+      'mixdrop',
+      'voe',
+      'filemoon',
+      'doodstream',
+      'stape',
+    ];
+    final playable = <String>{};
+    for (final server in servers) {
+      final service = RemoteCatalogService();
+      try {
+        final stream = await service.resolveDirectStream(
+          _episode(
+            provider: RemoteProvider.jkAnime,
+            filePath: pageUrl,
+            watchUrl: seriesUrl,
+            slug:
+                'disney-twisted-wonderland-the-animation-episode-of-heartslabyul',
+          ),
+          preferredServer: server,
+        );
+        if (stream == null) {
+          // ignore: avoid_print
+          print('JKAnime $server: resolver returned null');
+          continue;
+        }
+        final headers = stream.httpHeaders.entries
+            .map((entry) => '${entry.key}: ${entry.value}\r\n')
+            .join();
+        final probe = await io.Process.run('ffprobe', [
+          '-v',
+          'error',
+          if (headers.isNotEmpty) ...['-headers', headers],
+          '-print_format',
+          'json',
+          '-show_streams',
+          stream.playbackUrl,
+        ]).timeout(const Duration(seconds: 30));
+        final decoded = probe.exitCode == 0
+            ? jsonDecode('${probe.stdout}') as Map<String, dynamic>
+            : const <String, dynamic>{};
+        final types = (decoded['streams'] as List? ?? const [])
+            .whereType<Map>()
+            .map((entry) => '${entry['codec_type']}')
+            .toSet();
+        if (types.contains('video') && types.contains('audio')) {
+          playable.add(server);
+        }
+        // ignore: avoid_print
+        print(
+          'JKAnime $server: resolved=${stream.server} '
+          'kind=${stream.playbackKind} types=$types exit=${probe.exitCode}',
+        );
+      } catch (error) {
+        // ignore: avoid_print
+        print('JKAnime $server: $error');
+      } finally {
+        service.close();
+      }
+    }
+    expect(playable, contains('desu'));
+    expect(playable, contains('magi'));
+  },
+      skip: io.Platform.environment['RUN_JKANIME_PROBE'] != '1',
+      timeout: const Timeout(Duration(minutes: 8)));
 
   test('probes real BiliBili dash media with ffprobe', () async {
     const pageUrl = 'https://www.bilibili.tv/en/video/2044128968';
@@ -2291,9 +2671,9 @@ void main() {
       slug: 'demo',
     ));
 
-    expect(stream?.playbackKind, 'hls');
-    expect(stream?.playbackUrl, 'https://cdn.example.test/demo/mixdrop.m3u8');
-    expect(stream?.server, 'mixdrop');
+    expect(stream?.playbackKind, 'mp4');
+    expect(stream?.playbackUrl, 'https://cdn.example.test/demo/mp4upload.mp4');
+    expect(stream?.server, 'mp4upload');
   });
 
   test('prefers JKAnime var servers over native iframe like Android', () async {

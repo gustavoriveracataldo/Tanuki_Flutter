@@ -448,6 +448,25 @@ class AppController extends ChangeNotifier {
     return jkAnimeServerPreferenceFromId(value);
   }
 
+  LatAnimeServerPreference latAnimeServerForEpisode(EpisodeItem episode) {
+    final value = playbackPreferenceForEpisode(episode).latAnimeServer;
+    return latAnimeServerPreferenceFromId(value);
+  }
+
+  JustAnimePlaybackMode justAnimeModeForEpisode(EpisodeItem episode) =>
+      justAnimePlaybackModeFromId(
+          playbackPreferenceForEpisode(episode).justAnimeMode);
+
+  JustAnimeServerPreference justAnimeServerForEpisode(EpisodeItem episode) =>
+      justAnimeServerPreferenceFromId(
+          playbackPreferenceForEpisode(episode).justAnimeServer);
+
+  AniPmPlaybackMode aniPmModeForEpisode(EpisodeItem episode) =>
+      aniPmPlaybackModeFromId(playbackPreferenceForEpisode(episode).aniPmMode);
+
+  String aniPmServerForEpisode(EpisodeItem episode) =>
+      playbackPreferenceForEpisode(episode).aniPmServer.trim().toLowerCase();
+
   FacebookPlaybackMode facebookModeForEpisode(EpisodeItem episode) {
     final value = playbackPreferenceForEpisode(episode).facebookMode;
     return facebookPlaybackModeFromId(value);
@@ -461,6 +480,10 @@ class AppController extends ChangeNotifier {
   void setStatusMessage(String message) {
     _statusMessage = message.trim();
     notifyListeners();
+  }
+
+  void retireRemotePlaybackProxy(String playbackUrl) {
+    _remoteCatalog.retirePlaybackProxy(playbackUrl);
   }
 
   void clearPendingTrailerDetailRequest(int requestId) {
@@ -1430,7 +1453,7 @@ class AppController extends ChangeNotifier {
   Future<List<RemoteSearchCandidate>> loadHomeMovieCandidates({
     int pages = 2,
   }) async {
-    final targetPages = pages.clamp(1, 4).toInt();
+    final targetPages = pages.clamp(1, 10).toInt();
     final results = <RemoteSearchCandidate>[];
     for (var page = 1; page <= targetPages; page += 1) {
       final pageResults = await _remoteCatalog.discoverCatalogMovies(
@@ -1472,7 +1495,7 @@ class AppController extends ChangeNotifier {
   Future<List<RemoteSearchCandidate>> loadHomeAiringCandidates({
     int pages = 1,
   }) async {
-    final targetPages = pages.clamp(1, 4).toInt();
+    final targetPages = pages.clamp(1, 10).toInt();
     final results = <RemoteSearchCandidate>[];
     for (var page = 1; page <= targetPages; page += 1) {
       final pageResults = await _remoteCatalog.discoverCatalogAiring(
@@ -1556,36 +1579,80 @@ class AppController extends ChangeNotifier {
       loadSimilarCandidates(SeriesItem series) async {
     final related = <RemoteSearchCandidate>[];
     var usedRecommendations = false;
-
-    if (series.catalogId > 0) {
-      try {
-        final recommendations =
-            await _remoteCatalog.fetchCatalogRecommendations(series.catalogId);
-        if (recommendations.isNotEmpty) {
-          related.addAll(recommendations);
-          usedRecommendations = true;
-        }
-      } catch (_) {
-        // Search fallback below keeps the panel useful offline from Jikan recs.
-      }
-    }
-
-    if (related.isEmpty) {
-      final query = _stripProviderSuffix(series.name);
-      if (query.isNotEmpty) {
-        try {
-          related.addAll(await _remoteCatalog.search(query));
-        } catch (_) {
-          // Return the empty-state message below.
-        }
-      }
-    }
-
+    var usedTitleFallback = false;
     final normalizedTitle = normalizeSeriesKey(
       _stripProviderSuffix(series.name),
     );
+
+    try {
+      final recommendations =
+          await _remoteCatalog.fetchAniListRecommendationsForSeries(series);
+      if (recommendations.isNotEmpty) {
+        related.addAll(recommendations);
+        usedRecommendations = true;
+      }
+    } catch (_) {
+      // Jikan remains available below when AniList is rate limited.
+    }
+
+    if (related.isEmpty) {
+      final malId = await _remoteCatalog.resolveMyAnimeListIdForSeries(series);
+      if (malId > 0) {
+        try {
+          final recommendations =
+              await _remoteCatalog.fetchCatalogRecommendations(malId);
+          if (recommendations.isNotEmpty) {
+            related.addAll(recommendations);
+            usedRecommendations = true;
+          }
+        } catch (_) {
+          // The public MAL page remains available when Jikan cannot reach MAL.
+        }
+        if (related.isEmpty) {
+          try {
+            final recommendations =
+                await _remoteCatalog.fetchMyAnimeListWebRecommendations(malId);
+            if (recommendations.isNotEmpty) {
+              related.addAll(recommendations);
+              usedRecommendations = true;
+            }
+          } catch (_) {
+            // The empty state below is preferable to unrelated title matches.
+          }
+        }
+      }
+    }
+
+    if (related.isEmpty && normalizedTitle.isNotEmpty) {
+      try {
+        final matches = await _remoteCatalog.search(
+          _stripProviderSuffix(series.name),
+        );
+        final similarMatches = matches.where((candidate) {
+          final candidateTitle = normalizeSeriesKey(candidate.title);
+          return candidateTitle != normalizedTitle &&
+              _similarTitleFallbackScore(normalizedTitle, candidateTitle) > 0;
+        }).toList()
+          ..sort((left, right) => _similarTitleFallbackScore(
+                normalizedTitle,
+                normalizeSeriesKey(right.title),
+              ).compareTo(_similarTitleFallbackScore(
+                normalizedTitle,
+                normalizeSeriesKey(left.title),
+              )));
+        if (similarMatches.isNotEmpty) {
+          related.addAll(similarMatches);
+          usedTitleFallback = true;
+        }
+      } catch (_) {
+        // Keep the honest empty state when every source is unavailable.
+      }
+    }
+
     final candidates = _dedupeCandidates(
-      _sortByPreferredProvider(_activeRemoteCandidates(related)),
+      usedTitleFallback
+          ? _activeRemoteCandidates(related)
+          : _sortByPreferredProvider(_activeRemoteCandidates(related)),
     )
         .where((candidate) {
           if (series.catalogId > 0 && candidate.catalogId == series.catalogId) {
@@ -1596,13 +1663,42 @@ class AppController extends ChangeNotifier {
         .take(15)
         .toList();
 
-    final status = switch ((candidates.isEmpty, usedRecommendations)) {
-      (true, _) => 'No encontre series similares para esta ficha todavia.',
-      (false, true) =>
+    final status =
+        switch ((candidates.isEmpty, usedRecommendations, usedTitleFallback)) {
+      (true, _, _) => 'No encontre series similares para esta ficha todavia.',
+      (false, true, _) =>
         'Basado en recomendaciones de anime similares y afinidad del catalogo.',
+      (false, false, true) => 'Titulos con un nombre parecido.',
       _ => 'Series cercanas a esta para seguir explorando.',
     };
     return (candidates: candidates, status: status);
+  }
+
+  int _similarTitleFallbackScore(String requested, String candidate) {
+    if (requested.isEmpty || candidate.isEmpty || requested == candidate) {
+      return 0;
+    }
+    if (candidate.contains(requested)) {
+      return 1000 - (candidate.length - requested.length).clamp(0, 500).toInt();
+    }
+    if (requested.contains(candidate) && candidate.length >= 5) {
+      return 800 - (requested.length - candidate.length).clamp(0, 500).toInt();
+    }
+    final requestedTokens = requested
+        .split(RegExp(r'\s+'))
+        .where((token) => token.length >= 3)
+        .toSet();
+    final candidateTokens = candidate
+        .split(RegExp(r'\s+'))
+        .where((token) => token.length >= 3)
+        .toSet();
+    if (requestedTokens.isEmpty || candidateTokens.isEmpty) return 0;
+    final overlap = requestedTokens.intersection(candidateTokens).length;
+    final requiredOverlap = requestedTokens.length == 1 ? 1 : 2;
+    if (overlap < requiredOverlap) return 0;
+    final union = requestedTokens.union(candidateTokens).length;
+    final similarity = overlap / union;
+    return similarity >= 0.4 ? (similarity * 700).round() : 0;
   }
 
   Future<SeriesItem> importRemoteCandidate(
@@ -1748,6 +1844,7 @@ class AppController extends ChangeNotifier {
     Set<RemoteProvider> excludedProviders = const {},
     Set<String> excludedRemoteServers = const {},
     RemoteProvider? excludedRemoteServersProvider,
+    ValueChanged<RemoteProvider?>? onProviderAttempt,
   }) async {
     final excluded = {
       RemoteProvider.animeKai,
@@ -1779,7 +1876,8 @@ class AppController extends ChangeNotifier {
       'excludedServersProvider=${excludedRemoteServersProvider?.id ?? 'none'} '
       'excludedServers=${excludedRemoteServers.join(',')} '
       'animeAv1Mode=${animeAv1PlaybackModeFromId(preference.animeAv1Mode).id} '
-      'jkServer=${jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id}',
+      'jkServer=${jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id} '
+      'latServer=${latAnimeServerPreferenceFromId(preference.latAnimeServer).id}',
     );
     final effectiveEpisode = _resolvePreferredRemoteEpisode(
       episode,
@@ -1806,7 +1904,11 @@ class AppController extends ChangeNotifier {
         playbackTarget,
         preferredMode: playbackTarget.provider == RemoteProvider.youtube
             ? youtubePlaybackModeFromId(preference.youtubeMode).id
-            : animeAv1PlaybackModeFromId(preference.animeAv1Mode).id,
+            : playbackTarget.provider == RemoteProvider.justAnime
+                ? justAnimePlaybackModeFromId(preference.justAnimeMode).id
+                : playbackTarget.provider == RemoteProvider.aniPm
+                    ? aniPmPlaybackModeFromId(preference.aniPmMode).id
+                    : animeAv1PlaybackModeFromId(preference.animeAv1Mode).id,
         preferredFacebookMode: facebookPlaybackModeFromId(
           preference.facebookMode,
         ).id,
@@ -1847,6 +1949,7 @@ class AppController extends ChangeNotifier {
           );
       for (final provider in _dynamicRemoteProviderOrder(preferredProvider)
           .where((provider) => !excluded.contains(provider))) {
+        onProviderAttempt?.call(provider);
         _debugRemotePlayback('lookup provider candidate ${provider.id}');
         final libraryEpisode = _resolvePreferredRemoteEpisode(
           episode,
@@ -1879,6 +1982,7 @@ class AppController extends ChangeNotifier {
         return null;
       }
     }
+    onProviderAttempt?.call(effectiveEpisode.provider);
     final resolved = await resolve(effectiveEpisode);
     _debugRemotePlayback('resolve finished ${_debugStreamLabel(resolved)}');
     return resolved;
@@ -1933,6 +2037,16 @@ class AppController extends ChangeNotifier {
         preference.jkAnimeServer.trim().isNotEmpty) {
       return jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id;
     }
+    if (provider == RemoteProvider.latAnime &&
+        preference.latAnimeServer.trim().isNotEmpty) {
+      return latAnimeServerPreferenceFromId(preference.latAnimeServer).id;
+    }
+    if (provider == RemoteProvider.justAnime) {
+      return justAnimeServerPreferenceFromId(preference.justAnimeServer).id;
+    }
+    if (provider == RemoteProvider.aniPm) {
+      return preference.aniPmServer.trim().toLowerCase();
+    }
     if (provider == RemoteProvider.youtube) {
       final mode = youtubePlaybackModeFromId(preference.youtubeMode);
       final option = youtubePlaybackOptionFromId(preference.youtubeOption);
@@ -1949,6 +2063,8 @@ class AppController extends ChangeNotifier {
       RemoteProvider.animeAv1,
       RemoteProvider.jkAnime,
       RemoteProvider.latAnime,
+      RemoteProvider.justAnime,
+      RemoteProvider.aniPm,
       RemoteProvider.internetArchive,
       RemoteProvider.bilibili,
       RemoteProvider.youtube,
@@ -2609,11 +2725,58 @@ class AppController extends ChangeNotifier {
       (current) => current.copyWith(
         provider: normalized,
         clearProvider: normalized == null,
+        jkAnimeServer: normalized == RemoteProvider.jkAnime
+            ? JkAnimeServerPreference.desu.id
+            : null,
       ),
       normalized == null
           ? 'Fuente automatica para esta serie.'
           : 'Fuente de la serie: ${normalized.label}.',
     );
+  }
+
+  Future<void> rememberResolvedPlaybackForEpisode(
+    EpisodeItem episode,
+    RemoteDirectStream stream,
+  ) async {
+    final provider = stream.provider;
+    if (provider == null ||
+        !canUsePlaybackProviderForEpisode(episode, provider)) {
+      return;
+    }
+    final current = playbackPreferenceForEpisode(episode);
+    var next = current.copyWith(provider: provider);
+    final server = stream.server.trim().toLowerCase();
+    final mode = stream.selectedMode.trim().toLowerCase();
+    if (provider == RemoteProvider.animeAv1 && mode.isNotEmpty) {
+      next = next.copyWith(animeAv1Mode: mode);
+    } else if (provider == RemoteProvider.jkAnime && server.isNotEmpty) {
+      next = next.copyWith(jkAnimeServer: server);
+    } else if (provider == RemoteProvider.latAnime && server.isNotEmpty) {
+      next = next.copyWith(latAnimeServer: server);
+    } else if (provider == RemoteProvider.justAnime) {
+      next = next.copyWith(
+        justAnimeMode: mode,
+        justAnimeServer: server,
+      );
+    } else if (provider == RemoteProvider.aniPm) {
+      next = next.copyWith(
+        aniPmMode: mode,
+        aniPmServer: server,
+      );
+    }
+    if (next.toJson().toString() == current.toJson().toString()) return;
+    final key = normalizeSeriesKey(episode.seriesName);
+    if (key.isEmpty) return;
+    final preferences = Map<String, SeriesPlaybackPreference>.from(
+      _state.profile.seriesPlaybackPreferences,
+    );
+    preferences[key] = next;
+    _state = _state.copyWith(
+      profile: _state.profile.copyWith(seriesPlaybackPreferences: preferences),
+    );
+    await _save();
+    notifyListeners();
   }
 
   bool _isDisabledRemoteProvider(RemoteProvider? provider) {
@@ -2625,6 +2788,8 @@ class AppController extends ChangeNotifier {
     return provider == RemoteProvider.animeAv1 ||
         provider == RemoteProvider.jkAnime ||
         provider == RemoteProvider.latAnime ||
+        provider == RemoteProvider.justAnime ||
+        provider == RemoteProvider.aniPm ||
         provider == RemoteProvider.internetArchive ||
         provider == RemoteProvider.bilibili ||
         provider == RemoteProvider.youtube;
@@ -2649,6 +2814,61 @@ class AppController extends ChangeNotifier {
       episode,
       (current) => current.copyWith(jkAnimeServer: server.id),
       'JKAnime: ${server.label}.',
+    );
+  }
+
+  Future<void> setLatAnimeServerForEpisode(
+    EpisodeItem episode,
+    LatAnimeServerPreference server,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(latAnimeServer: server.id),
+      'LatAnime: ${server.label}.',
+    );
+  }
+
+  Future<void> setJustAnimeModeForEpisode(
+    EpisodeItem episode,
+    JustAnimePlaybackMode mode,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(justAnimeMode: mode.id),
+      'JustAnime: ${mode.dialogLabel}.',
+    );
+  }
+
+  Future<void> setJustAnimeServerForEpisode(
+    EpisodeItem episode,
+    JustAnimeServerPreference server,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(justAnimeServer: server.id),
+      'JustAnime: ${server.label}.',
+    );
+  }
+
+  Future<void> setAniPmModeForEpisode(
+    EpisodeItem episode,
+    AniPmPlaybackMode mode,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(aniPmMode: mode.id),
+      'ani.pm: ${mode.dialogLabel}.',
+    );
+  }
+
+  Future<void> setAniPmServerForEpisode(
+    EpisodeItem episode,
+    String server,
+  ) async {
+    await _updateSeriesPlaybackPreference(
+      episode,
+      (current) => current.copyWith(aniPmServer: server.trim().toLowerCase()),
+      'ani.pm: ${server.trim().isEmpty ? 'Automatico' : server.trim()}.',
     );
   }
 

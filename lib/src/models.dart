@@ -8,6 +8,8 @@ enum RemoteProvider {
   animeKai,
   jkAnime,
   latAnime,
+  justAnime,
+  aniPm,
   animeFlv,
   facebook,
   internetArchive,
@@ -32,6 +34,8 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.animeKai => 'animekai',
       RemoteProvider.jkAnime => 'jkanime',
       RemoteProvider.latAnime => 'latanime',
+      RemoteProvider.justAnime => 'justanime',
+      RemoteProvider.aniPm => 'anipm',
       RemoteProvider.animeFlv => 'animeflv',
       RemoteProvider.facebook => 'facebook',
       RemoteProvider.internetArchive => 'internetarchive',
@@ -47,6 +51,8 @@ extension RemoteProviderDetails on RemoteProvider {
       RemoteProvider.animeKai => 'AnimeKai',
       RemoteProvider.jkAnime => 'JKAnime',
       RemoteProvider.latAnime => 'LatAnime',
+      RemoteProvider.justAnime => 'JustAnime',
+      RemoteProvider.aniPm => 'ani.pm',
       RemoteProvider.animeFlv => 'AnimeFLV',
       RemoteProvider.facebook => 'Facebook',
       RemoteProvider.internetArchive => 'Internet Archive',
@@ -116,10 +122,15 @@ AnimeAv1PlaybackMode animeAv1PlaybackModeFromId(Object? value) {
 
 enum JkAnimeServerPreference {
   desu('desu', 'Desu'),
+  magi('magi', 'Magi'),
   streamWish('streamwish', 'StreamWish'),
+  mp4upload('mp4upload', 'MP4Upload'),
   vidhide('vidhide', 'VidHide'),
   mixDrop('mixdrop', 'MixDrop'),
-  doodstream('doodstream', 'Doodstream');
+  voe('voe', 'VOE'),
+  filemoon('filemoon', 'FileMoon'),
+  doodstream('doodstream', 'Doodstream'),
+  streamTape('stape', 'StreamTape');
 
   const JkAnimeServerPreference(this.id, this.label);
 
@@ -140,14 +151,97 @@ JkAnimeServerPreference jkAnimeServerPreferenceFromId(Object? value) {
     String text when text.contains('mixdrop') || text.contains('mix drop') =>
       JkAnimeServerPreference.mixDrop,
     String text
+        when text.contains('mp4upload') || text.contains('mp4 upload') =>
+      JkAnimeServerPreference.mp4upload,
+    String text when text.contains('filemoon') =>
+      JkAnimeServerPreference.filemoon,
+    String text when text == 'voe' || text.contains('voe.sx') =>
+      JkAnimeServerPreference.voe,
+    String text when text.contains('streamtape') || text.contains('stape') =>
+      JkAnimeServerPreference.streamTape,
+    String text
         when text.contains('doodstream') ||
             text.contains('dood') ||
             text.contains('dsvplay') =>
       JkAnimeServerPreference.doodstream,
     String text when text.contains('desu') => JkAnimeServerPreference.desu,
+    String text when text.contains('magi') => JkAnimeServerPreference.magi,
     String text when text.contains('vidhide') || text.contains('vid hide') =>
       JkAnimeServerPreference.vidhide,
     _ => JkAnimeServerPreference.desu,
+  };
+}
+
+enum LatAnimeServerPreference {
+  uqload('uqload', 'Uqload'),
+  mp4upload('mp4upload', 'MP4Upload'),
+  doodstream('doodstream', 'Doodstream'),
+  yourUpload('yourupload', 'YourUpload');
+
+  const LatAnimeServerPreference(this.id, this.label);
+
+  final String id;
+  final String label;
+}
+
+enum JustAnimePlaybackMode {
+  sub('sub', 'SUB', 'Subtitulado'),
+  dub('dub', 'DUB', 'Doblado');
+
+  const JustAnimePlaybackMode(this.id, this.buttonLabel, this.dialogLabel);
+  final String id;
+  final String buttonLabel;
+  final String dialogLabel;
+}
+
+enum AniPmPlaybackMode {
+  sub('sub', 'SUB', 'Subtitulado'),
+  dub('dub', 'DUB', 'Doblado');
+
+  const AniPmPlaybackMode(this.id, this.buttonLabel, this.dialogLabel);
+  final String id;
+  final String buttonLabel;
+  final String dialogLabel;
+}
+
+AniPmPlaybackMode aniPmPlaybackModeFromId(Object? value) =>
+    '$value'.trim().toLowerCase() == 'dub'
+        ? AniPmPlaybackMode.dub
+        : AniPmPlaybackMode.sub;
+
+JustAnimePlaybackMode justAnimePlaybackModeFromId(Object? value) =>
+    '$value'.trim().toLowerCase() == 'dub'
+        ? JustAnimePlaybackMode.dub
+        : JustAnimePlaybackMode.sub;
+
+enum JustAnimeServerPreference {
+  neko('neko', 'Neko'),
+  gigi('gigi', 'Gigi');
+
+  const JustAnimeServerPreference(this.id, this.label);
+  final String id;
+  final String label;
+}
+
+JustAnimeServerPreference justAnimeServerPreferenceFromId(Object? value) =>
+    '$value'.trim().toLowerCase().contains('gigi')
+        ? JustAnimeServerPreference.gigi
+        : JustAnimeServerPreference.neko;
+
+LatAnimeServerPreference latAnimeServerPreferenceFromId(Object? value) {
+  final normalized = '$value'.trim().toLowerCase();
+  return switch (normalized) {
+    String text
+        when text.contains('mp4upload') || text.contains('mp4 upload') =>
+      LatAnimeServerPreference.mp4upload,
+    String text when text.contains('dood') || text.contains('dsvplay') =>
+      LatAnimeServerPreference.doodstream,
+    String text
+        when text.contains('yourupload') ||
+            text.contains('your upload') ||
+            text.contains('vidcache') =>
+      LatAnimeServerPreference.yourUpload,
+    _ => LatAnimeServerPreference.uqload,
   };
 }
 
@@ -680,6 +774,7 @@ class RemoteDirectStream {
     required this.playbackKind,
     required this.pageUrl,
     this.availableModes = const {},
+    this.availableServers = const {},
     this.selectedMode = '',
     this.provider,
     this.server = '',
@@ -691,6 +786,7 @@ class RemoteDirectStream {
   final String playbackKind;
   final String pageUrl;
   final Set<String> availableModes;
+  final Set<String> availableServers;
   final String selectedMode;
   final RemoteProvider? provider;
   final String server;
@@ -702,6 +798,7 @@ class RemoteDirectStream {
     String? playbackKind,
     String? pageUrl,
     Set<String>? availableModes,
+    Set<String>? availableServers,
     String? selectedMode,
     RemoteProvider? provider,
     String? server,
@@ -713,6 +810,7 @@ class RemoteDirectStream {
       playbackKind: playbackKind ?? this.playbackKind,
       pageUrl: pageUrl ?? this.pageUrl,
       availableModes: availableModes ?? this.availableModes,
+      availableServers: availableServers ?? this.availableServers,
       selectedMode: selectedMode ?? this.selectedMode,
       provider: provider ?? this.provider,
       server: server ?? this.server,
@@ -744,6 +842,11 @@ class SeriesPlaybackPreference {
     this.animeAv1Mode = '',
     this.animeKaiMode = '',
     this.jkAnimeServer = '',
+    this.latAnimeServer = '',
+    this.justAnimeMode = '',
+    this.justAnimeServer = '',
+    this.aniPmMode = '',
+    this.aniPmServer = '',
     this.facebookMode = '',
     this.facebookOption = '',
     this.youtubeMode = '',
@@ -755,6 +858,11 @@ class SeriesPlaybackPreference {
   final String animeAv1Mode;
   final String animeKaiMode;
   final String jkAnimeServer;
+  final String latAnimeServer;
+  final String justAnimeMode;
+  final String justAnimeServer;
+  final String aniPmMode;
+  final String aniPmServer;
   final String facebookMode;
   final String facebookOption;
   final String youtubeMode;
@@ -769,6 +877,11 @@ class SeriesPlaybackPreference {
       animeAv1Mode: _normalizeOptionalAnimeAv1Mode(json['animeAv1Mode']),
       animeKaiMode: _readString(json['animeKaiMode']),
       jkAnimeServer: _normalizeOptionalJkAnimeServer(json['jkAnimeServer']),
+      latAnimeServer: _normalizeOptionalLatAnimeServer(json['latAnimeServer']),
+      justAnimeMode: _readString(json['justAnimeMode']),
+      justAnimeServer: _readString(json['justAnimeServer']),
+      aniPmMode: _readString(json['aniPmMode']),
+      aniPmServer: _readString(json['aniPmServer']),
       facebookMode: _normalizeOptionalFacebookMode(json['facebookMode']),
       facebookOption: _normalizeOptionalFacebookOption(json['facebookOption']),
       youtubeMode: _normalizeOptionalYoutubeMode(json['youtubeMode']),
@@ -785,6 +898,11 @@ class SeriesPlaybackPreference {
     String? animeAv1Mode,
     String? animeKaiMode,
     String? jkAnimeServer,
+    String? latAnimeServer,
+    String? justAnimeMode,
+    String? justAnimeServer,
+    String? aniPmMode,
+    String? aniPmServer,
     String? facebookMode,
     String? facebookOption,
     String? youtubeMode,
@@ -800,6 +918,13 @@ class SeriesPlaybackPreference {
       jkAnimeServer: jkAnimeServer == null
           ? this.jkAnimeServer
           : _normalizeOptionalJkAnimeServer(jkAnimeServer),
+      latAnimeServer: latAnimeServer == null
+          ? this.latAnimeServer
+          : _normalizeOptionalLatAnimeServer(latAnimeServer),
+      justAnimeMode: justAnimeMode ?? this.justAnimeMode,
+      justAnimeServer: justAnimeServer ?? this.justAnimeServer,
+      aniPmMode: aniPmMode ?? this.aniPmMode,
+      aniPmServer: aniPmServer ?? this.aniPmServer,
       facebookMode: facebookMode == null
           ? this.facebookMode
           : _normalizeOptionalFacebookMode(facebookMode),
@@ -825,6 +950,11 @@ class SeriesPlaybackPreference {
         animeAv1Mode.trim().isNotEmpty ||
         animeKaiMode.trim().isNotEmpty ||
         jkAnimeServer.trim().isNotEmpty ||
+        latAnimeServer.trim().isNotEmpty ||
+        justAnimeMode.trim().isNotEmpty ||
+        justAnimeServer.trim().isNotEmpty ||
+        aniPmMode.trim().isNotEmpty ||
+        aniPmServer.trim().isNotEmpty ||
         facebookMode.trim().isNotEmpty ||
         facebookOption.trim().isNotEmpty ||
         youtubeMode.trim().isNotEmpty ||
@@ -838,6 +968,11 @@ class SeriesPlaybackPreference {
       'animeAv1Mode': _normalizeOptionalAnimeAv1Mode(animeAv1Mode),
       'animeKaiMode': animeKaiMode,
       'jkAnimeServer': _normalizeOptionalJkAnimeServer(jkAnimeServer),
+      'latAnimeServer': _normalizeOptionalLatAnimeServer(latAnimeServer),
+      'justAnimeMode': justAnimePlaybackModeFromId(justAnimeMode).id,
+      'justAnimeServer': justAnimeServerPreferenceFromId(justAnimeServer).id,
+      'aniPmMode': aniPmPlaybackModeFromId(aniPmMode).id,
+      'aniPmServer': aniPmServer.trim(),
       'facebookMode': _normalizeOptionalFacebookMode(facebookMode),
       'facebookOption': _normalizeOptionalFacebookOption(facebookOption),
       'youtubeMode': _normalizeOptionalYoutubeMode(youtubeMode),
@@ -1833,6 +1968,11 @@ String _normalizeOptionalAnimeAv1Mode(Object? value) {
 String _normalizeOptionalJkAnimeServer(Object? value) {
   final raw = _readString(value);
   return raw.isEmpty ? '' : jkAnimeServerPreferenceFromId(raw).id;
+}
+
+String _normalizeOptionalLatAnimeServer(Object? value) {
+  final raw = _readString(value);
+  return raw.isEmpty ? '' : latAnimeServerPreferenceFromId(raw).id;
 }
 
 String _normalizeOptionalFacebookMode(Object? value) {

@@ -310,10 +310,9 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
         );
         await controller.loadHtmlString(
           canUseFloatingDesktopTrailerWebView(
-                    platform: defaultTargetPlatform,
-                    isWeb: kIsWeb,
-                  ) &&
-                  widget.entries.length > 1
+            platform: defaultTargetPlatform,
+            isWeb: kIsWeb,
+          )
               ? desktopYouTubeTrailerQueueHtml(
                   title: widget.title,
                   entries: widget.entries,

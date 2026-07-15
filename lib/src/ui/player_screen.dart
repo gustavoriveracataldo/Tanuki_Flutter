@@ -64,12 +64,18 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  static final List<vlc.Player> _retiredBiliBiliVlcPlayers = <vlc.Player>[];
+  static final List<vlc.Player> _retiredRemoteVlcPlayers = <vlc.Player>[];
+  static final Set<vlc.Player> _activeDesktopVlcPlayers = <vlc.Player>{};
+  static bool _disposingRetiredVlc = false;
 
   Player? _player;
   VideoController? _videoController;
   vp.VideoPlayerController? _androidExoController;
   vlc.Player? _desktopVlcPlayer;
+  String _desktopVlcSourcePath = '';
+  List<RemoteCaptionCue> _desktopVlcSubtitleCues = const [];
+  int _desktopSubtitleLoadTicket = 0;
+  int _lastDesktopSubtitleCueIndex = -2;
   WebViewController? _youtubeWebController;
   StreamSubscription<vlc.PositionState>? _desktopVlcPositionSubscription;
   StreamSubscription<vlc.PlaybackState>? _desktopVlcPlaybackSubscription;
@@ -113,6 +119,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       FocusNode(debugLabel: 'playerBottomProgress');
   late VideoScaleMode _videoScaleMode;
   RemoteDirectStream? _currentResolvedStream;
+  RemoteProvider? _automaticResolvingProvider;
   String _selectedRemoteSubtitleTrackKey = '';
   final Set<RemoteProvider> _failedRemoteProviders = <RemoteProvider>{};
   final Set<String> _failedRemoteServers = <String>{};
@@ -200,6 +207,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    _desktopSubtitleLoadTicket += 1;
     unawaited(_pauseSimklScrobble());
     _schedulePlaybackPersistAfterDispose();
     _simklScrobbleTimer?.cancel();
@@ -409,6 +417,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _disposeYoutubeWebPlayer();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
+    _desktopSubtitleLoadTicket += 1;
+    _desktopVlcSubtitleCues = const [];
+    _lastDesktopSubtitleCueIndex = -2;
     _openedNativeYoutubePlayer = false;
     _remotePlaybackAccepted = false;
     _remoteOpeningRecoveryAttempts = 0;
@@ -436,14 +447,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
         excludedProviders: _failedRemoteProviders,
         excludedRemoteServers: _failedRemoteServers,
         excludedRemoteServersProvider: _serverFallbackProvider,
+        onProviderAttempt: (provider) {
+          if (!mounted || openTicket != _openEpisodeTicket) return;
+          setState(() => _automaticResolvingProvider = provider);
+        },
       );
       if (!mounted || openTicket != _openEpisodeTicket) {
         _debugPlayerEvent('open discarded stale remote resolve');
         return;
       }
+      _automaticResolvingProvider = null;
       if (resolved != null && resolved.playbackUrl.isNotEmpty) {
         _currentResolvedStream = resolved;
         _reconcileRemoteSubtitleSelection(resolved);
+        await widget.controller.rememberResolvedPlaybackForEpisode(
+          widget.episode,
+          resolved,
+        );
+        if (!mounted || openTicket != _openEpisodeTicket) return;
         path = resolved.playbackUrl;
         _debugPlayerEvent(
           'resolved provider=${resolved.provider?.id ?? 'unknown'} '
@@ -601,6 +622,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 : 'Reproduccion local'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
       });
+      unawaited(_loadDesktopVlcSubtitleCues());
       _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
     } catch (error) {
@@ -712,12 +734,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  Future<void> _openDesktopVlcPlayer(String path) async {
+  Future<void> _openDesktopVlcPlayer(
+    String path, {
+    Duration? resumeOverride,
+  }) async {
     await _disposeDesktopVlcPlayer(delayForBiliBili: true);
     _desktopVlcCompletionHandled = false;
     _setPlayerBuffering(true);
 
-    final resumePosition =
+    final resumePosition = resumeOverride ??
         widget.controller.resumePositionForEpisode(widget.episode);
     final openStart = _desktopVlcOpenStartPosition(resumePosition);
     final urlStart =
@@ -730,14 +755,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final player = vlc.Player(
       id: _nextDesktopVlcPlayerId++,
       commandlineArguments: [
-        '--network-caching=1500',
+        // Remote HLS segments sometimes arrive with PCR/PTS jitter above one
+        // second. A three-second buffer gives libVLC enough margin without
+        // disabling clock synchronization (which could desync A/V).
+        '--network-caching=3000',
+        '--live-caching=3000',
+        '--http-reconnect',
         '--adaptive-logic=highest',
         if (audioSlave.isNotEmpty) '--input-slave=$audioSlave',
         if (referer.isNotEmpty) '--http-referrer=$referer',
       ],
     );
     _desktopVlcPlayer = player;
+    _activeDesktopVlcPlayers.add(player);
+    _desktopVlcSourcePath = path;
     player.setUserAgent(headers['User-Agent'] ?? _remotePlaybackUserAgent);
+    player.setVolume(1.0);
     _desktopVlcPositionSubscription = player.positionStream.listen((state) {
       if (_desktopVlcPlayer != player) {
         return;
@@ -745,6 +778,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final previous = _lastPosition;
       _lastPosition = state.position ?? Duration.zero;
       _lastDuration = state.duration ?? Duration.zero;
+      _logDesktopSubtitleCueAtPosition();
       if (_lastPosition != previous) {
         _lastPositionChangeAt = DateTime.now();
         _remotePlaybackAccepted = true;
@@ -823,6 +857,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _desktopVlcMedia(playbackPath, startTime: openStart),
         autoStart: true,
       );
+      _scheduleDesktopVlcAudioRecovery(player);
       _startSimklScrobble();
       if (!mounted || _desktopVlcPlayer != player) {
         return;
@@ -834,6 +869,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ? 'Reproduciendo con VLC'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
       });
+      unawaited(_loadDesktopVlcSubtitleCues());
       _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
     } catch (error) {
@@ -855,6 +891,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return Duration.zero;
     }
     return start;
+  }
+
+  void _scheduleDesktopVlcAudioRecovery(vlc.Player player, [int attempt = 1]) {
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 700), () {
+      if (!mounted || _desktopVlcPlayer != player) return;
+      try {
+        player.setVolume(1.0);
+        final trackCount = player.audioTrackCount;
+        _debugPlayerEvent(
+          'VLC audio recovery attempt=$attempt tracks=$trackCount',
+        );
+        if (trackCount > 0) {
+          player.setAudioTrack(1);
+          _debugPlayerEvent('VLC audio recovery selected track=1');
+          return;
+        }
+      } catch (error) {
+        _debugPlayerEvent('VLC audio recovery ignored error: $error');
+      }
+      // HLS often exposes its AAC elementary stream only after VLC has parsed
+      // the first transport-stream segments. Keep trying instead of treating
+      // the initial zero as a stream without audio.
+      if (attempt < 10) {
+        _scheduleDesktopVlcAudioRecovery(player, attempt + 1);
+      }
+    }));
   }
 
   Duration _desktopVlcUrlStartPosition(
@@ -914,6 +976,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _disposeDesktopVlcPlayer({
     bool delayForBiliBili = false,
+    bool treatAsBiliBili = false,
   }) async {
     final subscriptions = <StreamSubscription<dynamic>?>[
       _desktopVlcPositionSubscription,
@@ -925,25 +988,44 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _desktopVlcPlaybackSubscription = null;
     _desktopVlcErrorSubscription = null;
     _desktopVlcDimensionsSubscription = null;
-    final wasBiliBili =
+    final wasBiliBili = treatAsBiliBili ||
         _currentResolvedStream?.provider == RemoteProvider.bilibili;
+    final retiredSourcePath = _desktopVlcSourcePath;
+    _desktopVlcSourcePath = '';
+    final playbackUri = Uri.tryParse(retiredSourcePath);
+    final wasLoopbackProxy = playbackUri != null &&
+        (playbackUri.host == '127.0.0.1' || playbackUri.host == 'localhost');
     for (final subscription in subscriptions) {
       await subscription?.cancel();
     }
     final player = _desktopVlcPlayer;
     _desktopVlcPlayer = null;
     if (player != null) {
-      try {
-        player.stop();
-      } catch (_) {}
-      if (delayForBiliBili && wasBiliBili) {
-        // libVLC can still be reading the local BiliBili proxy after stop().
-        // Disposing that native player while it is buffering is what freezes
-        // or crashes Linux when the user changes source or leaves the screen.
-        _retiredBiliBiliVlcPlayers.add(player);
+      _activeDesktopVlcPlayers.remove(player);
+      if (delayForBiliBili && widget.episode.isRemote) {
+        // libVLC can still be reading a remote stream or local proxy while
+        // buffering. Native stop/dispose can block Flutter's UI thread.
+        // Stopping or disposing that native player synchronously is what can
+        // freeze Linux when the user changes source or leaves the screen.
+        _debugPlayerEvent(
+          'VLC native dispose deferred '
+          'bilibili=$wasBiliBili loopback=$wasLoopbackProxy',
+        );
+        try {
+          player.setVolume(0);
+          player.pause();
+        } catch (_) {}
+        if (wasLoopbackProxy) {
+          widget.controller.retireRemotePlaybackProxy(retiredSourcePath);
+        }
+        _retiredRemoteVlcPlayers.add(player);
+        _scheduleRetiredVlcDispose(player);
         _setPlayerBuffering(false);
         return;
       }
+      try {
+        player.stop();
+      } catch (_) {}
       try {
         player.dispose();
       } catch (error) {
@@ -951,6 +1033,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }
     _setPlayerBuffering(false);
+  }
+
+  void _scheduleRetiredVlcDispose(vlc.Player player) {
+    unawaited(Future<void>.delayed(const Duration(seconds: 3), () {
+      if (_activeDesktopVlcPlayers.isNotEmpty || _disposingRetiredVlc) {
+        _debugPlayerEvent(
+          'VLC deferred native dispose waiting for active player',
+        );
+        _scheduleRetiredVlcDispose(player);
+        return;
+      }
+      _debugPlayerEvent('VLC deferred native dispose start');
+      _disposingRetiredVlc = true;
+      try {
+        player.dispose();
+      } catch (_) {}
+      unawaited(Future<void>.delayed(const Duration(seconds: 1), () {
+        _retiredRemoteVlcPlayers.remove(player);
+        _disposingRetiredVlc = false;
+        _debugPlayerEvent('VLC deferred native dispose finished');
+      }));
+    }));
   }
 
   Future<bool> _openYoutubeSeriesWebPlayerIfNeeded(
@@ -1846,7 +1950,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   bool _supportsRemoteServerFallback(RemoteProvider provider) {
     return provider == RemoteProvider.jkAnime ||
-        provider == RemoteProvider.latAnime;
+        provider == RemoteProvider.latAnime ||
+        provider == RemoteProvider.justAnime ||
+        provider == RemoteProvider.aniPm;
   }
 
   Map<String, String>? _remoteMediaHeaders(String path) {
@@ -1879,6 +1985,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         headers[name] = value;
       }
     }
+    if (uri.host.endsWith('calm-koi.workers.dev')) {
+      headers['Referer'] = 'https://www.justanime.to/';
+      headers['Origin'] = 'https://www.justanime.to';
+    }
     return headers;
   }
 
@@ -1894,6 +2004,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _remoteReloadInProgress = true;
     ++_openEpisodeTicket;
     _debugPlayerEvent('manual reload remote source');
+    final wasBiliBili =
+        _currentResolvedStream?.provider == RemoteProvider.bilibili;
     try {
       _failedRemoteProviders.clear();
       _failedRemoteServers.clear();
@@ -1910,7 +2022,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         await androidExoController.dispose();
         _androidExoController = null;
       }
-      await _disposeDesktopVlcPlayer(delayForBiliBili: true);
+      await _disposeDesktopVlcPlayer(
+        delayForBiliBili: true,
+        treatAsBiliBili: wasBiliBili,
+      );
       await _player?.stop();
       if (!mounted) {
         return;
@@ -2236,7 +2351,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final stream = _currentResolvedStream;
     final preferredProvider =
         widget.controller.playbackProviderForEpisode(widget.episode);
+    final attemptingProvider =
+        stream == null ? _automaticResolvingProvider : null;
     final provider = stream?.provider ??
+        attemptingProvider ??
         preferredProvider ??
         _currentAutomaticProviderCandidate() ??
         widget.episode.provider;
@@ -2255,6 +2373,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.latAnime => stream?.server.trim().isNotEmpty == true
           ? remoteServerLabel(stream!.server)
           : 'Servidor',
+      RemoteProvider.justAnime => stream?.server.trim().isNotEmpty == true
+          ? '${justAnimePlaybackModeFromId(stream!.selectedMode).buttonLabel} / ${remoteServerLabel(stream.server)}'
+          : widget.controller
+              .justAnimeModeForEpisode(widget.episode)
+              .buttonLabel,
+      RemoteProvider.aniPm => stream?.server.trim().isNotEmpty == true
+          ? '${aniPmPlaybackModeFromId(stream!.selectedMode).buttonLabel} / ${remoteServerLabel(stream.server)}'
+          : widget.controller.aniPmModeForEpisode(widget.episode).buttonLabel,
       RemoteProvider.facebook =>
         widget.controller.facebookModeForEpisode(widget.episode).buttonLabel,
       RemoteProvider.internetArchive => stream?.server.trim().isNotEmpty == true
@@ -2278,6 +2404,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     };
     final label =
         detail.isEmpty ? provider.label : '${provider.label} / $detail';
+    if (attemptingProvider != null) {
+      return 'Intentando: $label';
+    }
     if (preferredProvider == null && stream?.provider != null) {
       return 'Automatico: $label';
     }
@@ -2298,6 +2427,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.animeAv1,
       RemoteProvider.jkAnime,
       RemoteProvider.latAnime,
+      RemoteProvider.justAnime,
+      RemoteProvider.aniPm,
       RemoteProvider.internetArchive,
       RemoteProvider.bilibili,
       RemoteProvider.youtube,
@@ -2511,6 +2642,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   ),
               ),
               if (_openedMedia &&
+                  _desktopVlcPlayer != null &&
+                  _activeDesktopVlcCaption.isNotEmpty)
+                Positioned(
+                  left: 32,
+                  right: 32,
+                  bottom: 72,
+                  child: IgnorePointer(
+                    child: Text(
+                      _activeDesktopVlcCaption,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        height: 1.25,
+                        fontWeight: FontWeight.w700,
+                        shadows: [
+                          Shadow(color: Colors.black, blurRadius: 4),
+                          Shadow(
+                            color: Colors.black,
+                            blurRadius: 2,
+                            offset: Offset(2, 2),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              if (_openedMedia &&
                   _playerBuffering &&
                   !useDesktopYoutubeWebControls)
                 Positioned.fill(
@@ -2541,10 +2700,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         onBack: () => Navigator.of(context).maybePop(),
                         onPrevious: _playPrevious,
                         onNext: _playNext,
-                        subtitlesEnabled: _subtitlesEnabled,
-                        videoScaleMode: _videoScaleMode,
-                        onToggleSubtitles: _toggleSubtitles,
-                        onToggleViewMode: _cycleVideoScaleMode,
                         onSettings: _showPlayerSettingsDialog,
                         onEpisodes: () => unawaited(_showEpisodeListPanel()),
                         onFullscreen: () => unawaited(_toggleFullscreenMode()),
@@ -2552,9 +2707,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         backButtonFocusNode: _playerBackButtonFocusNode,
                         previousButtonFocusNode: _playerPreviousButtonFocusNode,
                         nextButtonFocusNode: _playerNextButtonFocusNode,
-                        subtitlesButtonFocusNode:
-                            _playerSubtitlesButtonFocusNode,
-                        fitButtonFocusNode: _playerFitButtonFocusNode,
                         settingsButtonFocusNode: _playerSettingsButtonFocusNode,
                         episodesButtonFocusNode: _playerEpisodesButtonFocusNode,
                         fullscreenButtonFocusNode:
@@ -3173,6 +3325,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
     if (_usesDesktopVlcPlayer) {
+      await _loadDesktopVlcSubtitleCues();
       return;
     }
     final player = _player;
@@ -3180,6 +3333,101 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
     await _applyRemoteSubtitleTrack(player);
+  }
+
+  Future<void> _loadDesktopVlcSubtitleCues() async {
+    final loadTicket = ++_desktopSubtitleLoadTicket;
+    _debugPlayerEvent(
+      'desktop subtitle load requested enabled=$_subtitlesEnabled '
+      'tracks=${_currentResolvedStream?.subtitleTracks.length ?? 0} '
+      'selected=${_selectedRemoteSubtitleTrackKey.isEmpty ? "default" : _selectedRemoteSubtitleTrackKey}',
+    );
+    if (!_subtitlesEnabled) {
+      if (mounted) setState(() => _desktopVlcSubtitleCues = const []);
+      return;
+    }
+    _reconcileRemoteSubtitleSelection(_currentResolvedStream);
+    final track = selectRemoteSubtitleTrack(
+      _currentResolvedStream,
+      selectedKey: _selectedRemoteSubtitleTrackKey,
+    );
+    if (track == null) {
+      _debugPlayerEvent('desktop subtitle: no selected track');
+      if (mounted) setState(() => _desktopVlcSubtitleCues = const []);
+      return;
+    }
+    final trackKey = remoteSubtitleTrackKey(track);
+    try {
+      _debugPlayerEvent(
+        'desktop subtitle download start '
+        'track="${remoteSubtitleTrackLabel(track)}" '
+        'url=${_debugMediaLabel(track.url)} '
+        'headers=${_debugHeadersLabel(_remoteMediaHeaders(track.url) ?? const {})}',
+      );
+      final response = await http.get(
+        Uri.parse(track.url),
+        headers: _remoteMediaHeaders(track.url),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException('Subtitle HTTP ${response.statusCode}');
+      }
+      final body = utf8.decode(response.bodyBytes, allowMalformed: true);
+      final cues = parseRemoteCaptionCues(body);
+      _debugPlayerEvent(
+        'desktop subtitle download HTTP ${response.statusCode} '
+        'bytes=${response.bodyBytes.length} cues=${cues.length} '
+        'first=${cues.isEmpty ? "none" : _formatPlaybackTime(cues.first.start)} '
+        'last=${cues.isEmpty ? "none" : _formatPlaybackTime(cues.last.end)}',
+      );
+      if (!mounted ||
+          loadTicket != _desktopSubtitleLoadTicket ||
+          trackKey != _selectedRemoteSubtitleTrackKey) {
+        _debugPlayerEvent('desktop subtitle download discarded stale result');
+        return;
+      }
+      setState(() {
+        _desktopVlcSubtitleCues = cues;
+        _lastDesktopSubtitleCueIndex = -2;
+        _status = cues.isEmpty
+            ? 'El archivo de subtitulos esta vacio'
+            : 'Subtitulos: ${remoteSubtitleTrackLabel(track)}';
+      });
+    } catch (error) {
+      if (!mounted || loadTicket != _desktopSubtitleLoadTicket) return;
+      setState(() {
+        _desktopVlcSubtitleCues = const [];
+        _status = 'No se pudo cargar subtitulos';
+      });
+      _debugPlayerEvent('desktop subtitle load failed: $error');
+    }
+  }
+
+  String get _activeDesktopVlcCaption {
+    if (!_subtitlesEnabled || _desktopVlcSubtitleCues.isEmpty) return '';
+    for (final cue in _desktopVlcSubtitleCues) {
+      if (_lastPosition >= cue.start && _lastPosition < cue.end) {
+        return cue.text;
+      }
+    }
+    return '';
+  }
+
+  void _logDesktopSubtitleCueAtPosition() {
+    if (_desktopVlcSubtitleCues.isEmpty) return;
+    final index = _desktopVlcSubtitleCues.indexWhere(
+      (cue) => _lastPosition >= cue.start && _lastPosition < cue.end,
+    );
+    if (index == _lastDesktopSubtitleCueIndex) return;
+    _lastDesktopSubtitleCueIndex = index;
+    if (index >= 0) {
+      final cue = _desktopVlcSubtitleCues[index];
+      _debugPlayerEvent(
+        'desktop subtitle visible cue=$index '
+        'at=${_formatPlaybackTime(_lastPosition)} '
+        'range=${_formatPlaybackTime(cue.start)}-${_formatPlaybackTime(cue.end)} '
+        'text="${cue.text.replaceAll('\n', ' / ')}"',
+      );
+    }
   }
 
   Future<void> _applyRemoteSubtitleTrack(Player player) async {
@@ -3247,6 +3495,77 @@ class _PlayerScreenState extends State<PlayerScreen> {
           : 'Subtitulos desactivados';
     });
     unawaited(_applyRemoteSubtitleTrackIfReady());
+  }
+
+  Future<void> _showSubtitleTrackDialog() async {
+    final tracks =
+        _currentResolvedStream?.subtitleTracks ?? const <RemoteSubtitleTrack>[];
+    if (tracks.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _status = 'Esta fuente no ofrece subtitulos';
+        });
+      }
+      return;
+    }
+    _showPlayerOverlays();
+    final selected = await showDialog<String>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (context) => SimpleDialog(
+        backgroundColor: TanukiColors.panelSolid,
+        title: const Text('Subtitulos disponibles'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, '__off__'),
+            child: Row(
+              children: [
+                Icon(
+                  !_subtitlesEnabled
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_off,
+                  color: TanukiColors.orange,
+                ),
+                const SizedBox(width: 10),
+                const Text('Desactivados'),
+              ],
+            ),
+          ),
+          for (final track in tracks)
+            SimpleDialogOption(
+              onPressed: () =>
+                  Navigator.pop(context, remoteSubtitleTrackKey(track)),
+              child: Row(
+                children: [
+                  Icon(
+                    _subtitlesEnabled &&
+                            _selectedRemoteSubtitleTrackKey ==
+                                remoteSubtitleTrackKey(track)
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_off,
+                    color: TanukiColors.orange,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(remoteSubtitleTrackLabel(track))),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (selected == null || !mounted) return;
+    _debugPlayerEvent(
+        'subtitle dialog selected key=$selected tracks=${tracks.length}');
+    setState(() {
+      _subtitlesEnabled = selected != '__off__';
+      if (_subtitlesEnabled) _selectedRemoteSubtitleTrackKey = selected;
+      _status = _subtitlesEnabled
+          ? 'Subtitulos: ${remoteSubtitleTrackLabel(tracks.firstWhere(
+              (track) => remoteSubtitleTrackKey(track) == selected,
+            ))}'
+          : 'Subtitulos desactivados';
+    });
+    await _applyRemoteSubtitleTrackIfReady();
   }
 
   Future<void> _cycleVideoScaleMode() async {
@@ -3334,6 +3653,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     _currentResolvedStream?.server.trim().isNotEmpty == true
                 ? jkAnimeServerPreferenceFromId(_currentResolvedStream!.server)
                 : jkAnimeServerPreferenceFromId(preference.jkAnimeServer);
+            final latAnimeServer =
+                _currentResolvedStream?.provider == RemoteProvider.latAnime &&
+                        _currentResolvedStream?.server.trim().isNotEmpty == true
+                    ? latAnimeServerPreferenceFromId(
+                        _currentResolvedStream!.server,
+                      )
+                    : latAnimeServerPreferenceFromId(preference.latAnimeServer);
+            final justAnimeMode =
+                justAnimePlaybackModeFromId(preference.justAnimeMode);
+            final justAnimeServer = _currentResolvedStream?.provider ==
+                        RemoteProvider.justAnime &&
+                    _currentResolvedStream?.server.trim().isNotEmpty == true
+                ? justAnimeServerPreferenceFromId(
+                    _currentResolvedStream!.server)
+                : justAnimeServerPreferenceFromId(preference.justAnimeServer);
+            final aniPmMode = aniPmPlaybackModeFromId(preference.aniPmMode);
+            final aniPmServer =
+                _currentResolvedStream?.provider == RemoteProvider.aniPm &&
+                        _currentResolvedStream?.server.trim().isNotEmpty == true
+                    ? _currentResolvedStream!.server.trim().toLowerCase()
+                    : preference.aniPmServer.trim().toLowerCase();
             final facebookMode =
                 facebookPlaybackModeFromId(preference.facebookMode);
             final facebookOption =
@@ -3344,6 +3684,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 youtubePlaybackOptionFromId(preference.youtubeOption);
 
             Future<void> savePreference(Future<void> Function() save) async {
+              final wasBiliBili =
+                  _currentResolvedStream?.provider == RemoteProvider.bilibili;
               await save();
               if (!mounted || !dialogContext.mounted) {
                 return;
@@ -3353,6 +3695,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     .playbackPreferenceForEpisode(widget.episode);
               });
               if (widget.episode.isRemote) {
+                if (wasBiliBili) {
+                  await _disposeDesktopVlcPlayer(
+                    delayForBiliBili: true,
+                    treatAsBiliBili: true,
+                  );
+                  await Future<void>.delayed(
+                    const Duration(milliseconds: 120),
+                  );
+                }
                 await _reloadRemoteSource();
               }
             }
@@ -3380,11 +3731,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 );
               }
               if (provider == RemoteProvider.jkAnime) {
+                final availableServers = _availableJkAnimeServers();
                 return Wrap(
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    for (final server in JkAnimeServerPreference.values)
+                    for (final server in availableServers)
                       _PlayerDialogButton(
                         label: server.label,
                         active: jkAnimeServer == server,
@@ -3397,6 +3749,140 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           ),
                         ),
                       ),
+                  ],
+                );
+              }
+              if (provider == RemoteProvider.latAnime) {
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final server in LatAnimeServerPreference.values)
+                      _PlayerDialogButton(
+                        label: server.label,
+                        active: latAnimeServer == server,
+                        onPressed: () => unawaited(
+                          savePreference(
+                            () => widget.controller.setLatAnimeServerForEpisode(
+                              widget.episode,
+                              server,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              }
+              if (provider == RemoteProvider.justAnime) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const _PlayerDialogSectionTitle('Audio'),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final mode in JustAnimePlaybackMode.values)
+                          _PlayerDialogButton(
+                            label: mode.buttonLabel,
+                            active: justAnimeMode == mode,
+                            onPressed: () => unawaited(savePreference(
+                              () => widget.controller
+                                  .setJustAnimeModeForEpisode(
+                                      widget.episode, mode),
+                            )),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    const _PlayerDialogSectionTitle('Servidor'),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final server in JustAnimeServerPreference.values)
+                          _PlayerDialogButton(
+                            label: server.label,
+                            active: justAnimeServer == server,
+                            onPressed: () => unawaited(savePreference(
+                              () => widget.controller
+                                  .setJustAnimeServerForEpisode(
+                                widget.episode,
+                                server,
+                              ),
+                            )),
+                          ),
+                      ],
+                    ),
+                  ],
+                );
+              }
+              if (provider == RemoteProvider.aniPm) {
+                final resolvedServers = <String>[
+                  if (_currentResolvedStream?.provider == RemoteProvider.aniPm)
+                    ..._currentResolvedStream!.availableModes,
+                ];
+                resolvedServers.sort((left, right) => remoteServerLabel(left)
+                    .compareTo(remoteServerLabel(right)));
+                final servers = <String>{
+                  if (aniPmServer.isNotEmpty) aniPmServer,
+                  ...resolvedServers,
+                }.toList();
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const _PlayerDialogSectionTitle('Audio'),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final mode in AniPmPlaybackMode.values)
+                          _PlayerDialogButton(
+                            label: mode.buttonLabel,
+                            active: aniPmMode == mode,
+                            onPressed: () => unawaited(savePreference(
+                              () => widget.controller
+                                  .setAniPmModeForEpisode(widget.episode, mode),
+                            )),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    const _PlayerDialogSectionTitle('Servidor'),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _PlayerDialogButton(
+                          label: 'Automatico',
+                          active: aniPmServer.isEmpty,
+                          onPressed: () => unawaited(savePreference(
+                            () => widget.controller
+                                .setAniPmServerForEpisode(widget.episode, ''),
+                          )),
+                        ),
+                        for (final server in servers)
+                          _PlayerDialogButton(
+                            label: remoteServerLabel(server),
+                            active: aniPmServer == server,
+                            onPressed: () => unawaited(savePreference(
+                              () => widget.controller.setAniPmServerForEpisode(
+                                  widget.episode, server),
+                            )),
+                          ),
+                      ],
+                    ),
+                    if (resolvedServers.isEmpty) ...[
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Los servidores disponibles apareceran al resolver el episodio.',
+                        style: TextStyle(color: TanukiColors.muted),
+                      ),
+                    ],
                   ],
                 );
               }
@@ -3518,6 +4004,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
               RemoteProvider.animeAv1,
               RemoteProvider.jkAnime,
               RemoteProvider.latAnime,
+              RemoteProvider.justAnime,
+              RemoteProvider.aniPm,
               RemoteProvider.internetArchive,
               RemoteProvider.bilibili,
               RemoteProvider.youtube,
@@ -3618,8 +4106,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             ),
                             _PlayerDialogButton(
                               label: 'Sub',
-                              active: false,
-                              onPressed: () {},
+                              active: _subtitlesEnabled,
+                              onPressed: () {
+                                Navigator.of(dialogContext).pop();
+                                Future<void>.delayed(
+                                  const Duration(milliseconds: 120),
+                                  _showSubtitleTrackDialog,
+                                );
+                              },
                             ),
                           ],
                         )
@@ -3729,6 +4223,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 RemoteProvider.animeAv1,
                 RemoteProvider.jkAnime,
                 RemoteProvider.latAnime,
+                RemoteProvider.justAnime,
+                RemoteProvider.aniPm,
                 RemoteProvider.internetArchive,
                 RemoteProvider.bilibili,
                 if (widget.controller.canUsePlaybackProviderForEpisode(
@@ -3863,7 +4359,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    for (final server in JkAnimeServerPreference.values)
+                    for (final server in _availableJkAnimeServers())
                       _PlayerDialogButton(
                         label: server.label,
                         active: jkAnimeServer == server,
@@ -4000,6 +4496,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
+  List<JkAnimeServerPreference> _availableJkAnimeServers() {
+    final discovered =
+        _currentResolvedStream?.provider == RemoteProvider.jkAnime
+            ? _currentResolvedStream?.availableServers ?? const <String>{}
+            : const <String>{};
+    if (discovered.isEmpty) {
+      return JkAnimeServerPreference.values;
+    }
+    final servers = JkAnimeServerPreference.values
+        .where((server) => discovered.contains(server.id))
+        .toList(growable: false);
+    return servers.isEmpty ? JkAnimeServerPreference.values : servers;
+  }
+
   String _sourcePreviewText(
     RemoteProvider? provider,
     AnimeAv1PlaybackMode animeAv1Mode,
@@ -4011,6 +4521,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       RemoteProvider.animeAv1 => 'AnimeAV1 - ${animeAv1Mode.dialogLabel}',
       RemoteProvider.jkAnime => 'JKAnime - ${jkAnimeServer.label}',
       RemoteProvider.latAnime => 'LatAnime',
+      RemoteProvider.justAnime => 'JustAnime',
+      RemoteProvider.aniPm => 'ani.pm',
       RemoteProvider.internetArchive => 'Internet Archive',
       RemoteProvider.bilibili => 'BiliBili - DASH',
       RemoteProvider.youtube => 'YouTube',
@@ -5439,10 +5951,6 @@ class _PlayerTopBar extends StatelessWidget {
     required this.onBack,
     required this.onPrevious,
     required this.onNext,
-    required this.subtitlesEnabled,
-    required this.videoScaleMode,
-    required this.onToggleSubtitles,
-    required this.onToggleViewMode,
     required this.onSettings,
     required this.onEpisodes,
     required this.onFullscreen,
@@ -5450,8 +5958,6 @@ class _PlayerTopBar extends StatelessWidget {
     this.backButtonFocusNode,
     this.previousButtonFocusNode,
     this.nextButtonFocusNode,
-    this.subtitlesButtonFocusNode,
-    this.fitButtonFocusNode,
     this.settingsButtonFocusNode,
     this.episodesButtonFocusNode,
     this.fullscreenButtonFocusNode,
@@ -5461,8 +5967,6 @@ class _PlayerTopBar extends StatelessWidget {
   final FocusNode? backButtonFocusNode;
   final FocusNode? previousButtonFocusNode;
   final FocusNode? nextButtonFocusNode;
-  final FocusNode? subtitlesButtonFocusNode;
-  final FocusNode? fitButtonFocusNode;
   final FocusNode? settingsButtonFocusNode;
   final FocusNode? episodesButtonFocusNode;
   final FocusNode? fullscreenButtonFocusNode;
@@ -5472,10 +5976,6 @@ class _PlayerTopBar extends StatelessWidget {
   final VoidCallback onBack;
   final VoidCallback onPrevious;
   final VoidCallback onNext;
-  final bool subtitlesEnabled;
-  final VideoScaleMode videoScaleMode;
-  final VoidCallback onToggleSubtitles;
-  final VoidCallback onToggleViewMode;
   final VoidCallback onSettings;
   final VoidCallback onEpisodes;
   final VoidCallback onFullscreen;
@@ -5922,6 +6422,90 @@ bool shouldRetryDeferredAnimeAv1PlaybackError({
   return true;
 }
 
+class RemoteCaptionCue {
+  const RemoteCaptionCue({
+    required this.start,
+    required this.end,
+    required this.text,
+  });
+
+  final Duration start;
+  final Duration end;
+  final String text;
+}
+
+List<RemoteCaptionCue> parseRemoteCaptionCues(String payload) {
+  final normalized = payload
+      .replaceAll('\r\n', '\n')
+      .replaceAll('\r', '\n')
+      .replaceAll(RegExp(r'^\uFEFF'), '');
+  final cues = <RemoteCaptionCue>[];
+  if (normalized.contains('[Script Info]') ||
+      normalized.contains('\nDialogue:')) {
+    for (final rawLine in normalized.split('\n')) {
+      final line = rawLine.trim();
+      if (!line.startsWith('Dialogue:')) continue;
+      final fields = line.substring('Dialogue:'.length).split(',');
+      if (fields.length < 10) continue;
+      final start = _parseRemoteCaptionTimestamp(fields[1]);
+      final end = _parseRemoteCaptionTimestamp(fields[2]);
+      if (start == null || end == null || end <= start) continue;
+      final text = fields
+          .skip(9)
+          .join(',')
+          .replaceAll(RegExp(r'\{[^}]*\}'), '')
+          .replaceAll(r'\N', '\n')
+          .replaceAll(r'\n', '\n')
+          .replaceAll(r'\h', ' ')
+          .trim();
+      if (text.isNotEmpty) {
+        cues.add(RemoteCaptionCue(start: start, end: end, text: text));
+      }
+    }
+    return cues;
+  }
+  for (final block in normalized.split(RegExp(r'\n{2,}'))) {
+    final lines = block.split('\n').map((line) => line.trim()).toList();
+    final timingIndex = lines.indexWhere((line) => line.contains('-->'));
+    if (timingIndex < 0 || timingIndex + 1 >= lines.length) continue;
+    final timing = lines[timingIndex].split('-->');
+    if (timing.length != 2) continue;
+    final start = _parseRemoteCaptionTimestamp(timing[0]);
+    final end = _parseRemoteCaptionTimestamp(
+      timing[1].trim().split(RegExp(r'\s+')).first,
+    );
+    if (start == null || end == null || end <= start) continue;
+    final text = lines
+        .skip(timingIndex + 1)
+        .where((line) => line.isNotEmpty)
+        .join('\n')
+        .replaceAll(RegExp(r'<[^>]+>'), '')
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .trim();
+    if (text.isNotEmpty) {
+      cues.add(RemoteCaptionCue(start: start, end: end, text: text));
+    }
+  }
+  return cues;
+}
+
+Duration? _parseRemoteCaptionTimestamp(String value) {
+  final match = RegExp(r'(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})')
+      .firstMatch(value.trim());
+  if (match == null) return null;
+  final fraction = match.group(4) ?? '0';
+  final milliseconds = int.tryParse(fraction.padRight(3, '0')) ?? 0;
+  return Duration(
+    hours: int.tryParse(match.group(1) ?? '0') ?? 0,
+    minutes: int.tryParse(match.group(2) ?? '0') ?? 0,
+    seconds: int.tryParse(match.group(3) ?? '0') ?? 0,
+    milliseconds: milliseconds,
+  );
+}
+
 RemoteSubtitleTrack? selectRemoteSubtitleTrack(
   RemoteDirectStream? stream, {
   String selectedKey = '',
@@ -5968,6 +6552,8 @@ String remoteServerLabel(String server) {
     'mp4upload' => 'MP4Upload',
     'yourupload' => 'YourUpload',
     'uqload' => 'Uqload',
+    'neko' => 'Neko',
+    'gigi' => 'Gigi',
     'stape' => 'Stape',
     'netu' => 'Netu',
     'archive-direct' => 'Directo',
@@ -5977,6 +6563,14 @@ String remoteServerLabel(String server) {
     'youtube-sub-2' => 'SUB Opcion 2',
     'youtube-dub-1' => 'DUB Opcion 1',
     'youtube-dub-2' => 'DUB Opcion 2',
+    String value
+        when RegExp(r'^(nova|pulse|halo|orion|lyra)-\d+$').hasMatch(value) =>
+      value
+          .split('-')
+          .map((part) => part.length == 1
+              ? part
+              : '${part.substring(0, 1).toUpperCase()}${part.substring(1)}')
+          .join(' '),
     String value when value.isNotEmpty => value,
     _ => 'servidor',
   };

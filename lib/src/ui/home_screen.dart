@@ -59,6 +59,8 @@ class _HomeScreenState extends State<HomeScreen> {
   int _homeTrendingVisualRequest = 0;
   int _homeAiringVisualRequest = 0;
   int _homeMovieVisualRequest = 0;
+  int _homeAiringPages = 2;
+  int _homeMoviePages = 3;
   int _handledTrailerDetailRequestId = 0;
   String _similarStatus = '';
   String _detailSimilarStatus = '';
@@ -233,6 +235,8 @@ class _HomeScreenState extends State<HomeScreen> {
       onPlayEpisode: _playEpisode,
       onOpenSeriesTrailer: _openSeriesTrailer,
       onPlayTrendingTrailers: _playTrendingTrailerQueue,
+      onLoadMoreAiring: _loadMoreHomeAiring,
+      onLoadMoreMovies: _loadMoreHomeMovies,
       onStopWatchingSeries: widget.controller.stopWatchingSeries,
       onSeriesSelected: _selectSeries,
       onPreviewSeries: _previewSeries,
@@ -279,6 +283,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _Section? returnSection,
     bool refreshVisuals = true,
     bool importing = false,
+    bool loadSimilar = true,
   }) {
     final origin = returnSection ?? _section;
     setState(() {
@@ -288,11 +293,18 @@ class _HomeScreenState extends State<HomeScreen> {
       _heroPreviewSeries = series;
       _section = _Section.anime;
       _detailImporting = importing;
+      if (!loadSimilar) {
+        _detailSimilarResults = const [];
+        _detailSimilarStatus = 'Buscando similares...';
+        _detailSimilarLoading = true;
+      }
     });
     if (refreshVisuals) {
       unawaited(_refreshSelectedSeriesVisuals(series));
     }
-    unawaited(_loadDetailSimilar(series));
+    if (loadSimilar) {
+      unawaited(_loadDetailSimilar(series));
+    }
   }
 
   void _previewSeries(SeriesItem series) {
@@ -330,10 +342,14 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     if (_selectedSeries?.stableKey == series.stableKey) {
+      final similarIdentityChanged = refreshed.catalogId != series.catalogId ||
+          normalizeSeriesKey(refreshed.name) != normalizeSeriesKey(series.name);
       setState(() {
         _selectedSeries = refreshed;
       });
-      unawaited(_loadDetailSimilar(refreshed));
+      if (similarIdentityChanged) {
+        unawaited(_loadDetailSimilar(refreshed));
+      }
     }
   }
 
@@ -444,6 +460,7 @@ class _HomeScreenState extends State<HomeScreen> {
       returnSection: origin,
       refreshVisuals: false,
       importing: true,
+      loadSimilar: false,
     );
     final series = await widget.controller.importRemoteCandidate(candidate);
     if (!mounted) {
@@ -606,13 +623,13 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     try {
       final results = await widget.controller.loadHomeAiringCandidates(
-        pages: 1,
+        pages: _homeAiringPages,
       );
       if (!mounted) {
         return;
       }
       setState(() {
-        _homeAiringResults = results.take(18).toList(growable: false);
+        _homeAiringResults = results;
         _homeAiringLoading = false;
       });
       unawaited(_refreshHomeAiringVisuals(_homeAiringResults));
@@ -634,12 +651,14 @@ class _HomeScreenState extends State<HomeScreen> {
       _homeMoviesLoading = true;
     });
     try {
-      final movies = await widget.controller.loadHomeMovieCandidates(pages: 3);
+      final movies = await widget.controller.loadHomeMovieCandidates(
+        pages: _homeMoviePages,
+      );
       if (!mounted) {
         return;
       }
       setState(() {
-        _homeMovieResults = movies.take(18).toList(growable: false);
+        _homeMovieResults = movies;
         _homeMoviesLoading = false;
       });
       unawaited(_refreshHomeMovieVisuals(_homeMovieResults));
@@ -651,6 +670,22 @@ class _HomeScreenState extends State<HomeScreen> {
         _homeMoviesLoading = false;
       });
     }
+  }
+
+  Future<void> _loadMoreHomeAiring() async {
+    if (_homeAiringLoading || _homeAiringPages >= 10) {
+      return;
+    }
+    _homeAiringPages += 1;
+    await _loadHomeAiring();
+  }
+
+  Future<void> _loadMoreHomeMovies() async {
+    if (_homeMoviesLoading || _homeMoviePages >= 10) {
+      return;
+    }
+    _homeMoviePages += 1;
+    await _loadHomeMovies();
   }
 
   Future<void> _refreshHomeTrendingVisuals(
@@ -696,13 +731,13 @@ class _HomeScreenState extends State<HomeScreen> {
     final request = ++_homeMovieVisualRequest;
     final refreshed = await widget.controller.refreshCandidateVisuals(
       candidates,
-      limit: 6,
+      limit: 8,
     );
     if (!mounted || request != _homeMovieVisualRequest) {
       return;
     }
     setState(() {
-      _homeMovieResults = refreshed.take(18).toList(growable: false);
+      _homeMovieResults = refreshed;
     });
   }
 
@@ -714,14 +749,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final request = ++_homeAiringVisualRequest;
     final refreshed = await widget.controller.refreshCandidateVisuals(
       candidates,
-      limit: 14,
+      limit: 20,
       catalogMetadataOnly: true,
     );
     if (!mounted || request != _homeAiringVisualRequest) {
       return;
     }
     setState(() {
-      _homeAiringResults = refreshed.take(18).toList(growable: false);
+      _homeAiringResults = refreshed;
     });
   }
 
@@ -2267,6 +2302,8 @@ class _AnimePanel extends StatelessWidget {
     required this.onPlayEpisode,
     required this.onOpenSeriesTrailer,
     required this.onPlayTrendingTrailers,
+    required this.onLoadMoreAiring,
+    required this.onLoadMoreMovies,
     required this.onStopWatchingSeries,
     required this.onSeriesSelected,
     required this.onPreviewSeries,
@@ -2295,6 +2332,8 @@ class _AnimePanel extends StatelessWidget {
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final ValueChanged<SeriesItem> onOpenSeriesTrailer;
   final VoidCallback onPlayTrendingTrailers;
+  final VoidCallback onLoadMoreAiring;
+  final VoidCallback onLoadMoreMovies;
   final ValueChanged<SeriesItem> onStopWatchingSeries;
   final ValueChanged<SeriesItem> onSeriesSelected;
   final ValueChanged<SeriesItem> onPreviewSeries;
@@ -2307,9 +2346,10 @@ class _AnimePanel extends StatelessWidget {
         heroPreviewSeries ??
         (library.isEmpty ? null : library.first);
     final continueWatching = _continueWatchingEntries(controller);
+    final visibleSeason = _seasonShelfCandidates(trendingCandidates);
     final visibleAiring = _airingShelfCandidates(airingCandidates);
     final latestMovies = movieCandidates.isNotEmpty
-        ? movieCandidates.take(10).toList(growable: false)
+        ? movieCandidates
         : _latestMovieCandidates(trendingCandidates);
     final seasonTitle = controller.currentSeasonFilter.summaryLabel.isEmpty
         ? 'Temporada actual'
@@ -2356,13 +2396,13 @@ class _AnimePanel extends StatelessWidget {
       panelChildren.add(const SizedBox(height: sectionGap));
       nextSectionTop += sectionHeight + sectionGap;
     }
-    if (trendingCandidates.isNotEmpty || trendingLoading) {
+    if (visibleSeason.isNotEmpty || trendingLoading) {
       panelChildren.add(fadeSection(
         nextSectionTop,
         _TrendingPosterShelf(
           title: seasonTitle,
           controller: controller,
-          candidates: trendingCandidates,
+          candidates: visibleSeason,
           loading: trendingLoading,
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
@@ -2385,6 +2425,7 @@ class _AnimePanel extends StatelessWidget {
           controller: controller,
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
+          onLoadMore: onLoadMoreAiring,
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
@@ -2403,6 +2444,7 @@ class _AnimePanel extends StatelessWidget {
           controller: controller,
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
+          onLoadMore: onLoadMoreMovies,
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
@@ -4165,6 +4207,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
     required this.controller,
     required this.onCandidateSelected,
     required this.onCandidateFocused,
+    required this.onLoadMore,
   });
 
   final String title;
@@ -4174,6 +4217,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
   final AppController controller;
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
   final ValueChanged<RemoteSearchCandidate> onCandidateFocused;
+  final VoidCallback onLoadMore;
 
   @override
   Widget build(BuildContext context) {
@@ -4198,26 +4242,34 @@ class _UpcomingPosterShelf extends StatelessWidget {
           child: loading && candidates.isEmpty
               ? _PosterShelfSkeleton(width: posterWidth, height: posterHeight)
               : _HorizontalFocusShelf(
-                  child: ListView.separated(
-                    scrollDirection: Axis.horizontal,
-                    clipBehavior: Clip.none,
-                    padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
-                    itemBuilder: (context, index) {
-                      final candidate = candidates[index];
-                      return _RemotePosterCard(
-                        width: posterWidth,
-                        height: posterHeight,
-                        candidate: candidate,
-                        imported: controller.findRemoteSeriesForCandidate(
-                              candidate,
-                            ) !=
-                            null,
-                        onTap: () => onCandidateSelected(candidate),
-                        onFocused: () => focusCandidate(candidate),
-                      );
+                  child: NotificationListener<ScrollNotification>(
+                    onNotification: (notification) {
+                      if (notification.metrics.extentAfter < 560) {
+                        onLoadMore();
+                      }
+                      return false;
                     },
-                    separatorBuilder: (_, __) => const SizedBox(width: 8),
-                    itemCount: candidates.length,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      clipBehavior: Clip.none,
+                      padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                      itemBuilder: (context, index) {
+                        final candidate = candidates[index];
+                        return _RemotePosterCard(
+                          width: posterWidth,
+                          height: posterHeight,
+                          candidate: candidate,
+                          imported: controller.findRemoteSeriesForCandidate(
+                                candidate,
+                              ) !=
+                              null,
+                          onTap: () => onCandidateSelected(candidate),
+                          onFocused: () => focusCandidate(candidate),
+                        );
+                      },
+                      separatorBuilder: (_, __) => const SizedBox(width: 8),
+                      itemCount: candidates.length,
+                    ),
                   ),
                 ),
         ),
@@ -4315,7 +4367,7 @@ class _PosterSkeletonCard extends StatelessWidget {
             right: 0,
             bottom: 0,
             child: Container(
-              height: 54,
+              height: 58,
               padding: const EdgeInsets.fromLTRB(7, 7, 7, 7),
               color: const Color(0xB010161D),
               child: const Column(
@@ -6172,7 +6224,15 @@ List<RemoteSearchCandidate> _upcomingCandidates(
     }
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
-  return upcoming.take(10).toList(growable: false);
+  return upcoming.take(20).toList(growable: false);
+}
+
+List<RemoteSearchCandidate> _seasonShelfCandidates(
+  Iterable<RemoteSearchCandidate> candidates,
+) {
+  return candidates
+      .where((candidate) => _candidateScheduleChipLabel(candidate).isEmpty)
+      .toList(growable: false);
 }
 
 List<RemoteSearchCandidate> _airingShelfCandidates(
@@ -6211,7 +6271,7 @@ List<RemoteSearchCandidate> _airingShelfCandidates(
     }
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
-  return ordered.take(10).toList(growable: false);
+  return ordered;
 }
 
 List<RemoteSearchCandidate> _latestMovieCandidates(
@@ -6242,7 +6302,7 @@ List<RemoteSearchCandidate> _latestMovieCandidates(
     }
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
-  return movies.take(10).toList(growable: false);
+  return movies;
 }
 
 bool _candidateLooksMovieForHome(RemoteSearchCandidate candidate) {
@@ -7124,7 +7184,7 @@ class _Poster extends StatelessWidget {
   }
 }
 
-class _FadeInNetworkImage extends StatelessWidget {
+class _FadeInNetworkImage extends StatefulWidget {
   const _FadeInNetworkImage({
     required this.imageUrl,
     this.fit,
@@ -7138,23 +7198,97 @@ class _FadeInNetworkImage extends StatelessWidget {
   final ImageErrorWidgetBuilder? errorBuilder;
 
   @override
+  State<_FadeInNetworkImage> createState() => _FadeInNetworkImageState();
+}
+
+class _FadeInNetworkImageState extends State<_FadeInNetworkImage> {
+  late String _displayedImageUrl;
+  ImageStream? _pendingStream;
+  ImageStreamListener? _pendingListener;
+
+  @override
+  void initState() {
+    super.initState();
+    _displayedImageUrl = widget.imageUrl;
+  }
+
+  @override
+  void didUpdateWidget(covariant _FadeInNetworkImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.imageUrl != oldWidget.imageUrl) {
+      _preloadReplacement(widget.imageUrl);
+    }
+  }
+
+  void _preloadReplacement(String imageUrl) {
+    final previousStream = _pendingStream;
+    final previousListener = _pendingListener;
+    if (previousStream != null && previousListener != null) {
+      previousStream.removeListener(previousListener);
+    }
+    _pendingStream = null;
+    _pendingListener = null;
+    if (imageUrl == _displayedImageUrl) return;
+    final stream = NetworkImage(imageUrl).resolve(
+      createLocalImageConfiguration(context),
+    );
+    late final ImageStreamListener listener;
+    void showReplacement() {
+      stream.removeListener(listener);
+      if (!mounted || widget.imageUrl != imageUrl) return;
+      setState(() => _displayedImageUrl = imageUrl);
+      _pendingStream = null;
+      _pendingListener = null;
+    }
+
+    listener = ImageStreamListener(
+      (_, __) => showReplacement(),
+      onError: (_, __) => showReplacement(),
+    );
+    _pendingStream = stream;
+    _pendingListener = listener;
+    stream.addListener(listener);
+  }
+
+  @override
+  void dispose() {
+    final stream = _pendingStream;
+    final listener = _pendingListener;
+    if (stream != null && listener != null) {
+      stream.removeListener(listener);
+    }
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Image.network(
-      imageUrl,
-      fit: fit,
-      alignment: alignment,
-      errorBuilder: errorBuilder,
-      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-        if (wasSynchronouslyLoaded) {
-          return child;
-        }
-        return AnimatedOpacity(
-          opacity: frame == null ? 0 : 1,
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
-          child: child,
-        );
-      },
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 320),
+      reverseDuration: const Duration(milliseconds: 260),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) =>
+          FadeTransition(opacity: animation, child: child),
+      layoutBuilder: (currentChild, previousChildren) => Stack(
+        fit: StackFit.expand,
+        children: [...previousChildren, if (currentChild != null) currentChild],
+      ),
+      child: Image.network(
+        _displayedImageUrl,
+        key: ValueKey(_displayedImageUrl),
+        fit: widget.fit,
+        alignment: widget.alignment,
+        errorBuilder: widget.errorBuilder,
+        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+          if (wasSynchronouslyLoaded) return child;
+          return AnimatedOpacity(
+            opacity: frame == null ? 0 : 1,
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            child: child,
+          );
+        },
+      ),
     );
   }
 }

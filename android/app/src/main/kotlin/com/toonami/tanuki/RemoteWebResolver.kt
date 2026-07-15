@@ -418,6 +418,18 @@ class RemoteWebResolver(private val activity: Activity) {
                 if (text.includes('magi')) return 'magi';
                 if (text.includes('desuka')) return 'desuka';
                 if (text.includes('mega')) return 'mega';
+                if (/\bbonk\b/.test(text)) return 'bonk';
+                if (/\bbee\b/.test(text)) return 'bee';
+                if (/\bally\b/.test(text)) return 'ally';
+                if (/\bkiwi\b/.test(text)) return 'kiwi';
+                if (/\bmoo\b/.test(text)) return 'moo';
+                if (/\bnun\b/.test(text)) return 'nun';
+                if (/\bbun\b/.test(text)) return 'bun';
+                if (/\btwin\b/.test(text)) return 'twin';
+                if (/\bcog\b/.test(text)) return 'cog';
+                if (/\bhop\b/.test(text)) return 'hop';
+                if (/\bpewe\b/.test(text)) return 'pewe';
+                if (/\btelli\b/.test(text)) return 'telli';
                 return '';
               }
               const excludedServers = new Set(excludedServerValues.map((value) => normalizeServer(value)).filter(Boolean));
@@ -444,7 +456,7 @@ class RemoteWebResolver(private val activity: Activity) {
                 const zilla = zillaHlsUrl(value);
                 return zilla || toAbsoluteUrl(value);
               };
-              const supportedHostPattern = /streamwish|sfastwish|flaswish|mixdrop|dood|dsvplay|yourupload|uqload|mp4upload|streamtape|vidhide|hqq|netu|mega|desu|magi|desuka/i;
+              const supportedHostPattern = /streamwish|sfastwish|flaswish|mixdrop|dood|dsvplay|yourupload|uqload|mp4upload|streamtape|vidhide|hqq|netu|mega|desu|magi|desuka|bonk|bee|ally|kiwi|moo|nun|bun|twin|cog|hop|pewe|telli/i;
               const isExcludedHost = (url) => {
                 const server = normalizeServer(url);
                 return server && excludedServers.has(server);
@@ -1069,6 +1081,18 @@ class RemoteWebResolver(private val activity: Activity) {
             "magi" in lower -> "magi"
             "desuka" in lower -> "desuka"
             "mega" in lower -> "mega"
+            Regex("""\bbonk\b""").containsMatchIn(lower) -> "bonk"
+            Regex("""\bbee\b""").containsMatchIn(lower) -> "bee"
+            Regex("""\bally\b""").containsMatchIn(lower) -> "ally"
+            Regex("""\bkiwi\b""").containsMatchIn(lower) -> "kiwi"
+            Regex("""\bmoo\b""").containsMatchIn(lower) -> "moo"
+            Regex("""\bnun\b""").containsMatchIn(lower) -> "nun"
+            Regex("""\bbun\b""").containsMatchIn(lower) -> "bun"
+            Regex("""\btwin\b""").containsMatchIn(lower) -> "twin"
+            Regex("""\bcog\b""").containsMatchIn(lower) -> "cog"
+            Regex("""\bhop\b""").containsMatchIn(lower) -> "hop"
+            Regex("""\bpewe\b""").containsMatchIn(lower) -> "pewe"
+            Regex("""\btelli\b""").containsMatchIn(lower) -> "telli"
             else -> ""
         }
     }
