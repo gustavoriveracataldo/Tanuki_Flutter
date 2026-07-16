@@ -49,6 +49,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<RemoteSearchCandidate> _detailSimilarResults = const [];
   List<RemoteSearchCandidate> _homeTrendingResults = const [];
   List<RemoteSearchCandidate> _homeAiringResults = const [];
+  List<RemoteSearchCandidate> _homeAiringVisibleResults = const [];
   List<RemoteSearchCandidate> _homeMovieResults = const [];
   bool _similarLoading = false;
   bool _detailSimilarLoading = false;
@@ -288,7 +289,7 @@ class _HomeScreenState extends State<HomeScreen> {
       detailImporting: _detailImporting,
       trendingCandidates: _homeTrendingResults,
       trendingLoading: _homeTrendingLoading,
-      airingCandidates: _homeAiringResults,
+      airingVisibleCandidates: _homeAiringVisibleResults,
       airingLoading: _homeAiringLoading,
       movieCandidates: _homeMovieResults,
       moviesLoading: _homeMoviesLoading,
@@ -783,8 +784,12 @@ class _HomeScreenState extends State<HomeScreen> {
       final resolvedResults = nextVisible.isEmpty && previousVisible.isNotEmpty
           ? previousResults
           : results;
+      final resolvedVisible = nextVisible.isEmpty && previousVisible.isNotEmpty
+          ? previousVisible
+          : nextVisible;
       setState(() {
         _homeAiringResults = resolvedResults;
+        _homeAiringVisibleResults = resolvedVisible;
         _homeAiringLoading = false;
       });
       unawaited(_refreshHomeAiringVisuals(resolvedResults));
@@ -885,10 +890,11 @@ class _HomeScreenState extends State<HomeScreen> {
       apply: (refreshed) {
         final previousVisible = _airingShelfCandidates(previousResults);
         final refreshedVisible = _airingShelfCandidates(refreshed);
-        _homeAiringResults =
-            refreshedVisible.isEmpty && previousVisible.isNotEmpty
-                ? previousResults
-                : refreshed;
+        final keepPrevious =
+            refreshedVisible.isEmpty && previousVisible.isNotEmpty;
+        _homeAiringResults = keepPrevious ? previousResults : refreshed;
+        _homeAiringVisibleResults =
+            keepPrevious ? previousVisible : refreshedVisible;
       },
     );
   }
@@ -2852,7 +2858,7 @@ class _AnimePanel extends StatelessWidget {
     required this.detailImporting,
     required this.trendingCandidates,
     required this.trendingLoading,
-    required this.airingCandidates,
+    required this.airingVisibleCandidates,
     required this.airingLoading,
     required this.movieCandidates,
     required this.moviesLoading,
@@ -2883,7 +2889,7 @@ class _AnimePanel extends StatelessWidget {
   final bool detailImporting;
   final List<RemoteSearchCandidate> trendingCandidates;
   final bool trendingLoading;
-  final List<RemoteSearchCandidate> airingCandidates;
+  final List<RemoteSearchCandidate> airingVisibleCandidates;
   final bool airingLoading;
   final List<RemoteSearchCandidate> movieCandidates;
   final bool moviesLoading;
@@ -2914,7 +2920,7 @@ class _AnimePanel extends StatelessWidget {
     // filtrarla aqui haria desaparecer tarjetas cuando llegan metadatos de
     // emision durante la precarga visual.
     final visibleSeason = trendingCandidates;
-    final visibleAiring = _airingShelfCandidates(airingCandidates);
+    final visibleAiring = airingVisibleCandidates;
     final latestMovies = movieCandidates.isNotEmpty
         ? movieCandidates
         : _latestMovieCandidates(trendingCandidates);
@@ -3298,37 +3304,65 @@ class _HorizontalFocusShelfBinding extends InheritedWidget {
 }
 
 class _HorizontalFocusShelfController {
-  final List<FocusNode> _nodes = [];
+  final Map<FocusNode, BuildContext> _nodes = {};
 
-  void register(FocusNode node) {
-    if (!_nodes.contains(node)) {
-      _nodes.add(node);
-    }
+  void register(FocusNode node, BuildContext context) {
+    _nodes[node] = context;
   }
 
   void unregister(FocusNode node) {
     _nodes.remove(node);
   }
 
-  bool moveFrom(FocusNode node, {required bool forward}) {
-    final focusedIndex = _nodes.indexOf(node);
+  _HorizontalFocusMoveResult moveFrom(FocusNode node, {required bool forward}) {
+    final nodes = _orderedNodes();
+    final focusedIndex = nodes.indexOf(node);
     if (focusedIndex < 0) {
-      return false;
+      return _HorizontalFocusMoveResult.unavailable;
     }
     final targetIndex = focusedIndex + (forward ? 1 : -1);
-    if (targetIndex < 0 || targetIndex >= _nodes.length) {
-      return true;
+    if (targetIndex < 0 || targetIndex >= nodes.length) {
+      return _HorizontalFocusMoveResult.edge;
     }
-    final target = _nodes[targetIndex];
+    final target = nodes[targetIndex];
     if (target.canRequestFocus) {
       target.requestFocus();
+      return _HorizontalFocusMoveResult.moved;
     }
-    return true;
+    return _HorizontalFocusMoveResult.edge;
   }
 
   void dispose() {
     _nodes.clear();
   }
+
+  List<FocusNode> _orderedNodes() {
+    final positioned = <({FocusNode node, Offset offset})>[];
+    for (final entry in _nodes.entries) {
+      final renderObject = entry.value.findRenderObject();
+      if (renderObject is! RenderBox || !renderObject.attached) {
+        continue;
+      }
+      positioned.add((
+        node: entry.key,
+        offset: renderObject.localToGlobal(Offset.zero),
+      ));
+    }
+    positioned.sort((left, right) {
+      final horizontal = left.offset.dx.compareTo(right.offset.dx);
+      if (horizontal != 0) {
+        return horizontal;
+      }
+      return left.offset.dy.compareTo(right.offset.dy);
+    });
+    return [for (final entry in positioned) entry.node];
+  }
+}
+
+enum _HorizontalFocusMoveResult {
+  moved,
+  edge,
+  unavailable,
 }
 
 double _heroButtonSide(BuildContext context) =>
@@ -7269,9 +7303,10 @@ String _seriesKeyForEpisode(EpisodeItem episode) {
 List<RemoteSearchCandidate> _airingShelfCandidates(
   Iterable<RemoteSearchCandidate> candidates,
 ) {
+  final today = _todayDate();
   final byTitle = <String, RemoteSearchCandidate>{};
   for (final candidate in candidates) {
-    if (_candidateNextAirDate(candidate) == null) {
+    if (_candidateNextAirDate(candidate, today: today) == null) {
       continue;
     }
     final key = _seriesTitleDedupeKey(candidate.title);
@@ -7280,15 +7315,16 @@ List<RemoteSearchCandidate> _airingShelfCandidates(
     }
     final current = byTitle[key];
     if (current == null ||
-        _candidateSortDate(candidate).compareTo(_candidateSortDate(current)) <
+        _candidateSortDate(candidate, today: today)
+                .compareTo(_candidateSortDate(current, today: today)) <
             0) {
       byTitle[key] = candidate;
     }
   }
   final ordered = byTitle.values.toList(growable: false);
   ordered.sort((left, right) {
-    final leftNext = _candidateNextAirDate(left);
-    final rightNext = _candidateNextAirDate(right);
+    final leftNext = _candidateNextAirDate(left, today: today);
+    final rightNext = _candidateNextAirDate(right, today: today);
     if (leftNext != null && rightNext != null) {
       final dateCompare = leftNext.compareTo(rightNext);
       if (dateCompare != 0) {
@@ -7362,26 +7398,35 @@ DateTime? _candidateAirDate(RemoteSearchCandidate candidate) {
   return _parseAirDate(candidate.airDateIso);
 }
 
-DateTime _candidateSortDate(RemoteSearchCandidate candidate) {
-  return _candidateNextAirDate(candidate) ??
+DateTime _candidateSortDate(
+  RemoteSearchCandidate candidate, {
+  DateTime? today,
+}) {
+  return _candidateNextAirDate(candidate, today: today) ??
       _candidateAirDate(candidate) ??
       DateTime(9999);
 }
 
-DateTime? _candidateNextAirDate(RemoteSearchCandidate candidate) {
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final datedEpisodes = candidate.episodeDetails
-      .map((episode) => _parseAirDate(episode.airDateIso))
-      .whereType<DateTime>()
-      .where((date) => !date.isBefore(today))
-      .toList(growable: false)
-    ..sort();
-  if (datedEpisodes.isNotEmpty) {
-    return datedEpisodes.first;
+DateTime? _candidateNextAirDate(
+  RemoteSearchCandidate candidate, {
+  DateTime? today,
+}) {
+  final effectiveToday = today ?? _todayDate();
+  DateTime? nextEpisodeDate;
+  for (final episode in candidate.episodeDetails) {
+    final date = _parseAirDate(episode.airDateIso);
+    if (date == null || date.isBefore(effectiveToday)) {
+      continue;
+    }
+    if (nextEpisodeDate == null || date.isBefore(nextEpisodeDate)) {
+      nextEpisodeDate = date;
+    }
+  }
+  if (nextEpisodeDate != null) {
+    return nextEpisodeDate;
   }
   final candidateDate = _candidateAirDate(candidate);
-  if (candidateDate != null && !candidateDate.isBefore(today)) {
+  if (candidateDate != null && !candidateDate.isBefore(effectiveToday)) {
     return candidateDate;
   }
   return null;
@@ -7392,7 +7437,7 @@ String _candidateScheduleChipLabel(RemoteSearchCandidate candidate) {
   if (date == null) {
     return '';
   }
-  return _scheduleChipLabel(date.toIso8601String());
+  return _scheduleChipLabelForDate(date);
 }
 
 DateTime? _parseAirDate(String airDateIso) {
@@ -7400,12 +7445,19 @@ DateTime? _parseAirDate(String airDateIso) {
   if (normalized.isEmpty) {
     return null;
   }
-  final source =
-      normalized.length >= 10 ? normalized.substring(0, 10) : normalized;
-  final parsed = DateTime.tryParse(source);
-  return parsed == null
-      ? null
-      : DateTime(parsed.year, parsed.month, parsed.day);
+  if (normalized.length >= 10) {
+    final year = int.tryParse(normalized.substring(0, 4));
+    final month = int.tryParse(normalized.substring(5, 7));
+    final day = int.tryParse(normalized.substring(8, 10));
+    if (year != null && month != null && day != null) {
+      return DateTime(year, month, day);
+    }
+  }
+  final parsed = DateTime.tryParse(normalized);
+  if (parsed == null) {
+    return null;
+  }
+  return DateTime(parsed.year, parsed.month, parsed.day);
 }
 
 void _ensureFocusedShelfVisible(BuildContext context) {
@@ -7454,19 +7506,15 @@ String _searchStatusLabel(AppController controller, String query) {
 }
 
 String _scheduleChipLabel(String airDateIso) {
-  final normalized = airDateIso.trim();
-  if (normalized.isEmpty) {
+  final date = _parseAirDate(airDateIso);
+  if (date == null) {
     return '';
   }
-  final source =
-      normalized.length >= 10 ? normalized.substring(0, 10) : normalized;
-  final parsed = DateTime.tryParse(source);
-  if (parsed == null) {
-    return '';
-  }
-  final date = DateTime(parsed.year, parsed.month, parsed.day);
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
+  return _scheduleChipLabelForDate(date);
+}
+
+String _scheduleChipLabelForDate(DateTime date) {
+  final today = _todayDate();
   final daysUntil = date.difference(today).inDays;
   if (daysUntil < 0) {
     return '';
@@ -7493,20 +7541,17 @@ String _scheduleChipLabel(String airDateIso) {
 }
 
 bool _episodeAirsInFuture(String airDateIso) {
-  final normalized = airDateIso.trim();
-  if (normalized.isEmpty) {
+  final airDate = _parseAirDate(airDateIso);
+  if (airDate == null) {
     return false;
   }
-  final source =
-      normalized.length >= 10 ? normalized.substring(0, 10) : normalized;
-  final parsed = DateTime.tryParse(source);
-  if (parsed == null) {
-    return false;
-  }
-  final airDate = DateTime(parsed.year, parsed.month, parsed.day);
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
+  final today = _todayDate();
   return airDate.isAfter(today);
+}
+
+DateTime _todayDate() {
+  final now = DateTime.now();
+  return DateTime(now.year, now.month, now.day);
 }
 
 String _monthLabel(int month) {
@@ -7985,7 +8030,7 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
     }
     _horizontalShelf?.unregister(_focusNode);
     _horizontalShelf = nextShelf;
-    _horizontalShelf?.register(_focusNode);
+    _horizontalShelf?.register(_focusNode, context);
   }
 
   @override
@@ -8006,12 +8051,21 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
     if (event is KeyDownEvent || event is KeyRepeatEvent) {
       if (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
           event.logicalKey == LogicalKeyboardKey.arrowRight) {
-        final handled = _horizontalShelf?.moveFrom(
+        final forward = event.logicalKey == LogicalKeyboardKey.arrowRight;
+        final result = _horizontalShelf?.moveFrom(
               _focusNode,
-              forward: event.logicalKey == LogicalKeyboardKey.arrowRight,
+              forward: forward,
             ) ??
-            false;
-        return handled ? KeyEventResult.handled : KeyEventResult.ignored;
+            _HorizontalFocusMoveResult.unavailable;
+        if (result == _HorizontalFocusMoveResult.moved) {
+          return KeyEventResult.handled;
+        }
+        if (result == _HorizontalFocusMoveResult.edge) {
+          return _horizontalScrollHasRoom(context, forward: forward)
+              ? KeyEventResult.ignored
+              : KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
       }
     }
 
@@ -8292,6 +8346,24 @@ void _ensureFocusableVisible(
     alignment: alignment,
     alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
   );
+}
+
+bool _horizontalScrollHasRoom(
+  BuildContext context, {
+  required bool forward,
+}) {
+  final scrollable = Scrollable.maybeOf(context);
+  if (scrollable == null) {
+    return false;
+  }
+  final position = scrollable.position;
+  if (!position.hasPixels || !position.hasContentDimensions) {
+    return false;
+  }
+  const tolerance = 1.0;
+  return forward
+      ? position.extentAfter > tolerance
+      : position.extentBefore > tolerance;
 }
 
 class _Poster extends StatelessWidget {
