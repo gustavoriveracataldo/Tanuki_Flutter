@@ -83,7 +83,7 @@ BoxDecoration glassDecoration({
 }) {
   final useGlassGradient = color == TanukiColors.panel;
   return BoxDecoration(
-    color: useGlassGradient ? null : color.withOpacity(0.18),
+    color: useGlassGradient ? null : color.withValues(alpha: 0.18),
     gradient: useGlassGradient
         ? LinearGradient(
             begin: Alignment.centerLeft,
@@ -95,7 +95,7 @@ BoxDecoration glassDecoration({
           )
         : null,
     borderRadius: BorderRadius.circular(radius),
-    border: Border.all(color: borderColor.withOpacity(0.25)),
+    border: Border.all(color: borderColor.withValues(alpha: 0.25)),
     boxShadow: [],
   );
 }

@@ -221,21 +221,21 @@ class SimklService {
         continue;
       }
       var didPush = false;
-      if (update.listStatus.isNotEmpty) {
-        await _addToList(
-          accessToken: accessToken,
-          clientId: clientId,
-          itemPayload: itemPayload,
-          targetList: update.listStatus,
-          watchedEpisodes: update.watchedEpisodes,
-        );
-        didPush = true;
-      }
       if (update.watchedEpisodes > 0) {
         await _addHistory(
           accessToken: accessToken,
           clientId: clientId,
           itemPayload: itemPayload,
+          listStatus: update.listStatus,
+          watchedEpisodes: update.watchedEpisodes,
+        );
+        didPush = true;
+      } else if (update.listStatus.isNotEmpty) {
+        await _addToList(
+          accessToken: accessToken,
+          clientId: clientId,
+          itemPayload: itemPayload,
+          targetList: update.listStatus,
           watchedEpisodes: update.watchedEpisodes,
         );
         didPush = true;
@@ -269,12 +269,8 @@ class SimklService {
       clientId: clientId,
       accessToken: accessToken,
       body: {
-        'anime': {
-          'ids': itemPayload,
-          if (update.title.trim().isNotEmpty) 'title': update.title.trim(),
-          if (update.year > 0) 'year': update.year,
-        },
-        'episode': {'season': 1, 'number': update.episodeNumber},
+        'anime': itemPayload,
+        'episode': {'number': update.episodeNumber},
         'progress': update.progressPercent.clamp(0, 100).toDouble(),
       },
     );
@@ -311,31 +307,49 @@ class SimklService {
   }
 
   Map<String, dynamic>? _buildItemPayload(SimklLocalAnimeUpdate update) {
-    final payload = <String, dynamic>{
-      'type': 'show',
-      if (update.title.trim().isNotEmpty) 'title': update.title.trim(),
-      if (update.year > 0) 'year': update.year,
-      if (update.simklId > 0) 'simkl': update.simklId,
-      if (update.malId > 0) 'mal': update.malId,
-      if (update.tmdbId > 0) 'tmdb': update.tmdbId,
-      if (update.imdbId.trim().isNotEmpty) 'imdb': update.imdbId.trim(),
-    };
-    return payload.length > 1 || payload.containsKey('title') ? payload : null;
+    return _buildMediaPayload(
+      title: update.title,
+      year: update.year,
+      simklId: update.simklId,
+      malId: update.malId,
+      tmdbId: update.tmdbId,
+      imdbId: update.imdbId,
+    );
   }
 
   Map<String, dynamic>? _buildScrobbleItemPayload(
     SimklEpisodeScrobbleUpdate update,
   ) {
-    final payload = <String, dynamic>{
-      'type': 'show',
-      if (update.title.trim().isNotEmpty) 'title': update.title.trim(),
-      if (update.year > 0) 'year': update.year,
-      if (update.simklId > 0) 'simkl': update.simklId,
-      if (update.malId > 0) 'mal': update.malId,
-      if (update.tmdbId > 0) 'tmdb': update.tmdbId,
-      if (update.imdbId.trim().isNotEmpty) 'imdb': update.imdbId.trim(),
+    return _buildMediaPayload(
+      title: update.title,
+      year: update.year,
+      simklId: update.simklId,
+      malId: update.malId,
+      tmdbId: update.tmdbId,
+      imdbId: update.imdbId,
+    );
+  }
+
+  Map<String, dynamic>? _buildMediaPayload({
+    required String title,
+    required int year,
+    required int simklId,
+    required int malId,
+    required int tmdbId,
+    required String imdbId,
+  }) {
+    final ids = <String, dynamic>{
+      if (simklId > 0) 'simkl': simklId,
+      if (malId > 0) 'mal': malId,
+      if (tmdbId > 0) 'tmdb': tmdbId,
+      if (imdbId.trim().isNotEmpty) 'imdb': imdbId.trim(),
     };
-    return payload.length > 1 || payload.containsKey('title') ? payload : null;
+    final payload = <String, dynamic>{
+      if (title.trim().isNotEmpty) 'title': title.trim(),
+      if (year > 0) 'year': year,
+      if (ids.isNotEmpty) 'ids': ids,
+    };
+    return payload.isEmpty ? null : payload;
   }
 
   Future<void> _addToList({
@@ -370,6 +384,7 @@ class SimklService {
     required String accessToken,
     required String clientId,
     required Map<String, dynamic> itemPayload,
+    required String listStatus,
     required int watchedEpisodes,
   }) async {
     final episodes = List.generate(
@@ -382,7 +397,11 @@ class SimklService {
       accessToken: accessToken,
       body: {
         'shows': [
-          {...itemPayload, 'episodes': episodes},
+          {
+            ...itemPayload,
+            if (listStatus.isNotEmpty) 'status': listStatus,
+            'episodes': episodes,
+          },
         ],
       },
     );

@@ -3460,6 +3460,13 @@ class AppController extends ChangeNotifier {
       return false;
     }
     try {
+      if (action.trim().toLowerCase() == 'start') {
+        await _ensureSimklWatchingEntry(
+          update,
+          accessToken: _state.profile.simklAuth.accessToken,
+          clientId: clientId,
+        );
+      }
       await _simklService.scrobbleEpisode(
         accessToken: _state.profile.simklAuth.accessToken,
         clientId: clientId,
@@ -3473,6 +3480,54 @@ class AppController extends ChangeNotifier {
         'action=$action episode=${episode.episodeNumber}: $error',
       );
       return false;
+    }
+  }
+
+  Future<void> _ensureSimklWatchingEntry(
+    SimklEpisodeScrobbleUpdate update, {
+    required String accessToken,
+    required String clientId,
+  }) async {
+    final key = update.seriesKey;
+    final profile = _state.profile;
+    if (key.isEmpty ||
+        profile.watchlistSeries.contains(key) ||
+        profile.watchingSeries.contains(key) ||
+        profile.abandonedSeries.contains(key) ||
+        profile.completedSeries.contains(key) ||
+        profile.simklMappings.containsKey(key)) {
+      return;
+    }
+    final watched = _watchedEpisodesForSeriesKey(
+      profile,
+      key,
+      _findSeriesByKeyFallback(key),
+    );
+    if (watched > 0) {
+      return;
+    }
+    try {
+      await _simklService.pushLocalAnimeState(
+        accessToken: accessToken,
+        clientId: clientId,
+        updates: [
+          SimklLocalAnimeUpdate(
+            seriesKey: key,
+            title: update.title,
+            simklId: update.simklId,
+            malId: update.malId,
+            tmdbId: update.tmdbId,
+            imdbId: update.imdbId,
+            year: update.year,
+            listStatus: 'watching',
+          ),
+        ],
+      );
+    } catch (error) {
+      debugPrint(
+        'AppControllerSync: SIMKL watching add failed '
+        'series=$key: $error',
+      );
     }
   }
 

@@ -86,6 +86,10 @@ class RemoteCatalogService {
     }());
   }
 
+  String _debugBodySnippet(String value) {
+    return value.substring(0, value.length.clamp(0, 400));
+  }
+
   String _debugUrlLabel(String value) {
     final uri = Uri.tryParse(value);
     if (uri == null || !uri.hasScheme) {
@@ -1119,19 +1123,6 @@ class RemoteCatalogService {
       type: 'tv',
       sort: '[POPULARITY_DESC, TRENDING_DESC]',
       includeAiringSchedule: true,
-    );
-  }
-
-  Future<List<RemoteSearchCandidate>> _discoverAniListMovies({
-    required int limit,
-    required int page,
-  }) {
-    return _discoverAniListPage(
-      page: page,
-      limit: limit,
-      extraArgs: 'status: FINISHED',
-      type: 'movie',
-      sort: '[START_DATE_DESC, POPULARITY_DESC]',
     );
   }
 
@@ -3212,10 +3203,11 @@ $airingScheduleFields
     _debugResolver('animeav1 fetch ${_debugUrlLabel(episodeUrl)}');
     final response = await _get(Uri.parse(episodeUrl));
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      print('RemoteCatalogService: animeav1 episode fetch failed '
-          '(${response.statusCode}) for $episodeUrl');
-      print('RemoteCatalogService: response body snippet: '
-          "${response.body.substring(0, response.body.length.clamp(0, 400))}");
+      _debugResolver(
+        'animeav1 episode fetch failed status=${response.statusCode} '
+        'url=${_debugUrlLabel(episodeUrl)} '
+        'body=${_debugBodySnippet(response.body)}',
+      );
       final webResolved = await _resolvePlatformWebDirectStream(
         entry,
         preferredServer: preferredServer,
@@ -3248,10 +3240,10 @@ $airingScheduleFields
       );
     }
     if (playbackByMode.isEmpty) {
-      print(
-          'RemoteCatalogService: animeav1 no playback modes found for $episodeUrl');
-      print('RemoteCatalogService: response body snippet: '
-          "${response.body.substring(0, response.body.length.clamp(0, 400))}");
+      _debugResolver(
+        'animeav1 no playback modes url=${_debugUrlLabel(episodeUrl)} '
+        'body=${_debugBodySnippet(response.body)}',
+      );
       for (final playUrl
           in _extractAnimeAv1PlayUrls(response.body, episodeUrl)) {
         final hlsUrl = _buildAnimeAv1HlsUrl(playUrl);

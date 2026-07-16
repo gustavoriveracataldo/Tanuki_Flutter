@@ -91,83 +91,134 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: widget.controller,
-      builder: (context, _) {
-        final heroSeries = _resolveHeroSeries(widget.controller);
-        return Scaffold(
-          body: LayoutBuilder(
-            builder: (context, constraints) {
-              final compactNavigation = constraints.maxWidth < 720 ||
-                  constraints.maxHeight > constraints.maxWidth;
-              return Stack(
-                children: [
-                  Positioned.fill(child: _HeroBackground(series: heroSeries)),
-                  if (compactNavigation) ...[
-                    Positioned.fill(
-                      bottom: 64,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 14, 12, 0),
-                        child: _buildPanel(widget.controller),
-                      ),
-                    ),
-                    Positioned(
-                      left: 0,
-                      right: 0,
-                      bottom: 0,
-                      child: _BottomRail(
-                        activeSection: _section,
-                        profile: widget.controller.state.profile,
-                        onSectionSelected: _selectSection,
-                        onProfilePressed: _showProfilePicker,
-                      ),
-                    ),
-                  ] else ...[
-                    Positioned.fill(
-                      left: 54,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(0, 14, 14, 14),
-                        child: _buildPanel(widget.controller),
-                      ),
-                    ),
-                    Positioned(
-                      left: 0,
-                      top: 0,
-                      bottom: 0,
-                      child: _SideRail(
-                        activeSection: _section,
-                        profile: widget.controller.state.profile,
-                        onSectionSelected: _selectSection,
-                        onProfilePressed: _showProfilePicker,
-                      ),
-                    ),
-                  ],
-                  if (widget.controller.isSaving)
-                    const Positioned(
-                      right: 18,
-                      top: 18,
-                      child: _SavingPill(),
-                    ),
-                  if (_profilePickerVisible)
-                    Positioned.fill(
-                      child: _ProfilePickerOverlay(
-                        controller: widget.controller,
-                        onClose: _hideProfilePicker,
-                        onSelectProfile: _selectProfile,
-                        onCreateProfile: _createProfile,
-                        onRenameProfile: _renameProfile,
-                        onChangeProfileAvatar: _changeProfileAvatar,
-                        onSetDefaultProfile: _setDefaultProfile,
-                        onDeleteProfile: _deleteProfile,
-                      ),
-                    ),
-                ],
-              );
-            },
-          ),
-        );
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          _handleBackNavigation();
+        }
       },
+      child: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.goBack):
+              _handleBackNavigation,
+          const SingleActivator(LogicalKeyboardKey.browserBack):
+              _handleBackNavigation,
+          const SingleActivator(LogicalKeyboardKey.escape):
+              _handleBackNavigation,
+        },
+        child: AnimatedBuilder(
+          animation: widget.controller,
+          builder: (context, _) {
+            final heroSeries = _resolveHeroSeries(widget.controller);
+            return Scaffold(
+              body: LayoutBuilder(
+                builder: (context, constraints) {
+                  final compactNavigation = constraints.maxWidth < 720 ||
+                      constraints.maxHeight > constraints.maxWidth;
+                  return Stack(
+                    children: [
+                      Positioned.fill(
+                        child: _HeroBackground(series: heroSeries),
+                      ),
+                      if (compactNavigation) ...[
+                        Positioned.fill(
+                          bottom: 64,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(12, 14, 12, 0),
+                            child: _buildPanel(widget.controller),
+                          ),
+                        ),
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: _BottomRail(
+                            activeSection: _section,
+                            profile: widget.controller.state.profile,
+                            onSectionSelected: _selectSection,
+                            onProfilePressed: _showProfilePicker,
+                          ),
+                        ),
+                      ] else ...[
+                        Positioned.fill(
+                          left: 54,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(0, 14, 14, 14),
+                            child: _buildPanel(widget.controller),
+                          ),
+                        ),
+                        Positioned(
+                          left: 0,
+                          top: 0,
+                          bottom: 0,
+                          child: _SideRail(
+                            activeSection: _section,
+                            profile: widget.controller.state.profile,
+                            onSectionSelected: _selectSection,
+                            onProfilePressed: _showProfilePicker,
+                          ),
+                        ),
+                      ],
+                      if (widget.controller.isSaving)
+                        const Positioned(
+                          right: 18,
+                          top: 18,
+                          child: _SavingPill(),
+                        ),
+                      if (_profilePickerVisible)
+                        Positioned.fill(
+                          child: _ProfilePickerOverlay(
+                            controller: widget.controller,
+                            onClose: _hideProfilePicker,
+                            onSelectProfile: _selectProfile,
+                            onCreateProfile: _createProfile,
+                            onRenameProfile: _renameProfile,
+                            onChangeProfileAvatar: _changeProfileAvatar,
+                            onSetDefaultProfile: _setDefaultProfile,
+                            onDeleteProfile: _deleteProfile,
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            );
+          },
+        ),
+      ),
     );
+  }
+
+  void _handleBackNavigation() {
+    if (_profilePickerVisible) {
+      setState(() {
+        _profilePickerVisible = false;
+      });
+      return;
+    }
+
+    if (_section == _Section.anime) {
+      if (_selectedSeries == null) {
+        return;
+      }
+      final returnSection = _detailReturnSection;
+      setState(() {
+        _selectedSeries = null;
+        _detailReturnSection = null;
+        _detailImporting = false;
+        _section =
+            returnSection == _Section.search ? _Section.search : _Section.anime;
+      });
+      return;
+    }
+
+    setState(() {
+      _selectedSeries = null;
+      _detailReturnSection = null;
+      _detailImporting = false;
+      _section = _Section.anime;
+    });
   }
 
   void _selectSection(_Section section) {

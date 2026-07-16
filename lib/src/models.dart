@@ -1607,6 +1607,8 @@ class UserProfileState {
 }
 
 class AppState {
+  static const schemaVersion = 1;
+
   const AppState({
     this.rootPaths = const [],
     this.remoteLibrary = const [],
@@ -1759,6 +1761,7 @@ class AppState {
 
   Map<String, dynamic> toJson() {
     return {
+      'schemaVersion': schemaVersion,
       'rootPaths': rootPaths,
       'remoteLibrary': remoteLibrary.map((series) => series.toJson()).toList(),
       'showSeriesUpcomingCards': showSeriesUpcomingCards,

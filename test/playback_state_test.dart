@@ -493,6 +493,61 @@ void main() {
     expect(simkl.scrobbles.single.update.progressPercent, 50);
   });
 
+  test('adds unmapped SIMKL series to watching before scrobbling', () async {
+    final simkl = _FakeSimklService(remoteEntries: const []);
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        remoteLibrary: [
+          SeriesItem(
+            name: 'New Demo',
+            seriesStateKey: 'new-demo',
+            sourceType: SourceType.remote,
+            episodeCount: 12,
+            catalogId: 987,
+            releaseYear: 2026,
+            episodes: [
+              EpisodeItem(
+                seriesName: 'New Demo',
+                seriesStateKey: 'new-demo',
+                episodeIndex: 0,
+                episodeNumber: 1,
+                displayName: 'New Demo - Capitulo 1',
+                relativePath: 'New Demo / Capitulo 1',
+                filePath: '',
+                sourceType: SourceType.remote,
+              ),
+            ],
+          ),
+        ],
+        profiles: [
+          UserProfileState(
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(store: store, simklService: simkl);
+    await controller.initialize();
+
+    final sent = await controller.sendSimklScrobble(
+      store.state.remoteLibrary.single.episodes.single,
+      position: const Duration(minutes: 6),
+      duration: const Duration(minutes: 24),
+      action: 'start',
+    );
+
+    expect(sent, isTrue);
+    expect(simkl.pushedUpdates, hasLength(1));
+    expect(simkl.pushedUpdates.single.title, 'New Demo');
+    expect(simkl.pushedUpdates.single.malId, 987);
+    expect(simkl.pushedUpdates.single.listStatus, 'watching');
+    expect(simkl.pushedUpdates.single.watchedEpisodes, 0);
+    expect(simkl.scrobbles, hasLength(1));
+    expect(simkl.scrobbles.single.update.malId, 987);
+    expect(simkl.scrobbles.single.update.progressPercent, 25);
+  });
+
   test(
     'keeps progress partial below 97 percent and completes at 97 percent',
     () async {

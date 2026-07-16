@@ -103,8 +103,8 @@ void main() {
     final localManifest = await http.read(Uri.parse(stream!.playbackUrl));
     expect(localManifest, contains('http://127.0.0.1:'));
     expect(localManifest, isNot(contains('https://neko.justanime.to/')));
-    expect(stream?.subtitleTracks.single.label, 'Spanish');
-    expect(stream?.subtitleTracks.single.url,
+    expect(stream.subtitleTracks.single.label, 'Spanish');
+    expect(stream.subtitleTracks.single.url,
         contains('momo.calm-koi.workers.dev/proxy'));
   });
 

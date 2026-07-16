@@ -140,6 +140,19 @@ void main() {
         ),
       ],
     );
+    final planPush = await service.pushLocalAnimeState(
+      accessToken: 'token',
+      clientId: clientId,
+      updates: const [
+        SimklLocalAnimeUpdate(
+          seriesKey: 'plan',
+          title: 'Plan Demo',
+          malId: 987,
+          year: 2026,
+          listStatus: 'plantowatch',
+        ),
+      ],
+    );
     await service.scrobbleEpisode(
       accessToken: 'token',
       clientId: clientId,
@@ -166,7 +179,18 @@ void main() {
     expect(episodeProgress.single.episodeNumber, 4);
     expect(episodeProgress.single.progressPercent, 42.5);
     expect(push.pushedCount, 1);
-    expect(postedBodies['/sync/add-to-list']['shows'].single['to'], 'watching');
+    expect(planPush.pushedCount, 1);
+    expect(
+      postedBodies['/sync/add-to-list']['shows'].single['to'],
+      'plantowatch',
+    );
+    expect(
+      postedBodies['/sync/add-to-list']['shows'].single['ids']['mal'],
+      987,
+    );
+    expect(postedBodies['/sync/history']['shows'].single['status'], 'watching');
+    expect(postedBodies['/sync/history']['shows'].single['ids']['simkl'], 654);
+    expect(postedBodies['/sync/history']['shows'].single['ids']['mal'], 321);
     expect(
       postedBodies['/sync/history']['shows'].single['episodes'].last['number'],
       3,
