@@ -24,6 +24,7 @@ El workflow se ejecuta al subir un tag `v*` o manualmente desde `workflow_dispat
 3. Corre las validaciones locales que apliquen:
 
    ```sh
+   sh scripts/flutter_with_secrets.sh analyze
    sh scripts/flutter_with_secrets.sh test
    sh scripts/flutter_with_secrets.sh build apk --debug
    sh scripts/flutter_with_secrets.sh build linux --debug
@@ -75,10 +76,11 @@ En GitHub, abre `Actions` y entra al workflow `Release`.
 El workflow hace:
 
 1. `validate-secrets`: valida secretos obligatorios.
-2. `Android APK`: corre `scripts/build_android.sh` y sube el APK.
-3. `Linux x64`: instala dependencias Linux, corre `scripts/build_linux.sh` y sube el `.tar.gz`.
-4. `Windows x64`: corre `scripts\build_release_windows.ps1` y sube el `.zip`.
-5. `GitHub Release`: descarga los artefactos y crea el release.
+2. `Analyze and test`: corre `flutter analyze` y `flutter test`.
+3. `Android APK`: corre `scripts/build_android.sh` y sube el APK.
+4. `Linux x64`: instala dependencias Linux, corre `scripts/build_linux.sh` y sube el `.tar.gz`.
+5. `Windows x64`: corre `scripts\build_release_windows.ps1` y sube el `.zip`.
+6. `GitHub Release`: descarga los artefactos y crea el release.
 
 Los secretos requeridos son:
 
@@ -98,7 +100,10 @@ Tambien puedes correr el workflow sin tag:
 1. GitHub -> `Actions`.
 2. Selecciona `Release`.
 3. Presiona `Run workflow`.
-4. El workflow usara la version de `pubspec.yaml` para nombrar el release.
+4. Deja `Run flutter analyze and flutter test before building` activado si no
+   validaste localmente. Puedes desactivarlo para ahorrar minutos despues de
+   correr `analyze` y `test` en tu maquina.
+5. El workflow usara la version de `pubspec.yaml` para nombrar el release.
 
 Si el release manual crea `v1.4.0`, evita crear despues el mismo tag apuntando a
 otro commit. En ese caso sube una nueva version, por ejemplo `1.4.1+15`.
