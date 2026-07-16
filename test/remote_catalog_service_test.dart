@@ -924,6 +924,62 @@ void main() {
     expect(results.first.airDateIso, '2026-04-05T00:00:00+00:00');
   });
 
+  test('discovers MyAnimeList TV New season section without continuing shows',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(request.url.host, 'myanimelist.net');
+        expect(request.url.path, '/anime/season/2026/summer');
+        return http.Response(
+          '''
+          <div class="seasonal-anime-list js-seasonal-anime-list">
+            <div class="anime-header">TV (New)</div>
+            <div class="seasonal-anime js-anime-type-1">
+              <h2 class="h2_anime_title"><a href="https://myanimelist.net/anime/59193/Mushoku_Tensei_III__Isekai_Ittara_Honki_Dasu" class="link-title">Mushoku Tensei III: Isekai Ittara Honki Dasu</a></h2>
+              <span class="js-start_date">20260705</span>
+              <span class="js-score">8.50</span>
+              <img data-src="https://cdn.myanimelist.net/images/anime/1/1.jpg" />
+              <div class="eps">12 eps</div>
+            </div>
+            <div class="seasonal-anime js-anime-type-1">
+              <h2 class="h2_anime_title"><a href="https://myanimelist.net/anime/49233/Youjo_Senki_II" class="link-title">Youjo Senki II</a></h2>
+              <span class="js-start_date">20260708</span>
+              <img data-src="https://cdn.myanimelist.net/images/anime/2/2.jpg" />
+            </div>
+          </div>
+          <div class="seasonal-anime-list js-seasonal-anime-list">
+            <div class="anime-header">TV (Continuing)</div>
+            <div class="seasonal-anime js-anime-type-1">
+              <h2 class="h2_anime_title"><a href="https://myanimelist.net/anime/21/One_Piece" class="link-title">One Piece</a></h2>
+              <span class="js-start_date">19991020</span>
+            </div>
+          </div>
+          ''',
+          200,
+          request: request,
+        );
+      }),
+    );
+
+    final results = await service.discoverCatalogBySeason(
+      season: 'summer',
+      year: 2026,
+      type: 'tv',
+      limit: 50,
+      tvNewOnly: true,
+    );
+
+    expect(
+      results.map((candidate) => candidate.title),
+      [
+        'Mushoku Tensei III: Isekai Ittara Honki Dasu',
+        'Youjo Senki II',
+      ],
+    );
+    expect(results.map((candidate) => candidate.title),
+        isNot(contains('One Piece')));
+  });
+
   test('discovers Jikan catalog by year range', () async {
     final service = RemoteCatalogService(
       client: MockClient((request) async {

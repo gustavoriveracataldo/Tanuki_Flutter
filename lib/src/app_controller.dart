@@ -540,7 +540,9 @@ class AppController extends ChangeNotifier {
       final addresses = interfaces
           .expand((entry) => entry.addresses)
           .where((address) => _isPrivatePairingAddress(address.address))
-          .toList(growable: false);
+          .toList(growable: false)
+        ..sort((a, b) => _pairingAddressPriority(a.address)
+            .compareTo(_pairingAddressPriority(b.address)));
       if (addresses.isEmpty) {
         return '';
       }
@@ -549,13 +551,17 @@ class AppController extends ChangeNotifier {
       final token = base64Url
           .encode(List<int>.generate(24, (_) => random.nextInt(256)))
           .replaceAll('=', '');
-      final endpoint = Uri(
-        scheme: 'http',
-        host: addresses.first.address,
-        port: server.port,
-        path: '/mal-callback',
-        queryParameters: {'token': token},
-      );
+      final endpoints = addresses
+          .map(
+            (address) => Uri(
+              scheme: 'http',
+              host: address.address,
+              port: server.port,
+              path: '/mal-callback',
+              queryParameters: {'token': token},
+            ).toString(),
+          )
+          .toList(growable: false);
       _myAnimeListPairingServer = server;
       _myAnimeListPairingToken = token;
       server.listen((request) async {
@@ -576,7 +582,10 @@ class AppController extends ChangeNotifier {
         }
       });
       final payload = base64Url
-          .encode(utf8.encode(jsonEncode({'endpoint': endpoint.toString()})))
+          .encode(utf8.encode(jsonEncode({
+            'endpoint': endpoints.first,
+            'endpoints': endpoints,
+          })))
           .replaceAll('=', '');
       return 'tanuki_pair_$payload';
     } catch (_) {
@@ -606,6 +615,19 @@ class AppController extends ChangeNotifier {
         (first == 192 && second == 168);
   }
 
+  int _pairingAddressPriority(String value) {
+    if (value.startsWith('192.168.')) {
+      return 0;
+    }
+    if (value.startsWith('10.')) {
+      return 1;
+    }
+    if (value.startsWith('172.')) {
+      return 2;
+    }
+    return 3;
+  }
+
   Future<bool> _relayMyAnimeListCallback(String callback) async {
     final uri = Uri.tryParse(callback.trim());
     final state = uri?.queryParameters['state'] ?? '';
@@ -617,29 +639,67 @@ class AppController extends ChangeNotifier {
       final encoded = state.substring(prefix.length);
       final normalized = base64Url.normalize(encoded);
       final payload = jsonDecode(utf8.decode(base64Url.decode(normalized)));
-      final endpoint = Uri.tryParse('${payload['endpoint'] ?? ''}');
-      if (endpoint == null ||
-          endpoint.scheme != 'http' ||
-          endpoint.path != '/mal-callback' ||
-          !_isPrivatePairingAddress(endpoint.host)) {
+      final endpoints = _myAnimeListPairingEndpointsFromPayload(payload);
+      if (endpoints.isEmpty) {
         throw const FormatException('Destino de emparejamiento invalido.');
       }
-      final response = await http
-          .post(endpoint, body: callback)
-          .timeout(const Duration(seconds: 12));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException('El dispositivo respondio ${response.statusCode}.');
+      Object? lastError;
+      for (final endpoint in endpoints) {
+        try {
+          final response = await http
+              .post(endpoint, body: callback)
+              .timeout(const Duration(seconds: 5));
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            _statusMessage =
+                'Autorizacion enviada al otro dispositivo. Puedes volver a el.';
+            notifyListeners();
+            return true;
+          }
+          lastError = HttpException(
+            '${endpoint.host} respondio ${response.statusCode}.',
+          );
+        } catch (error) {
+          lastError = error;
+        }
       }
-      _statusMessage =
-          'Autorizacion enviada al otro dispositivo. Puedes volver a el.';
-      notifyListeners();
-      return true;
+      throw lastError ?? const HttpException('No hubo respuesta.');
     } catch (error) {
+      if (_myAnimeListPendingAuthorization?.state == state) {
+        return false;
+      }
       _statusMessage =
           'No pude enviar la autorizacion al otro dispositivo: $error';
       notifyListeners();
       return true;
     }
+  }
+
+  List<Uri> _myAnimeListPairingEndpointsFromPayload(Object? payload) {
+    if (payload is! Map) {
+      return const [];
+    }
+    final values = <String>[
+      ...switch (payload['endpoints']) {
+        final List entries => entries.map((entry) => '$entry'),
+        _ => const Iterable<String>.empty(),
+      },
+      '${payload['endpoint'] ?? ''}',
+    ];
+    final endpoints = <Uri>[];
+    final seen = <String>{};
+    for (final value in values) {
+      final endpoint = Uri.tryParse(value.trim());
+      if (endpoint == null ||
+          endpoint.scheme != 'http' ||
+          endpoint.path != '/mal-callback' ||
+          !_isPrivatePairingAddress(endpoint.host)) {
+        continue;
+      }
+      if (seen.add(endpoint.toString())) {
+        endpoints.add(endpoint);
+      }
+    }
+    return endpoints;
   }
 
   Future<String> beginMyAnimeListConnection() async {
@@ -882,6 +942,7 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    await _persistResolvedSimklClientId(clientId);
 
     _isConnectingSimkl = true;
     _statusMessage = 'Solicitando codigo PIN de SIMKL...';
@@ -942,6 +1003,7 @@ class AppController extends ChangeNotifier {
       );
       return;
     }
+    await _persistResolvedSimklClientId(clientId);
     if (_isSyncingSimkl) {
       _statusMessage = 'Ya hay una sincronizacion de SIMKL en progreso.';
       notifyListeners();
@@ -1019,6 +1081,15 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _persistResolvedSimklClientId(String clientId) async {
+    final normalized = clientId.trim();
+    if (normalized.isEmpty || _state.simklClientId.trim().isNotEmpty) {
+      return;
+    }
+    _state = _state.copyWith(simklClientId: normalized);
+    await _save();
+  }
+
   void _scheduleNextSimklPoll(int intervalSeconds) {
     _simklPollTimer?.cancel();
     final seconds = intervalSeconds < 3 ? 3 : intervalSeconds;
@@ -1049,6 +1120,9 @@ class AppController extends ChangeNotifier {
         lastSyncStatus: 'Cuenta SIMKL conectada.',
       );
       _state = _state.copyWith(
+        simklClientId: _state.simklClientId.trim().isEmpty
+            ? clientId.trim()
+            : _state.simklClientId,
         profile: _state.profile.copyWith(simklAuth: auth),
       );
       await _save();
@@ -1741,7 +1815,10 @@ class AppController extends ChangeNotifier {
       final pageResults = await _remoteCatalog.discoverCatalogBySeason(
         season: current.season,
         year: current.year,
+        type: 'tv',
+        limit: 50,
         page: page,
+        tvNewOnly: true,
       );
       results.addAll(pageResults);
       if (pageResults.length < 20) {
@@ -3375,7 +3452,7 @@ class AppController extends ChangeNotifier {
     await _save();
     notifyListeners();
     for (final episode in completedEpisodes) {
-      unawaited(_syncCompletedEpisodeExternal(episode));
+      unawaited(_syncEpisodeSeriesStateExternal(episode));
     }
   }
 
@@ -3422,18 +3499,26 @@ class AppController extends ChangeNotifier {
       nextPlayback[key] = record;
     }
 
-    var profile = _state.profile.copyWith(
+    final previousProfile = _state.profile;
+    var profile = previousProfile.copyWith(
       episodePlayback: nextPlayback,
       currentEntry: episode,
     );
+    var shouldSyncSeriesState = false;
     if (record.completed) {
       profile = _profileWithPlayedEpisode(profile, episode);
+      shouldSyncSeriesState = true;
+    } else if (record.positionMs > 0) {
+      final updatedProfile = _profileWithStartedEpisode(profile, episode);
+      shouldSyncSeriesState =
+          !_sameSeriesSpaceStatus(previousProfile, updatedProfile, episode);
+      profile = updatedProfile;
     }
     _state = _state.copyWith(profile: profile);
     await _save();
     notifyListeners();
-    if (record.completed) {
-      unawaited(_syncCompletedEpisodeExternal(episode));
+    if (shouldSyncSeriesState) {
+      unawaited(_syncEpisodeSeriesStateExternal(episode));
     }
   }
 
@@ -3443,35 +3528,53 @@ class AppController extends ChangeNotifier {
     required Duration duration,
     required String action,
   }) async {
-    if (!_state.profile.simklAuth.isConnected || duration <= Duration.zero) {
+    final normalizedAction = action.trim().toLowerCase();
+    if (!_state.profile.simklAuth.isConnected ||
+        (duration <= Duration.zero &&
+            normalizedAction != 'start' &&
+            normalizedAction != 'stop' &&
+            normalizedAction != 'pause')) {
       return false;
     }
     final clientId = _simklService.resolveClientId(_state.simklClientId);
     if (clientId.isEmpty) {
+      debugPrint(
+        'AppControllerSync: SIMKL scrobble skipped because clientId is empty.',
+      );
       return false;
     }
+    await _persistResolvedSimklClientId(clientId);
+    final progressPercent = duration > Duration.zero
+        ? (position.inMilliseconds / duration.inMilliseconds * 100)
+            .clamp(0, 100)
+            .toDouble()
+        : 0.0;
     final update = _buildSimklScrobbleUpdate(
       episode,
-      progressPercent: (position.inMilliseconds / duration.inMilliseconds * 100)
-          .clamp(0, 100)
-          .toDouble(),
+      progressPercent: progressPercent,
     );
     if (update == null) {
       return false;
     }
     try {
-      if (action.trim().toLowerCase() == 'start') {
-        await _ensureSimklWatchingEntry(
-          update,
-          accessToken: _state.profile.simklAuth.accessToken,
-          clientId: clientId,
-        );
-      }
+      debugPrint(
+        'AppControllerSync: SIMKL scrobble send '
+        'action=$normalizedAction series="${update.title}" '
+        'episode=${update.episodeNumber} '
+        'progress=${update.progressPercent.toStringAsFixed(2)} '
+        'simkl=${update.simklId} mal=${update.malId} '
+        'tmdb=${update.tmdbId} imdb=${update.imdbId}',
+      );
       await _simklService.scrobbleEpisode(
         accessToken: _state.profile.simklAuth.accessToken,
         clientId: clientId,
         action: action,
         update: update,
+      );
+      debugPrint(
+        'AppControllerSync: SIMKL scrobble ok '
+        'action=$normalizedAction series="${update.title}" '
+        'episode=${update.episodeNumber}',
       );
       return true;
     } catch (error) {
@@ -3483,54 +3586,6 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> _ensureSimklWatchingEntry(
-    SimklEpisodeScrobbleUpdate update, {
-    required String accessToken,
-    required String clientId,
-  }) async {
-    final key = update.seriesKey;
-    final profile = _state.profile;
-    if (key.isEmpty ||
-        profile.watchlistSeries.contains(key) ||
-        profile.watchingSeries.contains(key) ||
-        profile.abandonedSeries.contains(key) ||
-        profile.completedSeries.contains(key) ||
-        profile.simklMappings.containsKey(key)) {
-      return;
-    }
-    final watched = _watchedEpisodesForSeriesKey(
-      profile,
-      key,
-      _findSeriesByKeyFallback(key),
-    );
-    if (watched > 0) {
-      return;
-    }
-    try {
-      await _simklService.pushLocalAnimeState(
-        accessToken: accessToken,
-        clientId: clientId,
-        updates: [
-          SimklLocalAnimeUpdate(
-            seriesKey: key,
-            title: update.title,
-            simklId: update.simklId,
-            malId: update.malId,
-            tmdbId: update.tmdbId,
-            imdbId: update.imdbId,
-            year: update.year,
-            listStatus: 'watching',
-          ),
-        ],
-      );
-    } catch (error) {
-      debugPrint(
-        'AppControllerSync: SIMKL watching add failed '
-        'series=$key: $error',
-      );
-    }
-  }
-
   Future<void> resetProgress(SeriesItem series) async {
     final progress = {...activePlaylist.progress}..remove(series.stableKey);
     final playlist = activePlaylist.copyWith(progress: progress);
@@ -3539,13 +3594,17 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _syncCompletedEpisodeExternal(EpisodeItem episode) async {
+  Future<void> _syncEpisodeSeriesStateExternal(EpisodeItem episode) async {
     final key = _seriesStateKeyForEpisode(episode);
+    await _syncSeriesStateExternal(key);
+  }
+
+  Future<void> _syncSeriesStateExternal(String key) async {
     if (key.isEmpty) {
       return;
     }
     final malAuth = _state.profile.myAnimeListAuth;
-    if (malAuth.isConnected) {
+    if (malAuth.isConnected && !_isSyncingMyAnimeList) {
       try {
         final updates = _buildMyAnimeListLocalUpdates(
           _state,
@@ -3579,6 +3638,7 @@ class AppController extends ChangeNotifier {
         if (clientId.isEmpty) {
           return;
         }
+        await _persistResolvedSimklClientId(clientId);
         final updates = _buildSimklLocalUpdates(
           _state,
         ).where((update) => update.seriesKey == key).toList();
@@ -3612,6 +3672,18 @@ class AppController extends ChangeNotifier {
     if (skipFillerEpisodes == true || skipMixedEpisodes == true) {
       unawaited(refreshFillerMetadata());
     }
+  }
+
+  Future<void> setOverscanPadding({
+    double? horizontal,
+    double? top,
+  }) async {
+    _state = _state.copyWith(
+      overscanHorizontal: horizontal?.clamp(0, 96).toDouble(),
+      overscanTop: top?.clamp(0, 96).toDouble(),
+    );
+    await _save();
+    notifyListeners();
   }
 
   Future<void> refreshFillerMetadata({bool force = false}) async {
@@ -3733,6 +3805,7 @@ class AppController extends ChangeNotifier {
     _state = _state.copyWith(profile: profile);
     await _save();
     notifyListeners();
+    unawaited(_syncSeriesStateExternal(key));
   }
 
   Future<void> stopWatchingSeries(SeriesItem series) async {
@@ -5050,6 +5123,57 @@ class AppController extends ChangeNotifier {
       completedSeries: nextCompleted,
       currentEntry: episode,
     );
+  }
+
+  UserProfileState _profileWithStartedEpisode(
+    UserProfileState profile,
+    EpisodeItem episode,
+  ) {
+    final key = _seriesStateKeyForEpisode(episode);
+    if (key.isEmpty ||
+        profile.completedSeries.contains(key) ||
+        profile.abandonedSeries.contains(key)) {
+      return profile.copyWith(currentEntry: episode);
+    }
+    final series = findSeriesForEpisode(episode);
+    final matchingKeys = series == null
+        ? <String>{key}
+        : <String>{key, ..._matchingSeriesKeysForState(series)};
+    return profile.copyWith(
+      watchlistSeries: {...profile.watchlistSeries}..removeAll(matchingKeys),
+      watchingSeries: {...profile.watchingSeries}..add(key),
+      currentEntry: episode,
+    );
+  }
+
+  bool _sameSeriesSpaceStatus(
+    UserProfileState before,
+    UserProfileState after,
+    EpisodeItem episode,
+  ) {
+    final key = _seriesStateKeyForEpisode(episode);
+    if (key.isEmpty) {
+      return true;
+    }
+    final series = findSeriesForEpisode(episode);
+    final keys = series == null
+        ? <String>{key}
+        : <String>{key, ..._matchingSeriesKeysForState(series)};
+    return _sameMembership(
+            before.watchlistSeries, after.watchlistSeries, keys) &&
+        _sameMembership(before.watchingSeries, after.watchingSeries, keys) &&
+        _sameMembership(before.abandonedSeries, after.abandonedSeries, keys) &&
+        _sameMembership(before.completedSeries, after.completedSeries, keys);
+  }
+
+  bool _sameMembership(
+      Set<String> before, Set<String> after, Set<String> keys) {
+    for (final key in keys) {
+      if (before.contains(key) != after.contains(key)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   Set<String> _episodePlaybackAliases(EpisodeItem episode) {

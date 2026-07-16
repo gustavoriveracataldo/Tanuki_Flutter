@@ -691,6 +691,7 @@ class RemoteCatalogService {
     required String type,
     required int limit,
     required int page,
+    required bool tvNewOnly,
   }) async {
     final response = await _get(
       Uri.https('myanimelist.net', '/anime/season/$year/$season'),
@@ -700,7 +701,10 @@ class RemoteCatalogService {
         'MyAnimeList season respondio ${response.statusCode}',
       );
     }
-    final candidates = _parseMyAnimeListSeasonPage(response.body)
+    final html = tvNewOnly
+        ? _myAnimeListSeasonSectionHtml(response.body, 'TV (New)')
+        : response.body;
+    final candidates = _parseMyAnimeListSeasonPage(html)
         .where((candidate) =>
             type.isEmpty || _normalizeCatalogType(candidate.format) == type)
         .toList(growable: false);
@@ -711,6 +715,24 @@ class RemoteCatalogService {
       return const [];
     }
     return candidates.skip(start).take(normalizedLimit).toList(growable: false);
+  }
+
+  String _myAnimeListSeasonSectionHtml(String html, String header) {
+    final escapedHeader = RegExp.escape(header);
+    final headerMatch = RegExp(
+      '<div\\s+class="anime-header">\\s*$escapedHeader\\s*</div>',
+      caseSensitive: false,
+    ).firstMatch(html);
+    if (headerMatch == null) {
+      return html;
+    }
+    final start = headerMatch.end;
+    final nextHeader = RegExp(
+      r'<div\s+class="anime-header">',
+      caseSensitive: false,
+    ).firstMatch(html.substring(start));
+    final end = nextHeader == null ? html.length : start + nextHeader.start;
+    return html.substring(start, end);
   }
 
   List<RemoteSearchCandidate> _parseMyAnimeListSeasonPage(String html) {
@@ -1536,6 +1558,7 @@ $airingScheduleFields
     String type = '',
     int limit = 25,
     int page = 1,
+    bool tvNewOnly = false,
   }) async {
     final normalizedSeason = season.trim().toLowerCase();
     if (!{'winter', 'spring', 'summer', 'fall'}.contains(normalizedSeason)) {
@@ -1545,6 +1568,21 @@ $airingScheduleFields
       return const [];
     }
     final normalizedType = _normalizeCatalogType(type);
+    if (tvNewOnly) {
+      final malResults = await _safeProviderSearch(
+        () => _discoverMyAnimeListSeason(
+          season: normalizedSeason,
+          year: year,
+          type: normalizedType.isEmpty ? 'tv' : normalizedType,
+          limit: limit,
+          page: page,
+          tvNewOnly: true,
+        ),
+      );
+      if (malResults.isNotEmpty) {
+        return _dedupe(malResults).take(limit.clamp(1, 50).toInt()).toList();
+      }
+    }
     final providerResults = await Future.wait([
       _safeProviderSearch(
         () => _discoverJikanSeason(
@@ -1562,6 +1600,7 @@ $airingScheduleFields
           type: normalizedType,
           limit: limit,
           page: page,
+          tvNewOnly: false,
         ),
       ),
       _safeProviderSearch(

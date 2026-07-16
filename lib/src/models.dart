@@ -1616,6 +1616,8 @@ class AppState {
     this.showPlaylistUpcomingCards = true,
     this.skipMixedEpisodes = false,
     this.skipFillerEpisodes = false,
+    this.overscanHorizontal = 0,
+    this.overscanTop = 0,
     this.fillerCache = const {},
     this.visualCache = const {},
     this.myAnimeListClientId = '',
@@ -1632,6 +1634,8 @@ class AppState {
   final bool showPlaylistUpcomingCards;
   final bool skipMixedEpisodes;
   final bool skipFillerEpisodes;
+  final double overscanHorizontal;
+  final double overscanTop;
   final Map<String, FillerMetadataRecord> fillerCache;
   final Map<String, CandidateVisualCacheEntry> visualCache;
   final String myAnimeListClientId;
@@ -1676,6 +1680,8 @@ class AppState {
           _readBool(json['showPlaylistUpcomingCards'], fallback: true),
       skipMixedEpisodes: _readBool(json['skipMixedEpisodes']),
       skipFillerEpisodes: _readBool(json['skipFillerEpisodes']),
+      overscanHorizontal: _readDouble(json['overscanHorizontal']),
+      overscanTop: _readDouble(json['overscanTop']),
       fillerCache: _readFillerCache(json['fillerCache']),
       visualCache: _readCandidateVisualCache(json['visualCache']),
       myAnimeListClientId: _readString(json['myAnimeListClientId']),
@@ -1716,6 +1722,8 @@ class AppState {
     bool? showPlaylistUpcomingCards,
     bool? skipMixedEpisodes,
     bool? skipFillerEpisodes,
+    double? overscanHorizontal,
+    double? overscanTop,
     Map<String, FillerMetadataRecord>? fillerCache,
     Map<String, CandidateVisualCacheEntry>? visualCache,
     String? myAnimeListClientId,
@@ -1743,6 +1751,8 @@ class AppState {
           showPlaylistUpcomingCards ?? this.showPlaylistUpcomingCards,
       skipMixedEpisodes: skipMixedEpisodes ?? this.skipMixedEpisodes,
       skipFillerEpisodes: skipFillerEpisodes ?? this.skipFillerEpisodes,
+      overscanHorizontal: overscanHorizontal ?? this.overscanHorizontal,
+      overscanTop: overscanTop ?? this.overscanTop,
       fillerCache: fillerCache ?? this.fillerCache,
       visualCache: visualCache ?? this.visualCache,
       myAnimeListClientId: myAnimeListClientId ?? this.myAnimeListClientId,
@@ -1768,6 +1778,8 @@ class AppState {
       'showPlaylistUpcomingCards': showPlaylistUpcomingCards,
       'skipMixedEpisodes': skipMixedEpisodes,
       'skipFillerEpisodes': skipFillerEpisodes,
+      'overscanHorizontal': overscanHorizontal,
+      'overscanTop': overscanTop,
       'fillerCache': fillerCache.map(
         (key, value) => MapEntry(key, value.toJson()),
       ),
@@ -2029,6 +2041,13 @@ int _readInt(Object? value, {int fallback = 0}) {
     return value.truncate();
   }
   return int.tryParse('$value') ?? fallback;
+}
+
+double _readDouble(Object? value, {double fallback = 0}) {
+  if (value is num) {
+    return value.toDouble();
+  }
+  return double.tryParse('$value') ?? fallback;
 }
 
 bool _readBool(Object? value, {bool fallback = false}) {

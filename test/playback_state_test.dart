@@ -29,6 +29,18 @@ void main() {
     expect(restored.profile.episodePlayback['demo|1']?.completed, isFalse);
   });
 
+  test('serializes overscan padding settings', () {
+    const state = AppState(
+      overscanHorizontal: 32,
+      overscanTop: 20,
+    );
+
+    final restored = AppState.fromJson(state.toJson());
+
+    expect(restored.overscanHorizontal, 32);
+    expect(restored.overscanTop, 20);
+  });
+
   test('serializes series trailer url', () {
     const state = AppState(
       remoteLibrary: [
@@ -438,6 +450,66 @@ void main() {
     );
   });
 
+  test('pushes manual space status changes to MAL and SIMKL', () async {
+    final mal = _FakeMyAnimeListService(remoteEntries: const []);
+    final simkl = _FakeSimklService(remoteEntries: const []);
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        remoteLibrary: [
+          SeriesItem(
+            name: 'Demo',
+            seriesStateKey: 'demo',
+            sourceType: SourceType.remote,
+            episodeCount: 12,
+            catalogId: 321,
+            releaseYear: 2024,
+            episodes: [
+              EpisodeItem(
+                seriesName: 'Demo',
+                seriesStateKey: 'demo',
+                episodeIndex: 0,
+                episodeNumber: 1,
+                displayName: 'Demo - Capitulo 1',
+                relativePath: 'Demo / Capitulo 1',
+                filePath: '',
+                sourceType: SourceType.remote,
+              ),
+            ],
+          ),
+        ],
+        profiles: [
+          UserProfileState(
+            myAnimeListAuth: MyAnimeListAuthState(
+              accessToken: 'mal-access',
+              refreshToken: 'mal-refresh',
+              userId: 42,
+            ),
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(
+      store: store,
+      myAnimeListService: mal,
+      simklService: simkl,
+    );
+    await controller.initialize();
+
+    await controller.setSpaceStatus(
+        store.state.remoteLibrary.single, 'watching');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(store.state.profile.watchingSeries, contains('demo'));
+    expect(mal.pushedUpdates, hasLength(1));
+    expect(mal.pushedUpdates.single.malId, 321);
+    expect(mal.pushedUpdates.single.listStatus, 'watching');
+    expect(simkl.pushedUpdates, hasLength(1));
+    expect(simkl.pushedUpdates.single.malId, 321);
+    expect(simkl.pushedUpdates.single.listStatus, 'watching');
+  });
+
   test('sends SIMKL scrobble payload from current playback', () async {
     final simkl = _FakeSimklService(remoteEntries: const []);
     final store = _MemoryAppStore(
@@ -493,7 +565,59 @@ void main() {
     expect(simkl.scrobbles.single.update.progressPercent, 50);
   });
 
-  test('adds unmapped SIMKL series to watching before scrobbling', () async {
+  test('sends SIMKL now watching start even before duration is known',
+      () async {
+    final simkl = _FakeSimklService(remoteEntries: const []);
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        remoteLibrary: [
+          SeriesItem(
+            name: 'Now Watching Demo',
+            seriesStateKey: 'now-watching-demo',
+            sourceType: SourceType.remote,
+            episodeCount: 12,
+            catalogId: 987,
+            releaseYear: 2026,
+            episodes: [
+              EpisodeItem(
+                seriesName: 'Now Watching Demo',
+                seriesStateKey: 'now-watching-demo',
+                episodeIndex: 0,
+                episodeNumber: 1,
+                displayName: 'Now Watching Demo - Capitulo 1',
+                relativePath: 'Now Watching Demo / Capitulo 1',
+                filePath: '',
+                sourceType: SourceType.remote,
+              ),
+            ],
+          ),
+        ],
+        profiles: [
+          UserProfileState(
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(store: store, simklService: simkl);
+    await controller.initialize();
+
+    final sent = await controller.sendSimklScrobble(
+      store.state.remoteLibrary.single.episodes.single,
+      position: Duration.zero,
+      duration: Duration.zero,
+      action: 'start',
+    );
+
+    expect(sent, isTrue);
+    expect(simkl.scrobbles, hasLength(1));
+    expect(simkl.scrobbles.single.action, 'start');
+    expect(simkl.scrobbles.single.update.progressPercent, 0);
+  });
+
+  test('scrobbles unmapped SIMKL series without pre-pushing list state',
+      () async {
     final simkl = _FakeSimklService(remoteEntries: const []);
     final store = _MemoryAppStore(
       const AppState(
@@ -538,14 +662,63 @@ void main() {
     );
 
     expect(sent, isTrue);
-    expect(simkl.pushedUpdates, hasLength(1));
-    expect(simkl.pushedUpdates.single.title, 'New Demo');
-    expect(simkl.pushedUpdates.single.malId, 987);
-    expect(simkl.pushedUpdates.single.listStatus, 'watching');
-    expect(simkl.pushedUpdates.single.watchedEpisodes, 0);
+    expect(simkl.pushedUpdates, isEmpty);
     expect(simkl.scrobbles, hasLength(1));
     expect(simkl.scrobbles.single.update.malId, 987);
     expect(simkl.scrobbles.single.update.progressPercent, 25);
+  });
+
+  test('scrobbles local watching SIMKL series without a preflight write',
+      () async {
+    final simkl = _FakeSimklService(remoteEntries: const []);
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        remoteLibrary: [
+          SeriesItem(
+            name: 'Local Watching Demo',
+            seriesStateKey: 'local-watching-demo',
+            sourceType: SourceType.remote,
+            episodeCount: 12,
+            catalogId: 987,
+            releaseYear: 2026,
+            episodes: [
+              EpisodeItem(
+                seriesName: 'Local Watching Demo',
+                seriesStateKey: 'local-watching-demo',
+                episodeIndex: 1,
+                episodeNumber: 2,
+                displayName: 'Local Watching Demo - Capitulo 2',
+                relativePath: 'Local Watching Demo / Capitulo 2',
+                filePath: '',
+                sourceType: SourceType.remote,
+              ),
+            ],
+          ),
+        ],
+        profiles: [
+          UserProfileState(
+            watchingSeries: {'local-watching-demo'},
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(store: store, simklService: simkl);
+    await controller.initialize();
+
+    final sent = await controller.sendSimklScrobble(
+      store.state.remoteLibrary.single.episodes.single,
+      position: const Duration(minutes: 8),
+      duration: const Duration(minutes: 24),
+      action: 'start',
+    );
+
+    expect(sent, isTrue);
+    expect(simkl.pushedUpdates, isEmpty);
+    expect(simkl.scrobbles, hasLength(1));
+    expect(simkl.scrobbles.single.update.episodeNumber, 2);
+    expect(simkl.scrobbles.single.update.progressPercent, closeTo(33.33, .01));
   });
 
   test(
@@ -577,6 +750,8 @@ void main() {
       );
 
       expect(controller.activePlaylist.progress['demo'], isNull);
+      expect(controller.state.profile.watchingSeries, contains('demo'));
+      expect(controller.state.profile.watchlistSeries, isNot(contains('demo')));
       expect(
         controller.resumePositionForEpisode(episode),
         const Duration(minutes: 10),
@@ -1568,6 +1743,7 @@ class _FakeRemoteCatalog extends RemoteCatalogService {
     String type = '',
     int limit = 25,
     int page = 1,
+    bool tvNewOnly = false,
   }) async {
     lastSeason = season;
     lastSeasonYear = year;

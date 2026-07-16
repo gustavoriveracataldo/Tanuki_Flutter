@@ -153,6 +153,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   DateTime _lastAndroidExoRebuild = DateTime.fromMillisecondsSinceEpoch(0);
   final Map<String, DateTime> _nativeLogLastPrintedAt = <String, DateTime>{};
   double _lastSimklScrobbleProgress = -1;
+  bool _simklPlaybackPositionReady = false;
+  bool _pendingSimklStartAfterPositionReady = false;
+  bool _simklStartRetryScheduled = false;
+  bool _simklStartDurationRetryUsed = false;
   Timer? _simklPauseDebounceTimer;
   Timer? _remoteVideoFrameWatchdogTimer;
   Timer? _remoteOpeningRecoveryTimer;
@@ -448,6 +452,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _openedNativeYoutubePlayer = false;
     _remotePlaybackAccepted = false;
     _desktopVlcIsPlaying = false;
+    _resetSimklScrobbleSession();
     _desktopVlcAudioFallbackHandled = false;
     _remoteOpeningRecoveryAttempts = 0;
     _playerOverlaysVisible = true;
@@ -635,10 +640,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _lastPosition = startPosition ?? Duration.zero;
         _lastPositionChangeAt = DateTime.now();
       }
+      _markSimklPlaybackPositionReady(
+        playing: player.state.playing,
+        buffering: player.state.buffering,
+      );
       _attachPlaybackErrorFallback(player);
       _attachRemoteVideoFrameWatchdog(player);
       _scheduleRemoteOpeningRecovery(resumePosition ?? startPosition);
-      _startSimklScrobble();
       if (!mounted) {
         return;
       }
@@ -726,12 +734,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _lastPosition = resumePosition ?? Duration.zero;
       _lastDuration = controller.value.duration;
       _lastPositionChangeAt = DateTime.now();
+      _markSimklPlaybackPositionReady(
+        playing: controller.value.isPlaying,
+        buffering: controller.value.isBuffering,
+      );
       await _applyAndroidExoSubtitleTrack();
       _debugPlayerEvent('ExoPlayer play start');
       await controller.play();
       _debugPlayerEvent('ExoPlayer play requested');
       _remotePlaybackAccepted = true;
-      _startSimklScrobble();
       if (!mounted || _androidExoController != controller) {
         return;
       }
@@ -813,6 +824,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _lastPositionChangeAt = DateTime.now();
         _remotePlaybackAccepted = true;
       }
+      _maybeSendDeferredSimklStart();
       _maybeRetryDesktopVlcMissingVideoFrame(player, _lastPosition);
       if (_lastDuration > Duration.zero || _lastPosition > Duration.zero) {
         _setPlayerBuffering(false);
@@ -884,6 +896,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _lastPosition = resumePosition ?? Duration.zero;
     _lastDuration = Duration.zero;
     _lastPositionChangeAt = DateTime.now();
+    _markSimklPlaybackPositionReady(playing: _desktopVlcIsPlaying);
     _debugPlayerEvent(
       'VLC open url=${_debugMediaLabel(path)} '
       'playbackUrl=${_debugMediaLabel(playbackPath)} '
@@ -897,7 +910,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         autoStart: true,
       );
       _scheduleDesktopVlcAudioRecovery(player);
-      _startSimklScrobble();
       if (!mounted || _desktopVlcPlayer != player) {
         return;
       }
@@ -942,8 +954,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
           'VLC audio recovery attempt=$attempt tracks=$trackCount',
         );
         if (trackCount > 0) {
-          player.setAudioTrack(1);
-          _debugPlayerEvent('VLC audio recovery selected track=1');
+          // VLC auto-selects audio. Track ids are not guaranteed to match
+          // positions, so forcing id 1 can silence some servers after reload.
           return;
         }
         if (shouldRetryMissingAudioTrack(
@@ -1075,7 +1087,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _desktopVlcPlayer = null;
     if (player != null) {
       _activeDesktopVlcPlayers.remove(player);
-      if (delayForBiliBili && widget.episode.isRemote) {
+      if (delayForBiliBili &&
+          widget.episode.isRemote &&
+          (wasBiliBili || wasLoopbackProxy)) {
         // libVLC can still be reading a remote stream or local proxy while
         // buffering. Native stop/dispose can block Flutter's UI thread.
         // Stopping or disposing that native player synchronously is what can
@@ -1190,6 +1204,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _lastPosition = startPosition;
     _lastDuration = _youtubeWebDuration;
     _lastPositionChangeAt = DateTime.now();
+    _markSimklPlaybackPositionReady(playing: _youtubeWebPlaying);
     _setPlayerBuffering(true);
     if (mounted) {
       setState(() {
@@ -1215,7 +1230,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     _startYoutubeWebStateTimer();
     _remotePlaybackAccepted = true;
-    _startSimklScrobble();
     _scheduleOpeningUpcomingCards();
     _schedulePlayerOverlayHide();
     return true;
@@ -1321,7 +1335,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _youtubeWebEnded = state == 'ended';
     _lastPosition = _youtubeWebPosition;
     _lastDuration = _youtubeWebDuration;
-    _syncSimklPlaybackState(_youtubeWebPlaying);
+    _syncSimklPlaybackState(
+      _youtubeWebPlaying,
+      buffering: state == 'buffering',
+    );
     if (_youtubeWebPosition != previous) {
       _lastPositionChangeAt = DateTime.now();
     }
@@ -1457,7 +1474,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
     _setPlayerBuffering(value.isBuffering);
-    _syncSimklPlaybackState(value.isPlaying);
     final previous = _lastPosition;
     _lastPosition = value.position;
     _lastDuration = value.duration;
@@ -1466,6 +1482,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _lastPositionChangeAt = DateTime.now();
       _remotePlaybackAccepted = true;
     }
+    _syncSimklPlaybackState(value.isPlaying, buffering: value.isBuffering);
+    _maybeSendDeferredSimklStart();
     _maybeScheduleUpcomingCards(value.position);
     _persistPlaybackThrottled();
 
@@ -1579,11 +1597,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Duration get _effectiveCompletionDuration {
-    final expected = _expectedRemoteDuration;
-    if (expected > _lastDuration) {
-      return expected;
-    }
-    return _lastDuration;
+    return _bestKnownPlaybackDuration;
   }
 
   Duration get _expectedRemoteDuration {
@@ -1591,6 +1605,55 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _currentResolvedStream?.httpHeaders['X-Tanuki-Duration-Seconds'] ?? '';
     final seconds = int.tryParse(raw.trim()) ?? 0;
     return seconds > 0 ? Duration(seconds: seconds) : Duration.zero;
+  }
+
+  Duration get _bestKnownPlaybackDuration {
+    final candidates = <Duration>[
+      _lastDuration,
+      _expectedRemoteDuration,
+      _storedPlaybackDuration,
+      _episodeLabelDuration,
+    ];
+    return candidates.reduce(
+      (best, current) => current > best ? current : best,
+    );
+  }
+
+  Duration get _storedPlaybackDuration {
+    final record = widget.controller.playbackForEpisode(widget.episode);
+    final durationMs = record?.durationMs ?? 0;
+    return durationMs > 0 ? Duration(milliseconds: durationMs) : Duration.zero;
+  }
+
+  Duration get _episodeLabelDuration {
+    final label = widget.episode.durationLabel.trim().toLowerCase();
+    if (label.isEmpty) {
+      return Duration.zero;
+    }
+    var minutes = 0;
+    var seconds = 0;
+    for (final match in RegExp(r'(\d+)\s*(h|hr|hrs|hora|horas|min|m|sec|s)')
+        .allMatches(label)) {
+      final value = int.tryParse(match.group(1) ?? '') ?? 0;
+      final unit = match.group(2) ?? '';
+      if (unit.startsWith('h')) {
+        minutes += value * 60;
+      } else if (unit.startsWith('s')) {
+        seconds += value;
+      } else {
+        minutes += value;
+      }
+    }
+    if (minutes <= 0 && seconds <= 0) {
+      final value =
+          int.tryParse(RegExp(r'\d+').firstMatch(label)?.group(0) ?? '');
+      if (value != null && value > 0) {
+        minutes = value;
+      }
+    }
+    return minutes > 0 || seconds > 0
+        ? Duration(minutes: minutes, seconds: seconds)
+        : Duration.zero;
   }
 
   Future<void> _applyAndroidExoSubtitleTrack() async {
@@ -1872,7 +1935,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _playingSubscription = player.stream.playing.listen((playing) {
       _debugPlayerEvent('playing=$playing ${_debugPlayerState(player)}');
-      _syncSimklPlaybackState(playing);
+      _syncSimklPlaybackState(playing, buffering: _playerBuffering);
       if (playing) {
         _armRemoteVideoFrameWatchdog(player);
       } else {
@@ -2228,6 +2291,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (widget.episode.isRemote && position > Duration.zero) {
         _remotePlaybackAccepted = true;
       }
+      _maybeSendDeferredSimklStart();
       if (widget.episode.isRemote &&
           previous > Duration.zero &&
           position > const Duration(seconds: 3) &&
@@ -2244,6 +2308,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _durationSubscription = player.stream.duration.listen((duration) {
       _lastDuration = duration;
       _maybeRefineRemoteResume(duration);
+      _maybeSendDeferredSimklStart();
       _debugPlayerEvent(
         'duration=${_formatPlaybackTime(duration)} ${_debugPlayerState(player)}',
       );
@@ -2371,9 +2436,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await _stopSimklScrobble();
   }
 
+  void _resetSimklScrobbleSession() {
+    _simklPauseDebounceTimer?.cancel();
+    _simklPauseDebounceTimer = null;
+    _simklScrobbleActive = false;
+    _lastSimklScrobbleProgress = -1;
+    _simklPlaybackPositionReady = false;
+    _pendingSimklStartAfterPositionReady = false;
+    _simklStartRetryScheduled = false;
+    _simklStartDurationRetryUsed = false;
+  }
+
+  void _markSimklPlaybackPositionReady({
+    required bool playing,
+    bool buffering = false,
+  }) {
+    _simklPlaybackPositionReady = true;
+    final shouldStart = _pendingSimklStartAfterPositionReady || playing;
+    _pendingSimklStartAfterPositionReady = false;
+    if (shouldStart) {
+      _syncSimklPlaybackState(true, buffering: buffering);
+    }
+  }
+
   void _startSimklScrobble() {
     if (_simklScrobbleActive) {
-      if (_lastSimklScrobbleProgress < 0 && _lastDuration > Duration.zero) {
+      final progress = _simklProgressPercentForCurrentPosition();
+      if (_lastSimklScrobbleProgress <= 2 && progress > 5) {
         unawaited(_sendSimklScrobble('start', force: true));
       }
       return;
@@ -2383,14 +2472,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(_sendSimklScrobble('start', force: true));
   }
 
-  void _syncSimklPlaybackState(bool playing) {
+  void _syncSimklPlaybackState(bool playing, {bool buffering = false}) {
     _simklPauseDebounceTimer?.cancel();
     _simklPauseDebounceTimer = null;
     if (playing) {
+      if (!_simklPlaybackPositionReady) {
+        _pendingSimklStartAfterPositionReady = true;
+        return;
+      }
       _startSimklScrobble();
       return;
     }
-    if (!_simklScrobbleActive || _completionCommitted) {
+    if (buffering || !_simklScrobbleActive || _completionCommitted) {
       return;
     }
     _simklPauseDebounceTimer = Timer(const Duration(milliseconds: 500), () {
@@ -2399,6 +2492,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
         unawaited(_pauseSimklScrobble());
       }
     });
+  }
+
+  void _maybeSendDeferredSimklStart() {
+    if (!_simklScrobbleActive ||
+        _completionCommitted ||
+        _lastSimklScrobbleProgress >= 0 ||
+        _bestKnownPlaybackDuration <= Duration.zero ||
+        _simklPositionForAction('start') <= Duration.zero) {
+      return;
+    }
+    unawaited(_sendSimklScrobble('start', force: true));
   }
 
   Future<void> _pauseSimklScrobble() async {
@@ -2428,26 +2532,70 @@ class _PlayerScreenState extends State<PlayerScreen> {
     bool force = false,
     bool completed = false,
   }) async {
-    if (_lastDuration <= Duration.zero) {
+    final normalizedAction = action.trim().toLowerCase();
+    var durationForScrobble = _bestKnownPlaybackDuration;
+    var positionForScrobble = completed
+        ? durationForScrobble
+        : _simklPositionForAction(normalizedAction);
+    if (normalizedAction == 'start' &&
+        positionForScrobble > Duration.zero &&
+        durationForScrobble <= Duration.zero) {
+      if (_simklStartDurationRetryUsed || _simklStartRetryScheduled) {
+        return;
+      }
+      _simklStartDurationRetryUsed = true;
+      _simklStartRetryScheduled = true;
+      Timer(const Duration(milliseconds: 1500), () {
+        _simklStartRetryScheduled = false;
+        if (mounted && _simklScrobbleActive && !_completionCommitted) {
+          unawaited(_sendSimklScrobble('start', force: true));
+        }
+      });
       return;
     }
     final progress = completed
         ? 100.0
-        : (_lastPosition.inMilliseconds / _lastDuration.inMilliseconds * 100)
-            .clamp(0, 100)
-            .toDouble();
+        : durationForScrobble > Duration.zero
+            ? (positionForScrobble.inMilliseconds /
+                    durationForScrobble.inMilliseconds *
+                    100)
+                .clamp(0, 100)
+                .toDouble()
+            : 0.0;
     if (!force && (progress - _lastSimklScrobbleProgress).abs() < 1) {
       return;
     }
     final sent = await widget.controller.sendSimklScrobble(
       widget.episode,
-      position: completed ? _lastDuration : _lastPosition,
-      duration: _lastDuration,
-      action: action,
+      position: positionForScrobble,
+      duration: durationForScrobble,
+      action: normalizedAction,
     );
     if (sent) {
       _lastSimklScrobbleProgress = progress;
     }
+  }
+
+  double _simklProgressPercentForCurrentPosition() {
+    final durationForScrobble = _bestKnownPlaybackDuration;
+    if (durationForScrobble <= Duration.zero) {
+      return 0;
+    }
+    return (_simklPositionForAction('start').inMilliseconds /
+            durationForScrobble.inMilliseconds *
+            100)
+        .clamp(0, 100)
+        .toDouble();
+  }
+
+  Duration _simklPositionForAction(String action) {
+    if (action == 'start') {
+      final resume = widget.controller.resumePositionForEpisode(widget.episode);
+      if (resume != null && resume > _lastPosition) {
+        return resume;
+      }
+    }
+    return _lastPosition;
   }
 
   bool _meetsPlaybackCompletionThreshold(
@@ -3402,31 +3550,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _configurePlatformPlayback(Player player) async {
     final platform = player.platform;
     if (platform is! NativePlayer) {
-      return;
-    }
-    if ((Platform.isLinux || Platform.isWindows) && widget.episode.isRemote) {
-      // HLS AV1 seeks should jump to the nearest keyframe. Precise seeks make
-      // mpv decode the whole GOP and can appear frozen on software decoders.
-      await platform.setProperty('cache', 'yes');
-      await platform.setProperty('cache-on-disk', 'no');
-      await platform.setProperty('cache-pause', 'yes');
-      await platform.setProperty('cache-pause-initial', 'no');
-      await platform.setProperty('demuxer-readahead-secs', '20');
-      if (_shouldWatchAnimeAv1VideoFrame()) {
-        await platform.setProperty('hwdec', 'no');
-        await platform.setProperty('vd', 'lavc:libdav1d');
-        await platform.setProperty('hr-seek', 'yes');
-        await platform.setProperty('hr-seek-framedrop', 'yes');
-        await platform.setProperty('hr-seek-demuxer-offset', '20');
-      } else {
-        await platform.setProperty('hwdec', 'auto-safe');
-        await platform.setProperty('vd', 'lavc');
-        await platform.setProperty('hr-seek', 'no');
-      }
-      _debugPlayerEvent(
-        'desktop HLS fast seek configured '
-        'decoder=${_shouldWatchAnimeAv1VideoFrame() ? 'libdav1d' : 'auto'}',
-      );
       return;
     }
     if (!Platform.isAndroid) {
@@ -4602,26 +4725,59 @@ class _PlayerScreenState extends State<PlayerScreen> {
         }
         return;
       }
+      final nextEpisode = await _prepareEpisodeForPlayback(entries.first);
+      if (!mounted) {
+        return;
+      }
       await Navigator.of(context).pushReplacement(
         MaterialPageRoute(
           builder: (_) => PlayerScreen(
             controller: widget.controller,
-            episode: entries.first,
+            episode: nextEpisode,
             launchMode: widget.launchMode,
           ),
         ),
       );
       return;
     }
+    final nextEpisode = await _prepareEpisodeForPlayback(replacement);
+    if (!mounted) {
+      return;
+    }
     await Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (_) => PlayerScreen(
           controller: widget.controller,
-          episode: replacement,
+          episode: nextEpisode,
           launchMode: widget.launchMode,
         ),
       ),
     );
+  }
+
+  Future<EpisodeItem> _prepareEpisodeForPlayback(EpisodeItem episode) async {
+    final series = widget.controller.findSeriesForEpisode(episode);
+    if (series == null) {
+      return episode;
+    }
+    final refreshed =
+        await widget.controller.refreshRemoteSeriesVisuals(series);
+    return _matchingEpisodeInSeries(refreshed, episode);
+  }
+
+  EpisodeItem _matchingEpisodeInSeries(SeriesItem series, EpisodeItem episode) {
+    for (final candidate in series.episodes) {
+      if (episode.episodeNumber > 0 &&
+          candidate.episodeNumber == episode.episodeNumber) {
+        return candidate;
+      }
+    }
+    for (final candidate in series.episodes) {
+      if (candidate.episodeIndex == episode.episodeIndex) {
+        return candidate;
+      }
+    }
+    return episode;
   }
 
   EpisodeItem? _adjacentEpisode(int offset) {

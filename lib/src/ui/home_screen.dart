@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' as io;
 
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -7,6 +8,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../app_controller.dart';
 import '../models.dart';
+import '../services/image_disk_cache.dart';
 import '../services/my_anime_list_service.dart';
 import 'player_screen.dart';
 import 'toonami_theme.dart';
@@ -67,6 +69,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String _detailSimilarStatus = '';
   bool _profilePickerVisible = false;
   bool _handlingTrailerDetailRequest = false;
+  final Set<String> _continueWatchingVisualHydrationKeys = {};
 
   @override
   void initState() {
@@ -111,77 +114,89 @@ class _HomeScreenState extends State<HomeScreen> {
           animation: widget.controller,
           builder: (context, _) {
             final heroSeries = _resolveHeroSeries(widget.controller);
+            _scheduleContinueWatchingVisualHydration(widget.controller);
+            final overscanHorizontal =
+                widget.controller.state.overscanHorizontal;
+            final overscanTop = widget.controller.state.overscanTop;
             return Scaffold(
-              body: LayoutBuilder(
-                builder: (context, constraints) {
-                  final compactNavigation = constraints.maxWidth < 720 ||
-                      constraints.maxHeight > constraints.maxWidth;
-                  return Stack(
-                    children: [
-                      Positioned.fill(
-                        child: _HeroBackground(series: heroSeries),
-                      ),
-                      if (compactNavigation) ...[
+              backgroundColor: Colors.black,
+              body: Padding(
+                padding: EdgeInsets.only(
+                  left: overscanHorizontal,
+                  right: overscanHorizontal,
+                  top: overscanTop,
+                ),
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final compactNavigation = constraints.maxWidth < 720 ||
+                        constraints.maxHeight > constraints.maxWidth;
+                    return Stack(
+                      children: [
                         Positioned.fill(
-                          bottom: 64,
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(12, 14, 12, 0),
-                            child: _buildPanel(widget.controller),
-                          ),
+                          child: _HeroBackground(series: heroSeries),
                         ),
-                        Positioned(
-                          left: 0,
-                          right: 0,
-                          bottom: 0,
-                          child: _BottomRail(
-                            activeSection: _section,
-                            profile: widget.controller.state.profile,
-                            onSectionSelected: _selectSection,
-                            onProfilePressed: _showProfilePicker,
+                        if (compactNavigation) ...[
+                          Positioned.fill(
+                            bottom: 64,
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(12, 14, 12, 0),
+                              child: _buildPanel(widget.controller),
+                            ),
                           ),
-                        ),
-                      ] else ...[
-                        Positioned.fill(
-                          left: 54,
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(0, 14, 14, 14),
-                            child: _buildPanel(widget.controller),
+                          Positioned(
+                            left: 0,
+                            right: 0,
+                            bottom: 0,
+                            child: _BottomRail(
+                              activeSection: _section,
+                              profile: widget.controller.state.profile,
+                              onSectionSelected: _selectSection,
+                              onProfilePressed: _showProfilePicker,
+                            ),
                           ),
-                        ),
-                        Positioned(
-                          left: 0,
-                          top: 0,
-                          bottom: 0,
-                          child: _SideRail(
-                            activeSection: _section,
-                            profile: widget.controller.state.profile,
-                            onSectionSelected: _selectSection,
-                            onProfilePressed: _showProfilePicker,
+                        ] else ...[
+                          Positioned.fill(
+                            left: 54,
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(0, 14, 14, 14),
+                              child: _buildPanel(widget.controller),
+                            ),
                           ),
-                        ),
+                          Positioned(
+                            left: 0,
+                            top: 0,
+                            bottom: 0,
+                            child: _SideRail(
+                              activeSection: _section,
+                              profile: widget.controller.state.profile,
+                              onSectionSelected: _selectSection,
+                              onProfilePressed: _showProfilePicker,
+                            ),
+                          ),
+                        ],
+                        if (widget.controller.isSaving)
+                          const Positioned(
+                            right: 18,
+                            top: 18,
+                            child: _SavingPill(),
+                          ),
+                        if (_profilePickerVisible)
+                          Positioned.fill(
+                            child: _ProfilePickerOverlay(
+                              controller: widget.controller,
+                              onClose: _hideProfilePicker,
+                              onSelectProfile: _selectProfile,
+                              onCreateProfile: _createProfile,
+                              onRenameProfile: _renameProfile,
+                              onChangeProfileAvatar: _changeProfileAvatar,
+                              onSetDefaultProfile: _setDefaultProfile,
+                              onDeleteProfile: _deleteProfile,
+                            ),
+                          ),
                       ],
-                      if (widget.controller.isSaving)
-                        const Positioned(
-                          right: 18,
-                          top: 18,
-                          child: _SavingPill(),
-                        ),
-                      if (_profilePickerVisible)
-                        Positioned.fill(
-                          child: _ProfilePickerOverlay(
-                            controller: widget.controller,
-                            onClose: _hideProfilePicker,
-                            onSelectProfile: _selectProfile,
-                            onCreateProfile: _createProfile,
-                            onRenameProfile: _renameProfile,
-                            onChangeProfileAvatar: _changeProfileAvatar,
-                            onSetDefaultProfile: _setDefaultProfile,
-                            onDeleteProfile: _deleteProfile,
-                          ),
-                        ),
-                    ],
-                  );
-                },
+                    );
+                  },
+                ),
               ),
             );
           },
@@ -466,6 +481,25 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _scheduleContinueWatchingVisualHydration(AppController controller) {
+    final entries = _continueWatchingEntries(controller);
+    for (final entry in entries) {
+      final series = entry.series;
+      if (series == null ||
+          !_continueWatchingEntryNeedsVisualHydration(entry) ||
+          !_continueWatchingVisualHydrationKeys.add(series.stableKey)) {
+        continue;
+      }
+      unawaited(() async {
+        try {
+          await controller.refreshRemoteSeriesVisuals(series);
+        } finally {
+          _continueWatchingVisualHydrationKeys.remove(series.stableKey);
+        }
+      }());
+    }
+  }
+
   void _clearSelectedSeries() {
     final returnSection = _detailReturnSection;
     setState(() {
@@ -707,7 +741,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     try {
       final results = await widget.controller.loadHomeSeasonCandidates(
-        pages: 2,
+        pages: 3,
       );
       if (!mounted) {
         return;
@@ -715,7 +749,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         // La consulta ya corresponde a la temporada actual. Las fechas de
         // emision se ocultan en esta fila, pero no eliminan sus tarjetas.
-        _homeTrendingResults = results.take(18).toList(growable: false);
+        _homeTrendingResults = results;
         _homeTrendingLoading = false;
       });
       unawaited(_refreshHomeTrendingVisuals(_homeTrendingResults));
@@ -2386,6 +2420,7 @@ class _HeroBackground extends StatelessWidget {
             _FadeInNetworkImage(
               imageUrl: imageUrl,
               fit: BoxFit.cover,
+              cacheWidth: 1600,
               errorBuilder: (_, __, ___) => const SizedBox.shrink(),
             )
           else
@@ -2488,7 +2523,14 @@ List<SeriesItem> _buildHeroRecommendationQueue(
     );
   }
 
-  // 1. Continuar viendo.
+  // 1. Quiero ver.
+  for (final series in library) {
+    if (_seriesMatchesAnyKey(series, profile.watchlistSeries)) {
+      addSeries(series, priority: 900, bonus: _seriesVisualScore(series));
+    }
+  }
+
+  // 2. Continuar viendo.
   for (final entry in _continueWatchingEntries(controller)) {
     addSeries(
       entry.series ?? controller.findSeriesForEpisode(entry.episode),
@@ -2497,7 +2539,7 @@ List<SeriesItem> _buildHeroRecommendationQueue(
     );
   }
 
-  // 2. Playlist activa.
+  // 3. Playlist activa.
   for (final episode in controller.buildNextEntries(limit: 6)) {
     addSeries(
       controller.findSeriesForEpisode(episode),
@@ -2506,14 +2548,14 @@ List<SeriesItem> _buildHeroRecommendationQueue(
     );
   }
 
-  // 3. Favoritos con capitulos pendientes.
+  // 4. Favoritos con capitulos pendientes.
   for (final series in library) {
     if (_seriesMatchesAnyKey(series, profile.favoriteSeries)) {
       addSeries(series, priority: 600, bonus: _seriesVisualScore(series));
     }
   }
 
-  // 4. Similar a lo visto recientemente.
+  // 5. Similar a lo visto recientemente.
   final recent = currentSeries ??
       _findSeriesByKey(library, profile.activePlaylist.lastPlayedSeriesName);
   if (recent != null) {
@@ -2531,12 +2573,12 @@ List<SeriesItem> _buildHeroRecommendationQueue(
     }
   }
 
-  // 5. Temporada actual.
+  // 6. Temporada actual.
   for (final candidate in trendingCandidates) {
     addCandidate(candidate, priority: 400);
   }
 
-  // 6. MAL/SIMKL watching o plan to watch sin progreso local claro.
+  // 7. MAL/SIMKL watching o plan to watch sin progreso local claro.
   final syncedKeys = {
     ...profile.myAnimeListMappings.keys,
     ...profile.simklMappings.keys,
@@ -2556,7 +2598,7 @@ List<SeriesItem> _buildHeroRecommendationQueue(
     }
   }
 
-  // 7. Peliculas como fallback.
+  // 8. Peliculas como fallback.
   for (final candidate in movieCandidates) {
     addCandidate(candidate, priority: 200);
   }
@@ -2564,7 +2606,7 @@ List<SeriesItem> _buildHeroRecommendationQueue(
     addSeries(series, priority: 190, bonus: _seriesVisualScore(series));
   }
 
-  // 8. Random controlado desde biblioteca, evitando completadas y sin visuales
+  // 9. Random controlado desde biblioteca, evitando completadas y sin visuales
   // cuando hay alternativas mejores.
   final bucket = DateTime.now().millisecondsSinceEpoch ~/
       const Duration(hours: 6).inMilliseconds;
@@ -3191,10 +3233,101 @@ class _HorizontalFocusShelf extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return FocusTraversalGroup(
-      policy: WidgetOrderTraversalPolicy(),
-      child: child,
+    return _HorizontalFocusShelfScope(
+      child: FocusTraversalGroup(
+        policy: WidgetOrderTraversalPolicy(),
+        child: child,
+      ),
     );
+  }
+}
+
+class _HorizontalFocusShelfScope extends StatefulWidget {
+  const _HorizontalFocusShelfScope({required this.child});
+
+  final Widget child;
+
+  static _HorizontalFocusShelfController? maybeOf(BuildContext context) {
+    return context
+        .dependOnInheritedWidgetOfExactType<_HorizontalFocusShelfBinding>()
+        ?.controller;
+  }
+
+  @override
+  State<_HorizontalFocusShelfScope> createState() =>
+      _HorizontalFocusShelfScopeState();
+}
+
+class _HorizontalFocusShelfScopeState
+    extends State<_HorizontalFocusShelfScope> {
+  late final _HorizontalFocusShelfController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = _HorizontalFocusShelfController();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _HorizontalFocusShelfBinding(
+      controller: _controller,
+      child: widget.child,
+    );
+  }
+}
+
+class _HorizontalFocusShelfBinding extends InheritedWidget {
+  const _HorizontalFocusShelfBinding({
+    required this.controller,
+    required super.child,
+  });
+
+  final _HorizontalFocusShelfController controller;
+
+  @override
+  bool updateShouldNotify(_HorizontalFocusShelfBinding oldWidget) {
+    return controller != oldWidget.controller;
+  }
+}
+
+class _HorizontalFocusShelfController {
+  final List<FocusNode> _nodes = [];
+
+  void register(FocusNode node) {
+    if (!_nodes.contains(node)) {
+      _nodes.add(node);
+    }
+  }
+
+  void unregister(FocusNode node) {
+    _nodes.remove(node);
+  }
+
+  bool moveFrom(FocusNode node, {required bool forward}) {
+    final focusedIndex = _nodes.indexOf(node);
+    if (focusedIndex < 0) {
+      return false;
+    }
+    final targetIndex = focusedIndex + (forward ? 1 : -1);
+    if (targetIndex < 0 || targetIndex >= _nodes.length) {
+      return true;
+    }
+    final target = _nodes[targetIndex];
+    if (target.canRequestFocus) {
+      target.requestFocus();
+    }
+    return true;
+  }
+
+  void dispose() {
+    _nodes.clear();
   }
 }
 
@@ -3260,6 +3393,7 @@ class _HeroBlock extends StatelessWidget {
                           imageUrl: series!.logoUrl,
                           fit: BoxFit.contain,
                           alignment: Alignment.centerLeft,
+                          cacheWidth: 720,
                           errorBuilder: (_, __, ___) =>
                               _HeroTitleFallback(title: title),
                         ),
@@ -3743,6 +3877,7 @@ class _SeriesDetailInfo extends StatelessWidget {
                 imageUrl: series.logoUrl,
                 fit: BoxFit.contain,
                 alignment: Alignment.centerLeft,
+                cacheWidth: 640,
                 errorBuilder: (_, __, ___) => const SizedBox.shrink(),
               ),
             ),
@@ -4598,7 +4733,7 @@ class _TrendingPosterShelf extends StatelessWidget {
   Widget build(BuildContext context) {
     final posterHeight = _homeShelfPosterHeight(context);
     final posterWidth = posterHeight * 0.7;
-    final visibleCandidates = candidates.take(14).toList(growable: false);
+    final visibleCandidates = candidates;
     void focusCandidate(RemoteSearchCandidate candidate) {
       _ensureFocusedShelfVisible(context);
       onCandidateFocused(candidate);
@@ -5063,6 +5198,7 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
             _FadeInNetworkImage(
               imageUrl: entry.imageUrl,
               fit: BoxFit.cover,
+              cacheWidth: 640,
               errorBuilder: (_, __, ___) => _Poster(
                 imageUrl: entry.series?.imageUrl ?? '',
                 title: entry.seriesName,
@@ -6336,7 +6472,7 @@ class _SettingsPanel extends StatelessWidget {
                 data: controller
                     .myAnimeListPendingAuthorization!.authorizationUrl,
                 helper: controller.isMyAnimeListPairingBridgeActive
-                    ? 'Mantén ambos dispositivos en la misma red. Al aceptar, Tanuki móvil enviará la autorización automáticamente.'
+                    ? 'Mantén ambos dispositivos en la misma red. El QR automático requiere Tanuki en el celular; si solo usas el navegador, copia y pega la URL de retorno.'
                     : 'No pude abrir el puente local. Al terminar, pega en Tanuki la URL de retorno mostrada en el celular.',
               ),
             _SettingsStatusText(_myAnimeListSettingsStatus(controller)),
@@ -6418,6 +6554,20 @@ class _SettingsPanel extends StatelessWidget {
                   : 'Sincronizar cuentas conectadas'),
             ),
             const _SettingsSectionTitle('Reproduccion'),
+            const _SettingsSectionTitle('Overscan CRT'),
+            _SettingsSlider(
+              value: controller.state.overscanHorizontal,
+              label: 'Bordes laterales',
+              max: 96,
+              onChanged: (value) =>
+                  controller.setOverscanPadding(horizontal: value),
+            ),
+            _SettingsSlider(
+              value: controller.state.overscanTop,
+              label: 'Borde superior',
+              max: 96,
+              onChanged: (value) => controller.setOverscanPadding(top: value),
+            ),
             const _SettingsSectionTitle('Tarjetas Luego y Mas tarde'),
             _SettingsCheckBox(
               value: controller.state.showSeriesUpcomingCards,
@@ -6694,6 +6844,63 @@ class _SettingsCheckBox extends StatelessWidget {
   }
 }
 
+class _SettingsSlider extends StatelessWidget {
+  const _SettingsSlider({
+    required this.value,
+    required this.label,
+    required this.max,
+    required this.onChanged,
+  });
+
+  final double value;
+  final String label;
+  final double max;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 460,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 128,
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Color(0xFFD8E1EB),
+                fontSize: 14,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Slider(
+              value: value.clamp(0, max).toDouble(),
+              min: 0,
+              max: max,
+              divisions: 24,
+              activeColor: TanukiColors.orange,
+              inactiveColor: const Color(0xFF334250),
+              onChanged: onChanged,
+            ),
+          ),
+          SizedBox(
+            width: 44,
+            child: Text(
+              value.round().toString(),
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                color: TanukiColors.muted,
+                fontSize: 13,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _SettingsStatusText extends StatelessWidget {
   const _SettingsStatusText(this.text);
 
@@ -6806,8 +7013,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
       _ContinueWatchingEntry(
         series: series,
         seriesName: series.name,
-        imageUrl:
-            episode.imageUrl.isNotEmpty ? episode.imageUrl : series.imageUrl,
+        imageUrl: _continueWatchingImageUrl(series, episode),
         episode: episode,
         episodeCount: total,
         watchedCount: watched,
@@ -6833,7 +7039,10 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
       _ContinueWatchingEntry(
         series: controller.findSeriesForEpisode(current),
         seriesName: current.seriesName,
-        imageUrl: current.imageUrl,
+        imageUrl: _continueWatchingImageUrl(
+          controller.findSeriesForEpisode(current),
+          current,
+        ),
         episode: current,
         episodeCount: 0,
         watchedCount: 0,
@@ -6975,7 +7184,7 @@ EpisodeItem? _continueWatchingEpisodeForSeries(
   required int watched,
 }) {
   if (currentForSeries) {
-    return current;
+    return current == null ? null : _matchingEpisodeInSeries(series, current);
   }
   if (partialEpisode != null) {
     return partialEpisode;
@@ -6990,6 +7199,51 @@ EpisodeItem? _continueWatchingEpisodeForSeries(
     return episodes[watched];
   }
   return controller.firstPlayableEpisode(series);
+}
+
+EpisodeItem _matchingEpisodeInSeries(SeriesItem series, EpisodeItem episode) {
+  for (final candidate in series.episodes) {
+    if (episode.episodeNumber > 0 &&
+        candidate.episodeNumber == episode.episodeNumber) {
+      return candidate;
+    }
+  }
+  for (final candidate in series.episodes) {
+    if (candidate.episodeIndex == episode.episodeIndex) {
+      return candidate;
+    }
+  }
+  return episode;
+}
+
+String _continueWatchingImageUrl(
+  SeriesItem? series,
+  EpisodeItem episode,
+) {
+  final freshEpisode =
+      series == null ? episode : _matchingEpisodeInSeries(series, episode);
+  final episodeImage = freshEpisode.imageUrl.trim();
+  if (episodeImage.isNotEmpty) {
+    return episodeImage;
+  }
+  final seriesImage = series?.imageUrl.trim() ?? '';
+  return seriesImage.isNotEmpty ? seriesImage : episode.imageUrl.trim();
+}
+
+bool _continueWatchingEntryNeedsVisualHydration(
+  _ContinueWatchingEntry entry,
+) {
+  final series = entry.series;
+  if (series == null || !series.isRemote) {
+    return false;
+  }
+  if (series.imageUrl.isEmpty ||
+      series.backgroundUrl.isEmpty ||
+      series.logoUrl.isEmpty ||
+      series.description.isEmpty) {
+    return true;
+  }
+  return _matchingEpisodeInSeries(series, entry.episode).imageUrl.isEmpty;
 }
 
 double _playbackProgress(EpisodePlaybackRecord? playback) {
@@ -7715,6 +7969,7 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   bool _focused = false;
   bool _hovered = false;
   final FocusNode _focusNode = FocusNode();
+  _HorizontalFocusShelfController? _horizontalShelf;
   Timer? _remoteLongPressTimer;
   bool _remoteLongPressTriggered = false;
   bool _remoteKeyDown = false;
@@ -7722,8 +7977,21 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   bool get _active => _focused || _hovered;
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final nextShelf = _HorizontalFocusShelfScope.maybeOf(context);
+    if (nextShelf == _horizontalShelf) {
+      return;
+    }
+    _horizontalShelf?.unregister(_focusNode);
+    _horizontalShelf = nextShelf;
+    _horizontalShelf?.register(_focusNode);
+  }
+
+  @override
   void dispose() {
     _remoteLongPressTimer?.cancel();
+    _horizontalShelf?.unregister(_focusNode);
     _focusNode.dispose();
     super.dispose();
   }
@@ -7733,6 +8001,18 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
         event is! KeyRepeatEvent &&
         event is! KeyUpEvent) {
       return KeyEventResult.ignored;
+    }
+
+    if (event is KeyDownEvent || event is KeyRepeatEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
+          event.logicalKey == LogicalKeyboardKey.arrowRight) {
+        final handled = _horizontalShelf?.moveFrom(
+              _focusNode,
+              forward: event.logicalKey == LogicalKeyboardKey.arrowRight,
+            ) ??
+            false;
+        return handled ? KeyEventResult.handled : KeyEventResult.ignored;
+      }
     }
 
     if (!_isRemoteActivateKey(event.logicalKey)) {
@@ -8034,6 +8314,7 @@ class _Poster extends StatelessWidget {
             : _FadeInNetworkImage(
                 imageUrl: imageUrl,
                 fit: BoxFit.cover,
+                cacheWidth: 420,
                 errorBuilder: (_, __, ___) => _PosterFallback(title: title),
               ),
       ),
@@ -8047,12 +8328,14 @@ class _FadeInNetworkImage extends StatefulWidget {
     this.fit,
     this.alignment = Alignment.center,
     this.errorBuilder,
+    this.cacheWidth,
   });
 
   final String imageUrl;
   final BoxFit? fit;
   final AlignmentGeometry alignment;
   final ImageErrorWidgetBuilder? errorBuilder;
+  final int? cacheWidth;
 
   @override
   State<_FadeInNetworkImage> createState() => _FadeInNetworkImageState();
@@ -8060,61 +8343,55 @@ class _FadeInNetworkImage extends StatefulWidget {
 
 class _FadeInNetworkImageState extends State<_FadeInNetworkImage> {
   late String _displayedImageUrl;
-  ImageStream? _pendingStream;
-  ImageStreamListener? _pendingListener;
+  io.File? _displayedFile;
+  int _cacheRequestId = 0;
+  bool _cacheLookupComplete = false;
 
   @override
   void initState() {
     super.initState();
     _displayedImageUrl = widget.imageUrl;
+    _loadCachedImage(widget.imageUrl, showWhenReady: true);
   }
 
   @override
   void didUpdateWidget(covariant _FadeInNetworkImage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.imageUrl != oldWidget.imageUrl) {
-      _preloadReplacement(widget.imageUrl);
+      setState(() {
+        _displayedImageUrl = widget.imageUrl;
+        _displayedFile = null;
+        _cacheLookupComplete = false;
+      });
+      _loadCachedImage(widget.imageUrl, showWhenReady: true);
     }
   }
 
-  void _preloadReplacement(String imageUrl) {
-    final previousStream = _pendingStream;
-    final previousListener = _pendingListener;
-    if (previousStream != null && previousListener != null) {
-      previousStream.removeListener(previousListener);
+  void _loadCachedImage(String imageUrl, {required bool showWhenReady}) {
+    final requestId = ++_cacheRequestId;
+    _cacheLookupComplete = false;
+    unawaited(ImageDiskCache.instance.getFile(imageUrl).then((file) {
+      if (!mounted ||
+          requestId != _cacheRequestId ||
+          widget.imageUrl != imageUrl) {
+        return;
+      }
+      setState(() {
+        _displayedImageUrl = imageUrl;
+        _cacheLookupComplete = true;
+        _displayedFile = file;
+      });
+    }).catchError((_) {
+      if (!mounted ||
+          requestId != _cacheRequestId ||
+          widget.imageUrl != imageUrl) {
+        return;
+      }
+      setState(() => _cacheLookupComplete = true);
+    }));
+    if (showWhenReady) {
+      _displayedFile = null;
     }
-    _pendingStream = null;
-    _pendingListener = null;
-    if (imageUrl == _displayedImageUrl) return;
-    final stream = NetworkImage(imageUrl).resolve(
-      createLocalImageConfiguration(context),
-    );
-    late final ImageStreamListener listener;
-    void showReplacement() {
-      stream.removeListener(listener);
-      if (!mounted || widget.imageUrl != imageUrl) return;
-      setState(() => _displayedImageUrl = imageUrl);
-      _pendingStream = null;
-      _pendingListener = null;
-    }
-
-    listener = ImageStreamListener(
-      (_, __) => showReplacement(),
-      onError: (_, __) => showReplacement(),
-    );
-    _pendingStream = stream;
-    _pendingListener = listener;
-    stream.addListener(listener);
-  }
-
-  @override
-  void dispose() {
-    final stream = _pendingStream;
-    final listener = _pendingListener;
-    if (stream != null && listener != null) {
-      stream.removeListener(listener);
-    }
-    super.dispose();
   }
 
   @override
@@ -8130,22 +8407,49 @@ class _FadeInNetworkImageState extends State<_FadeInNetworkImage> {
         fit: StackFit.expand,
         children: [...previousChildren, if (currentChild != null) currentChild],
       ),
-      child: Image.network(
-        _displayedImageUrl,
-        key: ValueKey(_displayedImageUrl),
+      child: _imageForCurrentSource(),
+    );
+  }
+
+  Widget _imageForCurrentSource() {
+    final file = _displayedFile;
+    if (file != null) {
+      return Image.file(
+        file,
+        key: ValueKey('file:${file.path}'),
         fit: widget.fit,
         alignment: widget.alignment,
+        cacheWidth: widget.cacheWidth,
         errorBuilder: widget.errorBuilder,
-        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-          if (wasSynchronouslyLoaded) return child;
-          return AnimatedOpacity(
-            opacity: frame == null ? 0 : 1,
-            duration: const Duration(milliseconds: 220),
-            curve: Curves.easeOutCubic,
-            child: child,
-          );
-        },
-      ),
+        frameBuilder: _fadeFrame,
+      );
+    }
+    if (!_cacheLookupComplete) {
+      return SizedBox.expand(key: ValueKey('loading:$_displayedImageUrl'));
+    }
+    return Image.network(
+      _displayedImageUrl,
+      key: ValueKey('network:$_displayedImageUrl'),
+      fit: widget.fit,
+      alignment: widget.alignment,
+      cacheWidth: widget.cacheWidth,
+      errorBuilder: widget.errorBuilder,
+      frameBuilder: _fadeFrame,
+    );
+  }
+
+  Widget _fadeFrame(
+    BuildContext context,
+    Widget child,
+    int? frame,
+    bool wasSynchronouslyLoaded,
+  ) {
+    if (wasSynchronouslyLoaded) return child;
+    return AnimatedOpacity(
+      opacity: frame == null ? 0 : 1,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      child: child,
     );
   }
 }

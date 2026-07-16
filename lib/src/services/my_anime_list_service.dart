@@ -31,6 +31,7 @@ class MyAnimeListService {
   static const _userAgent = 'TanukiFlutter/1.0';
   static const _authRefreshLeewayMs = 60000;
   static const _maxSearchQueryLength = 64;
+  static const _requestTimeout = Duration(seconds: 20);
 
   final http.Client _client;
   final String _defaultClientId;
@@ -283,10 +284,12 @@ class MyAnimeListService {
     );
 
     while (nextUri != null) {
-      final response = await _client.get(
-        nextUri,
-        headers: _headers(accessToken: accessToken),
-      );
+      final response = await _client
+          .get(
+            nextUri,
+            headers: _headers(accessToken: accessToken),
+          )
+          .timeout(_requestTimeout);
       final json = _expectJsonObject(response);
       for (final item in _readList(json['data'])) {
         if (item is! Map) {
@@ -349,7 +352,7 @@ class MyAnimeListService {
         if (clientSecret.trim().isNotEmpty)
           'client_secret': clientSecret.trim(),
       },
-    );
+    ).timeout(_requestTimeout);
     final json = _expectJsonObject(response);
     return _OAuthToken(
       accessToken: _readString(json['access_token']),
@@ -377,7 +380,7 @@ class MyAnimeListService {
         if (clientSecret.trim().isNotEmpty)
           'client_secret': clientSecret.trim(),
       },
-    );
+    ).timeout(_requestTimeout);
     final json = _expectJsonObject(response);
     return _OAuthToken(
       accessToken: _readString(json['access_token']),
@@ -398,17 +401,20 @@ class MyAnimeListService {
     MyAnimeListRemoteAnimeEntry? bestEntry;
     var bestScore = -1 << 31;
     for (final query in _searchQueries(update)) {
-      final response = await _client.get(
-        _apiUri(
-          '/anime',
-          query: {
-            'q': query,
-            'limit': '12',
-            'fields': 'alternative_titles,start_date,media_type,num_episodes',
-          },
-        ),
-        headers: _headers(accessToken: accessToken),
-      );
+      final response = await _client
+          .get(
+            _apiUri(
+              '/anime',
+              query: {
+                'q': query,
+                'limit': '12',
+                'fields':
+                    'alternative_titles,start_date,media_type,num_episodes',
+              },
+            ),
+            headers: _headers(accessToken: accessToken),
+          )
+          .timeout(_requestTimeout);
       if (!_isOk(response)) {
         if (_isInvalidSearchQuery(response.body)) {
           continue;
@@ -472,11 +478,13 @@ class MyAnimeListService {
     required int animeId,
     required Map<String, String> params,
   }) async {
-    final response = await _client.put(
-      _apiUri('/anime/$animeId/my_list_status'),
-      headers: _headers(accessToken: accessToken, form: true),
-      body: params,
-    );
+    final response = await _client
+        .put(
+          _apiUri('/anime/$animeId/my_list_status'),
+          headers: _headers(accessToken: accessToken, form: true),
+          body: params,
+        )
+        .timeout(_requestTimeout);
     _expectJsonObject(response);
   }
 
@@ -484,10 +492,12 @@ class MyAnimeListService {
     required String accessToken,
     required int animeId,
   }) async {
-    final response = await _client.delete(
-      _apiUri('/anime/$animeId/my_list_status'),
-      headers: _headers(accessToken: accessToken),
-    );
+    final response = await _client
+        .delete(
+          _apiUri('/anime/$animeId/my_list_status'),
+          headers: _headers(accessToken: accessToken),
+        )
+        .timeout(_requestTimeout);
     if (!_isOk(response) && response.statusCode != 404) {
       throw MyAnimeListException(
         _extractApiError(response.body, response.statusCode),
@@ -500,10 +510,12 @@ class MyAnimeListService {
     Map<String, String> query = const {},
     String accessToken = '',
   }) {
-    return _client.get(
-      _apiUri(path, query: query),
-      headers: _headers(accessToken: accessToken),
-    );
+    return _client
+        .get(
+          _apiUri(path, query: query),
+          headers: _headers(accessToken: accessToken),
+        )
+        .timeout(_requestTimeout);
   }
 
   Uri _apiUri(String path, {Map<String, String> query = const {}}) {

@@ -199,6 +199,12 @@ void main() {
     expect(postedBodies['/scrobble/start']['anime']['ids']['mal'], 321);
     expect(postedBodies['/scrobble/start']['episode']['number'], 4);
     expect(postedBodies['/scrobble/start']['progress'], 42.5);
+    final scrobbleStartRequest = requests.singleWhere(
+      (entry) => entry.startsWith('POST https://api.simkl.com/scrobble/start'),
+    );
+    expect(scrobbleStartRequest, contains('client_id=client'));
+    expect(scrobbleStartRequest, contains('app-name=tanuki'));
+    expect(scrobbleStartRequest, contains('app-version=1.0.0'));
     expect(
       requests,
       contains(startsWith('GET https://api.simkl.com/oauth/pin')),

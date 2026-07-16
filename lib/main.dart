@@ -10,6 +10,8 @@ import 'src/ui/toonami_app.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  PaintingBinding.instance.imageCache.maximumSize = 1200;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 256 << 20;
   if (Platform.isLinux || Platform.isWindows) {
     vlc.DartVLC.initialize();
   }
