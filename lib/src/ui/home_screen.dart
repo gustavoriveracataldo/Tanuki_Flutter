@@ -6878,7 +6878,7 @@ class _SettingsCheckBox extends StatelessWidget {
   }
 }
 
-class _SettingsSlider extends StatelessWidget {
+class _SettingsSlider extends StatefulWidget {
   const _SettingsSlider({
     required this.value,
     required this.label,
@@ -6892,6 +6892,43 @@ class _SettingsSlider extends StatelessWidget {
   final ValueChanged<double> onChanged;
 
   @override
+  State<_SettingsSlider> createState() => _SettingsSliderState();
+}
+
+class _SettingsSliderState extends State<_SettingsSlider> {
+  late final FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode(
+      debugLabel: 'settingsSlider:${widget.label}',
+      onKeyEvent: _handleKeyEvent,
+    );
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+      FocusScope.of(context).focusInDirection(TraversalDirection.up);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+      FocusScope.of(context).focusInDirection(TraversalDirection.down);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
   Widget build(BuildContext context) {
     return SizedBox(
       width: 460,
@@ -6900,7 +6937,7 @@ class _SettingsSlider extends StatelessWidget {
           SizedBox(
             width: 128,
             child: Text(
-              label,
+              widget.label,
               style: const TextStyle(
                 color: Color(0xFFD8E1EB),
                 fontSize: 14,
@@ -6909,19 +6946,20 @@ class _SettingsSlider extends StatelessWidget {
           ),
           Expanded(
             child: Slider(
-              value: value.clamp(0, max).toDouble(),
+              focusNode: _focusNode,
+              value: widget.value.clamp(0, widget.max).toDouble(),
               min: 0,
-              max: max,
+              max: widget.max,
               divisions: 24,
               activeColor: TanukiColors.orange,
               inactiveColor: const Color(0xFF334250),
-              onChanged: onChanged,
+              onChanged: widget.onChanged,
             ),
           ),
           SizedBox(
             width: 44,
             child: Text(
-              value.round().toString(),
+              widget.value.round().toString(),
               textAlign: TextAlign.right,
               style: const TextStyle(
                 color: TanukiColors.muted,
