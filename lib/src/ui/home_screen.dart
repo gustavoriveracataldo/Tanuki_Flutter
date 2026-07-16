@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -197,16 +198,11 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_heroPreviewSeries != null) {
       return _heroPreviewSeries;
     }
-    final currentEntry = controller.currentEntry;
-    if (currentEntry != null) {
-      return controller.findSeriesForEpisode(currentEntry);
-    }
-    for (final series in controller.library) {
-      if (series.backgroundUrl.isNotEmpty || series.imageUrl.isNotEmpty) {
-        return series;
-      }
-    }
-    return controller.library.isEmpty ? null : controller.library.first;
+    return _resolveRecommendedHeroSeries(
+      controller,
+      trendingCandidates: _homeTrendingResults,
+      movieCandidates: _homeMovieResults,
+    );
   }
 
   Widget _buildAnimePanel(AppController controller) {
@@ -214,6 +210,11 @@ class _HomeScreenState extends State<HomeScreen> {
       controller: controller,
       selectedSeries: _selectedSeries,
       heroPreviewSeries: _heroPreviewSeries,
+      recommendedHeroSeries: _resolveRecommendedHeroSeries(
+        controller,
+        trendingCandidates: _homeTrendingResults,
+        movieCandidates: _homeMovieResults,
+      ),
       detailBackLabel: _detailBackLabel,
       detailSimilarCandidates: _detailSimilarResults,
       detailSimilarStatus: _detailSimilarStatus,
@@ -318,6 +319,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _previewRemoteCandidate(RemoteSearchCandidate candidate) {
+    unawaited(_refreshHomeVisualsNear(candidate));
     final preview = candidate.toSeries(existingNames: const []);
     if (_heroPreviewSeries?.stableKey == preview.stableKey) {
       return;
@@ -325,6 +327,62 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _heroPreviewSeries = preview;
     });
+  }
+
+  Future<void> _refreshHomeVisualsNear(
+    RemoteSearchCandidate focused,
+  ) async {
+    final shelves = <({
+      List<RemoteSearchCandidate> candidates,
+      int Function() nextRequest,
+      bool Function(int request) isCurrent,
+      void Function(List<RemoteSearchCandidate> candidates) apply,
+    })>[
+      (
+        candidates: _homeTrendingResults,
+        nextRequest: () => ++_homeTrendingVisualRequest,
+        isCurrent: (request) => request == _homeTrendingVisualRequest,
+        apply: (items) => _homeTrendingResults = items,
+      ),
+      (
+        candidates: _homeAiringResults,
+        nextRequest: () => ++_homeAiringVisualRequest,
+        isCurrent: (request) => request == _homeAiringVisualRequest,
+        apply: (items) => _homeAiringResults = items,
+      ),
+      (
+        candidates: _homeMovieResults,
+        nextRequest: () => ++_homeMovieVisualRequest,
+        isCurrent: (request) => request == _homeMovieVisualRequest,
+        apply: (items) => _homeMovieResults = items,
+      ),
+    ];
+    final focusedKey = _homeCandidateKey(focused);
+    for (final shelf in shelves) {
+      final index = shelf.candidates.indexWhere(
+        (candidate) => _homeCandidateKey(candidate) == focusedKey,
+      );
+      if (index < 0) {
+        continue;
+      }
+      final start = (index - 2).clamp(0, shelf.candidates.length).toInt();
+      final end = (index + 5).clamp(0, shelf.candidates.length).toInt();
+      final request = shelf.nextRequest();
+      final refreshed = await widget.controller.refreshCandidateVisuals(
+        shelf.candidates.sublist(start, end),
+        limit: end - start,
+      );
+      if (!mounted || !shelf.isCurrent(request)) {
+        return;
+      }
+      final current = List<RemoteSearchCandidate>.from(shelf.candidates)
+        ..replaceRange(start, end, refreshed);
+      setState(() {
+        shelf.apply(List.unmodifiable(current));
+        _refreshHeroPreviewFromCandidates(current);
+      });
+      return;
+    }
   }
 
   void _updateAnimePanelOpacity(double offset) {
@@ -343,7 +401,11 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (_selectedSeries?.stableKey == series.stableKey) {
       final similarIdentityChanged = refreshed.catalogId != series.catalogId ||
-          normalizeSeriesKey(refreshed.name) != normalizeSeriesKey(series.name);
+          normalizeSeriesKey(refreshed.name) !=
+              normalizeSeriesKey(series.name) ||
+          refreshed.provider != series.provider ||
+          refreshed.backgroundUrl != series.backgroundUrl ||
+          refreshed.logoUrl != series.logoUrl;
       setState(() {
         _selectedSeries = refreshed;
       });
@@ -600,6 +662,8 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
       setState(() {
+        // La consulta ya corresponde a la temporada actual. Las fechas de
+        // emision se ocultan en esta fila, pero no eliminan sus tarjetas.
         _homeTrendingResults = results.take(18).toList(growable: false);
         _homeTrendingLoading = false;
       });
@@ -618,6 +682,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_homeAiringLoading) {
       return;
     }
+    final previousResults = _homeAiringResults;
     setState(() {
       _homeAiringLoading = true;
     });
@@ -628,11 +693,16 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) {
         return;
       }
+      final previousVisible = _airingShelfCandidates(previousResults);
+      final nextVisible = _airingShelfCandidates(results);
+      final resolvedResults = nextVisible.isEmpty && previousVisible.isNotEmpty
+          ? previousResults
+          : results;
       setState(() {
-        _homeAiringResults = results;
+        _homeAiringResults = resolvedResults;
         _homeAiringLoading = false;
       });
-      unawaited(_refreshHomeAiringVisuals(_homeAiringResults));
+      unawaited(_refreshHomeAiringVisuals(resolvedResults));
     } catch (_) {
       if (!mounted) {
         return;
@@ -694,33 +764,14 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final request = ++_homeTrendingVisualRequest;
-    final refreshed = await widget.controller.refreshCandidateVisuals(
-      candidates,
-      limit: 8,
-      catalogMetadataOnly: true,
+    await _refreshHomeVisualsGradually(
+      candidates: candidates,
+      isCurrent: () => request == _homeTrendingVisualRequest,
+      apply: (refreshed) {
+        _homeTrendingResults = refreshed;
+        _refreshHeroPreviewFromCandidates(refreshed);
+      },
     );
-    if (!mounted || request != _homeTrendingVisualRequest) {
-      return;
-    }
-    setState(() {
-      _homeTrendingResults = refreshed.take(14).toList(growable: false);
-      final preview = _heroPreviewSeries;
-      if (preview != null) {
-        final refreshedPreview = refreshed.firstWhere(
-          (candidate) =>
-              normalizeSeriesKey(candidate.title) == preview.stableKey,
-          orElse: () => const RemoteSearchCandidate(
-            provider: RemoteProvider.catalog,
-            slug: '',
-            title: '',
-          ),
-        );
-        if (refreshedPreview.title.isNotEmpty) {
-          _heroPreviewSeries =
-              refreshedPreview.toSeries(existingNames: const []);
-        }
-      }
-    });
   }
 
   Future<void> _refreshHomeMovieVisuals(
@@ -729,16 +780,11 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final request = ++_homeMovieVisualRequest;
-    final refreshed = await widget.controller.refreshCandidateVisuals(
-      candidates,
-      limit: 8,
+    await _refreshHomeVisualsGradually(
+      candidates: candidates,
+      isCurrent: () => request == _homeMovieVisualRequest,
+      apply: (refreshed) => _homeMovieResults = refreshed,
     );
-    if (!mounted || request != _homeMovieVisualRequest) {
-      return;
-    }
-    setState(() {
-      _homeMovieResults = refreshed;
-    });
   }
 
   Future<void> _refreshHomeAiringVisuals(
@@ -746,18 +792,70 @@ class _HomeScreenState extends State<HomeScreen> {
     if (candidates.isEmpty) {
       return;
     }
+    final previousResults = _homeAiringResults;
     final request = ++_homeAiringVisualRequest;
-    final refreshed = await widget.controller.refreshCandidateVisuals(
-      candidates,
-      limit: 20,
-      catalogMetadataOnly: true,
+    await _refreshHomeVisualsGradually(
+      candidates: candidates,
+      isCurrent: () => request == _homeAiringVisualRequest,
+      apply: (refreshed) {
+        final previousVisible = _airingShelfCandidates(previousResults);
+        final refreshedVisible = _airingShelfCandidates(refreshed);
+        _homeAiringResults =
+            refreshedVisible.isEmpty && previousVisible.isNotEmpty
+                ? previousResults
+                : refreshed;
+      },
     );
-    if (!mounted || request != _homeAiringVisualRequest) {
+  }
+
+  Future<void> _refreshHomeVisualsGradually({
+    required List<RemoteSearchCandidate> candidates,
+    required bool Function() isCurrent,
+    required void Function(List<RemoteSearchCandidate>) apply,
+  }) async {
+    const batchSize = 3;
+    const initialItemCount = 6;
+    var current = List<RemoteSearchCandidate>.from(candidates);
+    final initialEnd = current.length.clamp(0, initialItemCount).toInt();
+    for (var start = 0; start < initialEnd; start += batchSize) {
+      if (!mounted || !isCurrent()) {
+        return;
+      }
+      final end = (start + batchSize).clamp(0, initialEnd).toInt();
+      final batch = current.sublist(start, end);
+      final refreshed = await widget.controller.refreshCandidateVisuals(
+        batch,
+        limit: batch.length,
+      );
+      if (!mounted || !isCurrent()) {
+        return;
+      }
+      current = [...current]..replaceRange(start, end, refreshed);
+      setState(() => apply(List.unmodifiable(current)));
+      if (end < initialEnd) {
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+      }
+    }
+  }
+
+  void _refreshHeroPreviewFromCandidates(
+    List<RemoteSearchCandidate> candidates,
+  ) {
+    final preview = _heroPreviewSeries;
+    if (preview == null) {
       return;
     }
-    setState(() {
-      _homeAiringResults = refreshed;
-    });
+    final refreshedPreview = candidates.firstWhere(
+      (candidate) => normalizeSeriesKey(candidate.title) == preview.stableKey,
+      orElse: () => const RemoteSearchCandidate(
+        provider: RemoteProvider.catalog,
+        slug: '',
+        title: '',
+      ),
+    );
+    if (refreshedPreview.title.isNotEmpty) {
+      _heroPreviewSeries = refreshedPreview.toSeries(existingNames: const []);
+    }
   }
 
   Future<void> _openRandomSeries() async {
@@ -833,12 +931,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final launchMode = _selectedSeries != null &&
             series?.stableKey == _selectedSeries!.stableKey
         ? PlayerLaunchMode.detail
-        : _section == _Section.anime &&
-                series != null &&
-                widget.controller.state.profile.watchingSeries
-                    .contains(series.stableKey)
-            ? PlayerLaunchMode.continueWatching
-            : PlayerLaunchMode.normal;
+        : _section == _Section.playlist
+            ? PlayerLaunchMode.playlist
+            : _section == _Section.anime &&
+                    series != null &&
+                    widget.controller.state.profile.watchingSeries
+                        .contains(series.stableKey)
+                ? PlayerLaunchMode.continueWatching
+                : PlayerLaunchMode.normal;
     await widget.controller.setCurrentEntry(episode);
     if (!mounted) {
       return;
@@ -2278,11 +2378,380 @@ class _HeroBackground extends StatelessWidget {
   }
 }
 
+SeriesItem? _resolveRecommendedHeroSeries(
+  AppController controller, {
+  required List<RemoteSearchCandidate> trendingCandidates,
+  required List<RemoteSearchCandidate> movieCandidates,
+}) {
+  final queue = _buildHeroRecommendationQueue(
+    controller,
+    trendingCandidates: trendingCandidates,
+    movieCandidates: movieCandidates,
+  );
+  return queue.isEmpty ? null : queue.first;
+}
+
+List<SeriesItem> _buildHeroRecommendationQueue(
+  AppController controller, {
+  required List<RemoteSearchCandidate> trendingCandidates,
+  required List<RemoteSearchCandidate> movieCandidates,
+}) {
+  final profile = controller.state.profile;
+  final library = controller.library;
+  final entries = <_HeroRecommendationEntry>[];
+  final currentEntry = controller.currentEntry;
+  final currentSeries = currentEntry == null
+      ? null
+      : controller.findSeriesForEpisode(currentEntry);
+
+  void addSeries(
+    SeriesItem? series, {
+    required int priority,
+    int bonus = 0,
+  }) {
+    if (series == null || series.name.trim().isEmpty) {
+      return;
+    }
+    if (_isHeroRecommendationCompleted(controller, profile, series)) {
+      return;
+    }
+    entries.add(_HeroRecommendationEntry(
+      series: series,
+      priority: priority,
+      bonus: bonus,
+    ));
+  }
+
+  void addCandidate(
+    RemoteSearchCandidate candidate, {
+    required int priority,
+    int bonus = 0,
+  }) {
+    if (candidate.title.trim().isEmpty) {
+      return;
+    }
+    addSeries(
+      candidate.toSeries(existingNames: const []),
+      priority: priority,
+      bonus: bonus + _remoteCandidateRecommendationScore(candidate),
+    );
+  }
+
+  // 1. Continuar viendo.
+  for (final entry in _continueWatchingEntries(controller)) {
+    addSeries(
+      entry.series ?? controller.findSeriesForEpisode(entry.episode),
+      priority: 800,
+      bonus: (entry.progress * 100).round() + (entry.isCurrent ? 60 : 0),
+    );
+  }
+
+  // 2. Playlist activa.
+  for (final episode in controller.buildNextEntries(limit: 6)) {
+    addSeries(
+      controller.findSeriesForEpisode(episode),
+      priority: 700,
+      bonus: 30 - episode.episodeIndex,
+    );
+  }
+
+  // 3. Favoritos con capitulos pendientes.
+  for (final series in library) {
+    if (_seriesMatchesAnyKey(series, profile.favoriteSeries)) {
+      addSeries(series, priority: 600, bonus: _seriesVisualScore(series));
+    }
+  }
+
+  // 4. Similar a lo visto recientemente.
+  final recent = currentSeries ??
+      _findSeriesByKey(library, profile.activePlaylist.lastPlayedSeriesName);
+  if (recent != null) {
+    final similar = library
+        .where((series) => series.stableKey != recent.stableKey)
+        .map((series) => (
+              series: series,
+              score: _seriesSimilarityScore(recent, series),
+            ))
+        .where((entry) => entry.score > 0)
+        .toList()
+      ..sort((a, b) => b.score.compareTo(a.score));
+    for (final entry in similar.take(4)) {
+      addSeries(entry.series, priority: 500, bonus: entry.score);
+    }
+  }
+
+  // 5. Temporada actual.
+  for (final candidate in trendingCandidates) {
+    addCandidate(candidate, priority: 400);
+  }
+
+  // 6. MAL/SIMKL watching o plan to watch sin progreso local claro.
+  final syncedKeys = {
+    ...profile.myAnimeListMappings.keys,
+    ...profile.simklMappings.keys,
+  };
+  final syncedStatusKeys = {
+    ...profile.watchingSeries,
+    ...profile.watchlistSeries,
+  };
+  for (final series in library) {
+    if (_seriesMatchesAnyKey(series, syncedStatusKeys) &&
+        (syncedKeys.isEmpty || _seriesMatchesAnyKey(series, syncedKeys))) {
+      addSeries(
+        series,
+        priority: 300,
+        bonus: profile.watchingSeries.contains(series.stableKey) ? 25 : 10,
+      );
+    }
+  }
+
+  // 7. Peliculas como fallback.
+  for (final candidate in movieCandidates) {
+    addCandidate(candidate, priority: 200);
+  }
+  for (final series in library.where(_isMovieSeries)) {
+    addSeries(series, priority: 190, bonus: _seriesVisualScore(series));
+  }
+
+  // 8. Random controlado desde biblioteca, evitando completadas y sin visuales
+  // cuando hay alternativas mejores.
+  final bucket = DateTime.now().millisecondsSinceEpoch ~/
+      const Duration(hours: 6).inMilliseconds;
+  for (final series in library) {
+    addSeries(
+      series,
+      priority: 100,
+      bonus: _seriesVisualScore(series) +
+          _stableRecommendationScore('$bucket|${series.stableKey}'),
+    );
+  }
+
+  if (entries.isEmpty && currentEntry != null) {
+    addSeries(currentSeries, priority: 50);
+  }
+  if (entries.isEmpty) {
+    for (final series in library) {
+      entries.add(_HeroRecommendationEntry(
+        series: series,
+        priority: 0,
+        bonus: _seriesVisualScore(series),
+      ));
+    }
+  }
+
+  final deduped = <String, _HeroRecommendationEntry>{};
+  for (final entry in entries) {
+    final key = _seriesTitleDedupeKey(entry.series.name);
+    final current = deduped[key];
+    if (current == null || entry.compareTo(current) < 0) {
+      deduped[key] = entry;
+    }
+  }
+  final sorted = deduped.values.toList()..sort();
+  return sorted.map((entry) => entry.series).toList(growable: false);
+}
+
+class _HeroRecommendationEntry implements Comparable<_HeroRecommendationEntry> {
+  const _HeroRecommendationEntry({
+    required this.series,
+    required this.priority,
+    required this.bonus,
+  });
+
+  final SeriesItem series;
+  final int priority;
+  final int bonus;
+
+  @override
+  int compareTo(_HeroRecommendationEntry other) {
+    final priorityCompare = other.priority.compareTo(priority);
+    if (priorityCompare != 0) {
+      return priorityCompare;
+    }
+    final bonusCompare = other.bonus.compareTo(bonus);
+    if (bonusCompare != 0) {
+      return bonusCompare;
+    }
+    final visualCompare =
+        _seriesVisualScore(other.series).compareTo(_seriesVisualScore(series));
+    if (visualCompare != 0) {
+      return visualCompare;
+    }
+    return series.name.toLowerCase().compareTo(other.series.name.toLowerCase());
+  }
+}
+
+bool _isHeroRecommendationCompleted(
+  AppController controller,
+  UserProfileState profile,
+  SeriesItem series,
+) {
+  final keys = _heroSeriesIdentityKeys(series);
+  if (keys.any(profile.abandonedSeries.contains) ||
+      keys.any(profile.completedSeries.contains)) {
+    return true;
+  }
+  final total =
+      series.episodeCount > 0 ? series.episodeCount : series.episodes.length;
+  return total > 0 && controller.watchedCountFor(series) >= total;
+}
+
+SeriesItem? _findSeriesByKey(Iterable<SeriesItem> library, String key) {
+  final normalized = normalizeSeriesKey(key);
+  if (normalized.isEmpty) {
+    return null;
+  }
+  for (final series in library) {
+    if (_heroSeriesIdentityKeys(series).contains(normalized)) {
+      return series;
+    }
+  }
+  return null;
+}
+
+bool _seriesMatchesAnyKey(SeriesItem series, Iterable<String> keys) {
+  final normalizedKeys = keys.map(normalizeSeriesKey).toSet()
+    ..removeWhere((key) => key.isEmpty);
+  if (normalizedKeys.isEmpty) {
+    return false;
+  }
+  return _heroSeriesIdentityKeys(series).any(normalizedKeys.contains);
+}
+
+Set<String> _heroSeriesIdentityKeys(SeriesItem series) {
+  return {
+    series.stableKey,
+    normalizeSeriesKey(series.name),
+    _seriesTitleDedupeKey(series.name),
+    if (series.catalogId > 0) 'catalog:${series.catalogId}',
+    normalizeSeriesKey(series.japaneseTitle),
+    _seriesTitleDedupeKey(series.japaneseTitle),
+    ...series.aliases.map(normalizeSeriesKey),
+    ...series.aliases.map(_seriesTitleDedupeKey),
+  }..removeWhere((key) => key.isEmpty);
+}
+
+int _seriesVisualScore(SeriesItem series) {
+  var score = 0;
+  if (series.backgroundUrl.isNotEmpty) {
+    score += 90;
+  }
+  if (series.imageUrl.isNotEmpty) {
+    score += 70;
+  }
+  if (series.logoUrl.isNotEmpty) {
+    score += 35;
+  }
+  if (series.description.trim().isNotEmpty) {
+    score += 20;
+  }
+  if (series.trailerUrl.isNotEmpty) {
+    score += 8;
+  }
+  if (series.releaseYear > 0) {
+    score += series.releaseYear.clamp(1980, 2030).toInt() - 1980;
+  }
+  return score;
+}
+
+int _remoteCandidateRecommendationScore(RemoteSearchCandidate candidate) {
+  var score = 0;
+  if (candidate.backgroundUrl.isNotEmpty) {
+    score += 90;
+  }
+  if (candidate.imageUrl.isNotEmpty) {
+    score += 70;
+  }
+  if (candidate.logoUrl.isNotEmpty) {
+    score += 35;
+  }
+  if (candidate.description.trim().isNotEmpty) {
+    score += 20;
+  }
+  if (candidate.trailerUrl.isNotEmpty) {
+    score += 8;
+  }
+  score += (_numericRating(candidate.rating) * 10).round();
+  if (candidate.releaseYear > 0) {
+    score += candidate.releaseYear.clamp(1980, 2030).toInt() - 1980;
+  }
+  return score;
+}
+
+int _seriesSimilarityScore(SeriesItem anchor, SeriesItem candidate) {
+  var score = 0;
+  final anchorFormat = anchor.format.trim().toLowerCase();
+  final candidateFormat = candidate.format.trim().toLowerCase();
+  if (anchorFormat.isNotEmpty && anchorFormat == candidateFormat) {
+    score += 30;
+  }
+  if (anchor.provider != null && anchor.provider == candidate.provider) {
+    score += 8;
+  }
+  if (anchor.releaseYear > 0 && candidate.releaseYear > 0) {
+    final diff = (anchor.releaseYear - candidate.releaseYear).abs();
+    if (diff <= 1) {
+      score += 18;
+    } else if (diff <= 3) {
+      score += 10;
+    }
+  }
+  final anchorCast = anchor.cast.map(normalizeSeriesKey).toSet()
+    ..removeWhere((entry) => entry.isEmpty);
+  final candidateCast = candidate.cast.map(normalizeSeriesKey).toSet()
+    ..removeWhere((entry) => entry.isEmpty);
+  score += anchorCast.intersection(candidateCast).length * 12;
+
+  final anchorTokens = _recommendationTitleTokens(anchor);
+  final candidateTokens = _recommendationTitleTokens(candidate);
+  score += anchorTokens.intersection(candidateTokens).length * 5;
+  return score + (_seriesVisualScore(candidate) ~/ 8);
+}
+
+Set<String> _recommendationTitleTokens(SeriesItem series) {
+  final text = [
+    series.name,
+    series.japaneseTitle,
+    ...series.aliases,
+  ].join(' ');
+  return normalizeSeriesKey(text)
+      .split(' ')
+      .where((token) => token.length >= 4)
+      .toSet();
+}
+
+bool _isMovieSeries(SeriesItem series) {
+  final format = series.format.trim().toLowerCase();
+  return format.contains('movie') ||
+      format.contains('pelicula') ||
+      series.episodes.any((episode) =>
+          episode.relativePath.toLowerCase().contains('pelicula') ||
+          episode.watchUrl.toLowerCase().contains('/pelicula'));
+}
+
+double _numericRating(String value) {
+  final match = RegExp(r'\d+(?:[.,]\d+)?').firstMatch(value);
+  if (match == null) {
+    return 0;
+  }
+  return double.tryParse(match.group(0)!.replaceAll(',', '.')) ?? 0;
+}
+
+int _stableRecommendationScore(String value) {
+  var hash = 0x811c9dc5;
+  for (final unit in value.codeUnits) {
+    hash ^= unit;
+    hash = (hash * 0x01000193) & 0x7fffffff;
+  }
+  return hash % 80;
+}
+
 class _AnimePanel extends StatelessWidget {
   const _AnimePanel({
     required this.controller,
     required this.selectedSeries,
     required this.heroPreviewSeries,
+    required this.recommendedHeroSeries,
     required this.detailBackLabel,
     required this.detailSimilarCandidates,
     required this.detailSimilarStatus,
@@ -2313,6 +2782,7 @@ class _AnimePanel extends StatelessWidget {
   final AppController controller;
   final SeriesItem? selectedSeries;
   final SeriesItem? heroPreviewSeries;
+  final SeriesItem? recommendedHeroSeries;
   final String detailBackLabel;
   final List<RemoteSearchCandidate> detailSimilarCandidates;
   final String detailSimilarStatus;
@@ -2344,9 +2814,13 @@ class _AnimePanel extends StatelessWidget {
     final library = controller.library;
     final hero = selectedSeries ??
         heroPreviewSeries ??
+        recommendedHeroSeries ??
         (library.isEmpty ? null : library.first);
     final continueWatching = _continueWatchingEntries(controller);
-    final visibleSeason = _seasonShelfCandidates(trendingCandidates);
+    // La pertenencia al estante se fija al cargar la temporada. Volver a
+    // filtrarla aqui haria desaparecer tarjetas cuando llegan metadatos de
+    // emision durante la precarga visual.
+    final visibleSeason = trendingCandidates;
     final visibleAiring = _airingShelfCandidates(airingCandidates);
     final latestMovies = movieCandidates.isNotEmpty
         ? movieCandidates
@@ -2407,6 +2881,7 @@ class _AnimePanel extends StatelessWidget {
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
           onPlayTrailers: onPlayTrendingTrailers,
+          showScheduleChip: false,
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
@@ -2426,6 +2901,7 @@ class _AnimePanel extends StatelessWidget {
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
           onLoadMore: onLoadMoreAiring,
+          showScheduleChip: true,
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
@@ -2445,6 +2921,7 @@ class _AnimePanel extends StatelessWidget {
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
           onLoadMore: onLoadMoreMovies,
+          showScheduleChip: false,
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
@@ -4054,6 +4531,7 @@ class _TrendingPosterShelf extends StatelessWidget {
     required this.onCandidateSelected,
     required this.onCandidateFocused,
     required this.onPlayTrailers,
+    this.showScheduleChip = false,
   });
 
   final String title;
@@ -4063,6 +4541,7 @@ class _TrendingPosterShelf extends StatelessWidget {
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
   final ValueChanged<RemoteSearchCandidate> onCandidateFocused;
   final VoidCallback onPlayTrailers;
+  final bool showScheduleChip;
 
   @override
   Widget build(BuildContext context) {
@@ -4122,6 +4601,7 @@ class _TrendingPosterShelf extends StatelessWidget {
                             null,
                         onTap: () => onCandidateSelected(candidate),
                         onFocused: () => focusCandidate(candidate),
+                        showScheduleChip: showScheduleChip,
                       );
                     },
                     separatorBuilder: (_, __) => const SizedBox(width: 8),
@@ -4142,6 +4622,7 @@ class _RemotePosterCard extends StatelessWidget {
     required this.imported,
     required this.onTap,
     required this.onFocused,
+    this.showScheduleChip = true,
   });
 
   final double width;
@@ -4150,6 +4631,7 @@ class _RemotePosterCard extends StatelessWidget {
   final bool imported;
   final VoidCallback onTap;
   final VoidCallback onFocused;
+  final bool showScheduleChip;
 
   @override
   Widget build(BuildContext context) {
@@ -4162,6 +4644,7 @@ class _RemotePosterCard extends StatelessWidget {
         onTap: onTap,
         onFocused: onFocused,
         onLongPress: () => _showCardMenu(context),
+        showScheduleChip: showScheduleChip,
       ),
     );
   }
@@ -4208,6 +4691,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
     required this.onCandidateSelected,
     required this.onCandidateFocused,
     required this.onLoadMore,
+    this.showScheduleChip = true,
   });
 
   final String title;
@@ -4218,6 +4702,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
   final ValueChanged<RemoteSearchCandidate> onCandidateFocused;
   final VoidCallback onLoadMore;
+  final bool showScheduleChip;
 
   @override
   Widget build(BuildContext context) {
@@ -4265,6 +4750,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
                               null,
                           onTap: () => onCandidateSelected(candidate),
                           onFocused: () => focusCandidate(candidate),
+                          showScheduleChip: showScheduleChip,
                         );
                       },
                       separatorBuilder: (_, __) => const SizedBox(width: 8),
@@ -4687,8 +5173,7 @@ class _PlaylistPanel extends StatelessWidget {
     final entries = controller.buildNextEntries(limit: 12);
     final selected = _dedupeSeriesForDisplay(
         controller.library.where(controller.isSelected));
-    final current =
-        controller.currentEntry ?? (entries.isEmpty ? null : entries.first);
+    final nextEpisode = entries.isEmpty ? null : entries.first;
     final playlistOrder = PlaylistPlaybackOrder.normalize(
         controller.activePlaylist.playbackOrder);
     return Padding(
@@ -4697,16 +5182,16 @@ class _PlaylistPanel extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            current?.seriesName ?? controller.activePlaylist.name,
+            nextEpisode?.seriesName ?? controller.activePlaylist.name,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context).textTheme.headlineMedium,
           ),
           const SizedBox(height: 8),
           Text(
-            current == null
+            nextEpisode == null
                 ? 'Selecciona series desde Biblioteca o Buscar.'
-                : 'Episodio ${current.episodeNumber} - ${current.displayName}',
+                : 'Episodio ${nextEpisode.episodeNumber} - ${nextEpisode.displayName}',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
@@ -4719,41 +5204,49 @@ class _PlaylistPanel extends StatelessWidget {
             runSpacing: 8,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              IconButton(
-                onPressed:
-                    current == null ? null : () => onPlayEpisode(current),
-                icon: const Icon(Icons.play_arrow),
-                style: IconButton.styleFrom(
-                  fixedSize: const Size(44, 44),
-                  backgroundColor: const Color(0xFF1A2332),
-                  foregroundColor: TanukiColors.text,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                ),
-                tooltip: 'Reproducir actual',
-              ),
               FilledButton(
-                onPressed:
-                    entries.isEmpty ? null : () => onPlayEpisode(entries.first),
-                child: const Text('Reproducir siguiente'),
+                onPressed: nextEpisode == null
+                    ? null
+                    : () => onPlayEpisode(nextEpisode),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.play_arrow, size: 18),
+                    SizedBox(width: 6),
+                    Text('Reproducir'),
+                  ],
+                ),
               ),
               OutlinedButton(
-                onPressed: () {},
-                child: const Text('Listas'),
-              ),
-              _PlaylistOrderChip(
-                label: 'TV',
-                selected: playlistOrder == PlaylistPlaybackOrder.tv,
-                onPressed: () => controller.setActivePlaylistPlaybackOrder(
-                  PlaylistPlaybackOrder.tv,
+                onPressed: () => _showPlaylistManager(context),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.playlist_play, size: 18),
+                    const SizedBox(width: 6),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 180),
+                      child: Text(
+                        controller.activePlaylist.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
                 ),
               ),
               _PlaylistOrderChip(
-                label: 'Por serie',
-                selected: playlistOrder == PlaylistPlaybackOrder.series,
+                label: 'TV Serial',
+                selected: playlistOrder == PlaylistPlaybackOrder.tvSerial,
                 onPressed: () => controller.setActivePlaylistPlaybackOrder(
-                  PlaylistPlaybackOrder.series,
+                  PlaylistPlaybackOrder.tvSerial,
+                ),
+              ),
+              _PlaylistOrderChip(
+                label: 'TV Random',
+                selected: playlistOrder == PlaylistPlaybackOrder.tvRandom,
+                onPressed: () => controller.setActivePlaylistPlaybackOrder(
+                  PlaylistPlaybackOrder.tvRandom,
                 ),
               ),
             ],
@@ -4774,6 +5267,7 @@ class _PlaylistPanel extends StatelessWidget {
                           itemBuilder: (context, index) {
                             final entry = entries[index];
                             return _QueueRow(
+                              controller: controller,
                               episode: entry,
                               onPlay: () => onPlayEpisode(entry),
                             );
@@ -4785,15 +5279,32 @@ class _PlaylistPanel extends StatelessWidget {
                   emptyText: 'No hay series seleccionadas.',
                   child: selected.isEmpty
                       ? null
-                      : ListView.builder(
-                          padding: EdgeInsets.zero,
-                          itemCount: selected.length,
-                          itemBuilder: (context, index) {
-                            final series = selected[index];
-                            return _MiniSeriesTile(
-                              controller: controller,
-                              series: series,
-                              onTap: () => onSeriesSelected(series),
+                      : LayoutBuilder(
+                          builder: (context, constraints) {
+                            final columns = constraints.maxWidth >= 520 ? 4 : 3;
+                            final spacing = 10.0;
+                            final width = (constraints.maxWidth -
+                                    spacing * (columns - 1)) /
+                                columns;
+                            final height = (width * 1.48).clamp(150.0, 220.0);
+                            return GridView.builder(
+                              padding: EdgeInsets.zero,
+                              gridDelegate:
+                                  SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: columns,
+                                mainAxisSpacing: spacing,
+                                crossAxisSpacing: spacing,
+                                childAspectRatio: width / height,
+                              ),
+                              itemCount: selected.length,
+                              itemBuilder: (context, index) {
+                                final series = selected[index];
+                                return _PlaylistSeriesPosterCard(
+                                  controller: controller,
+                                  series: series,
+                                  onTap: () => onSeriesSelected(series),
+                                );
+                              },
                             );
                           },
                         ),
@@ -4825,6 +5336,134 @@ class _PlaylistPanel extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _showPlaylistManager(BuildContext context) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: TanukiColors.panelSolid,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+            child: StatefulBuilder(
+              builder: (context, setSheetState) {
+                final playlists = controller.state.profile.playlists;
+                final activeId = controller.state.profile.activePlaylistId;
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Listas',
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Nueva lista',
+                          onPressed: () async {
+                            final name = await _askPlaylistName(context);
+                            if (name == null) {
+                              return;
+                            }
+                            await controller.createPlaylist(name: name);
+                            setSheetState(() {});
+                          },
+                          icon: const Icon(Icons.add),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Flexible(
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: playlists.length,
+                        itemBuilder: (context, index) {
+                          final playlist = playlists[index];
+                          final selected = playlist.id == activeId;
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(selected
+                                ? Icons.radio_button_checked
+                                : Icons.radio_button_unchecked),
+                            title: Text(
+                              playlist.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              '${playlist.selectedSeries.length} series',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            onTap: () async {
+                              await controller.selectPlaylist(playlist.id);
+                              if (sheetContext.mounted) {
+                                Navigator.of(sheetContext).pop();
+                              }
+                            },
+                            trailing: IconButton(
+                              tooltip: 'Eliminar lista',
+                              onPressed: playlists.length <= 1
+                                  ? null
+                                  : () async {
+                                      await controller
+                                          .deletePlaylist(playlist.id);
+                                      setSheetState(() {});
+                                    },
+                              icon: const Icon(Icons.delete_outline),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<String?> _askPlaylistName(BuildContext context) async {
+    final textController = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: TanukiColors.panelSolid,
+          title: const Text('Nueva lista'),
+          content: TextField(
+            controller: textController,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Nombre',
+              hintText: 'Playlist de temporada',
+            ),
+            onSubmitted: (value) => Navigator.of(context).pop(value.trim()),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(textController.text.trim()),
+              child: const Text('Crear'),
+            ),
+          ],
+        );
+      },
+    );
+    textController.dispose();
+    return name?.trim();
   }
 }
 
@@ -5161,6 +5800,7 @@ class _SearchResultPosterCard extends StatelessWidget {
     required this.onTap,
     this.onFocused,
     this.onLongPress,
+    this.showScheduleChip = true,
   });
 
   final RemoteSearchCandidate candidate;
@@ -5168,6 +5808,7 @@ class _SearchResultPosterCard extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback? onFocused;
   final VoidCallback? onLongPress;
+  final bool showScheduleChip;
 
   @override
   Widget build(BuildContext context) {
@@ -5219,7 +5860,7 @@ class _SearchResultPosterCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                 ],
-                if (scheduleLabel.isNotEmpty)
+                if (showScheduleChip && scheduleLabel.isNotEmpty)
                   _ScheduleChip(text: scheduleLabel),
               ],
             ),
@@ -5560,6 +6201,172 @@ class _SettingsPanel extends StatelessWidget {
             const _SettingsStatusText(
               'Tanuki Flutter v$_appVersionLabel\nby Guzz.',
             ),
+            const _SettingsSectionTitle('Cuentas'),
+            const _SettingsSectionTitle('MyAnimeList'),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _SettingsIconButton(
+                  tooltip: 'Conectar MyAnimeList',
+                  icon: Icons.login,
+                  selected:
+                      malAuth.isConnected || controller.isConnectingMyAnimeList,
+                  onPressed:
+                      malAuth.isConnected || controller.isConnectingMyAnimeList
+                          ? null
+                          : () async {
+                              final url =
+                                  await controller.beginMyAnimeListConnection();
+                              if (url.isNotEmpty && context.mounted) {
+                                await _openSettingsUrl(url);
+                              }
+                            },
+                ),
+                _SettingsIconButton(
+                  tooltip: 'Conectar MyAnimeList con QR',
+                  icon: Icons.qr_code_2,
+                  selected: controller.myAnimeListPendingAuthorization != null,
+                  onPressed:
+                      malAuth.isConnected || controller.isConnectingMyAnimeList
+                          ? null
+                          : () async {
+                              final url =
+                                  await controller.beginMyAnimeListConnection();
+                              if (url.isNotEmpty) {
+                                controller.setStatusMessage(
+                                  'Escanea el QR para autorizar MyAnimeList.',
+                                );
+                              }
+                            },
+                ),
+                if (controller.myAnimeListPendingAuthorization != null)
+                  _SettingsIconButton(
+                    tooltip: 'Pegar retorno de MyAnimeList',
+                    icon: Icons.content_paste,
+                    selected: true,
+                    onPressed: () => _showSettingsTextDialog(
+                      context,
+                      title: 'URL de retorno de MyAnimeList',
+                      initialValue: '',
+                      hintText: 'toonamitvshell://mal-auth/callback?...',
+                      onSave: controller.completeMyAnimeListConnection,
+                    ),
+                  ),
+                if (controller.myAnimeListPendingAuthorization != null)
+                  _SettingsIconButton(
+                    tooltip: 'Cancelar OAuth',
+                    icon: Icons.close,
+                    onPressed: controller.cancelMyAnimeListConnection,
+                  ),
+                _SettingsIconButton(
+                  tooltip: 'Sincronizar MyAnimeList',
+                  icon: Icons.sync,
+                  selected: controller.isSyncingMyAnimeList,
+                  onPressed:
+                      malAuth.isConnected && !controller.isSyncingMyAnimeList
+                          ? controller.recordMyAnimeListSyncAttempt
+                          : null,
+                ),
+                _SettingsIconButton(
+                  tooltip: 'Desconectar MyAnimeList',
+                  icon: Icons.link_off,
+                  onPressed:
+                      malAuth.isConnected && !controller.isSyncingMyAnimeList
+                          ? controller.disconnectMyAnimeList
+                          : null,
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (controller.myAnimeListPendingAuthorization != null)
+              _AccountPairingQr(
+                title: 'Escanea para autorizar MyAnimeList',
+                data: controller
+                    .myAnimeListPendingAuthorization!.authorizationUrl,
+                helper: controller.isMyAnimeListPairingBridgeActive
+                    ? 'Mantén ambos dispositivos en la misma red. Al aceptar, Tanuki móvil enviará la autorización automáticamente.'
+                    : 'No pude abrir el puente local. Al terminar, pega en Tanuki la URL de retorno mostrada en el celular.',
+              ),
+            _SettingsStatusText(_myAnimeListSettingsStatus(controller)),
+            const _SettingsSectionTitle('SIMKL'),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _SettingsIconButton(
+                  tooltip: 'Conectar SIMKL con QR',
+                  icon: Icons.qr_code_2,
+                  selected:
+                      simklAuth.isConnected || controller.isConnectingSimkl,
+                  onPressed: simklAuth.isConnected ||
+                          controller.isConnectingSimkl ||
+                          controller.isSyncingSimkl
+                      ? null
+                      : controller.beginSimklConnection,
+                ),
+                _SettingsIconButton(
+                  tooltip: 'Abrir sitio de SIMKL',
+                  icon: Icons.open_in_new,
+                  onPressed: controller.simklPendingAuthorization == null
+                      ? null
+                      : () => unawaited(_openSettingsUrl(
+                            controller
+                                .simklPendingAuthorization!.verificationUrl,
+                          )),
+                ),
+                _SettingsIconButton(
+                  tooltip: 'Verificar SIMKL ahora',
+                  icon: Icons.verified,
+                  onPressed: controller.simklPendingAuthorization == null
+                      ? null
+                      : controller.pollSimklAuthorizationNow,
+                ),
+                _SettingsIconButton(
+                  tooltip: 'Sincronizar SIMKL',
+                  icon: Icons.sync,
+                  selected: controller.isSyncingSimkl,
+                  onPressed: simklAuth.isConnected && !controller.isSyncingSimkl
+                      ? controller.recordSimklSyncAttempt
+                      : null,
+                ),
+                _SettingsIconButton(
+                  tooltip: 'Desconectar SIMKL',
+                  icon: Icons.link_off,
+                  onPressed: simklAuth.isConnected ||
+                          controller.simklPendingAuthorization != null
+                      ? controller.disconnectSimkl
+                      : null,
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (controller.simklPendingAuthorization != null)
+              _AccountPairingQr(
+                title: 'Escanea para conectar SIMKL',
+                data: controller.simklPendingAuthorization!.verificationUrl,
+                code: controller.simklPendingAuthorization!.userCode,
+                helper:
+                    'Autoriza el codigo en el celular. Tanuki detectara la conexion automaticamente.',
+              ),
+            _SettingsStatusText(_simklSettingsStatus(controller)),
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: controller.isSyncingAccounts
+                  ? null
+                  : controller.synchronizeConnectedAccounts,
+              icon: controller.isSyncingAccounts
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync),
+              label: Text(controller.isSyncingAccounts
+                  ? 'Sincronizando cuentas...'
+                  : 'Sincronizar cuentas conectadas'),
+            ),
+            const _SettingsSectionTitle('Reproduccion'),
             const _SettingsSectionTitle('Tarjetas Luego y Mas tarde'),
             _SettingsCheckBox(
               value: controller.state.showSeriesUpcomingCards,
@@ -5586,6 +6393,7 @@ class _SettingsPanel extends StatelessWidget {
               onChanged: (value) =>
                   controller.setBooleanSetting(skipFillerEpisodes: value),
             ),
+            const _SettingsSectionTitle('Datos locales'),
             const SizedBox(height: 8),
             OutlinedButton.icon(
               onPressed: controller.isRefreshingFillerMetadata
@@ -5613,146 +6421,6 @@ class _SettingsPanel extends StatelessWidget {
                 'Cerca de 16:9: ${isSixteenByNine ? 'Sí' : 'No'}'),
             _SettingsStatusText(
                 'Safe area: top ${safePadding.top.toStringAsFixed(0)}, bottom ${safePadding.bottom.toStringAsFixed(0)}, left ${safePadding.left.toStringAsFixed(0)}, right ${safePadding.right.toStringAsFixed(0)}'),
-            const SizedBox(height: 16),
-            const _SettingsSectionTitle('MyAnimeList'),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                _SettingsChoiceButton(
-                  label: 'Client ID',
-                  selected: controller.state.myAnimeListClientId.isNotEmpty,
-                  onPressed: () => _showSettingsTextDialog(
-                    context,
-                    title: 'Client ID de MyAnimeList',
-                    initialValue: controller.state.myAnimeListClientId,
-                    hintText: 'Client ID',
-                    onSave: controller.setMyAnimeListClientId,
-                  ),
-                ),
-                _SettingsChoiceButton(
-                  label: 'Client Secret',
-                  selected: controller.state.myAnimeListClientSecret.isNotEmpty,
-                  onPressed: () => _showSettingsTextDialog(
-                    context,
-                    title: 'Client Secret de MyAnimeList',
-                    initialValue: controller.state.myAnimeListClientSecret,
-                    hintText: 'Client Secret',
-                    obscureText: true,
-                    onSave: controller.setMyAnimeListClientSecret,
-                  ),
-                ),
-                _SettingsChoiceButton(
-                  label: 'Conectar',
-                  selected:
-                      malAuth.isConnected || controller.isConnectingMyAnimeList,
-                  onPressed:
-                      malAuth.isConnected || controller.isConnectingMyAnimeList
-                          ? null
-                          : () async {
-                              final url =
-                                  await controller.beginMyAnimeListConnection();
-                              if (url.isNotEmpty && context.mounted) {
-                                await _openSettingsUrl(url);
-                              }
-                            },
-                ),
-                if (controller.myAnimeListPendingAuthorization != null)
-                  _SettingsChoiceButton(
-                    label: 'Pegar retorno',
-                    selected: true,
-                    onPressed: () => _showSettingsTextDialog(
-                      context,
-                      title: 'URL de retorno de MyAnimeList',
-                      initialValue: '',
-                      hintText: 'toonamitvshell://mal-auth/callback?...',
-                      onSave: controller.completeMyAnimeListConnection,
-                    ),
-                  ),
-                if (controller.myAnimeListPendingAuthorization != null)
-                  _SettingsChoiceButton(
-                    label: 'Cancelar OAuth',
-                    onPressed: controller.cancelMyAnimeListConnection,
-                  ),
-                _SettingsChoiceButton(
-                  label: 'Sincronizar ahora',
-                  onPressed:
-                      malAuth.isConnected && !controller.isSyncingMyAnimeList
-                          ? controller.recordMyAnimeListSyncAttempt
-                          : null,
-                ),
-                _SettingsChoiceButton(
-                  label: 'Desconectar',
-                  onPressed:
-                      malAuth.isConnected && !controller.isSyncingMyAnimeList
-                          ? controller.disconnectMyAnimeList
-                          : null,
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            _SettingsStatusText(_myAnimeListSettingsStatus(controller)),
-            const _SettingsSectionTitle('SIMKL'),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                _SettingsChoiceButton(
-                  label: 'Client ID',
-                  selected: controller.state.simklClientId.isNotEmpty,
-                  onPressed: () => _showSettingsTextDialog(
-                    context,
-                    title: 'Client ID de SIMKL',
-                    initialValue: controller.state.simklClientId,
-                    hintText: 'Client ID',
-                    onSave: controller.setSimklClientId,
-                  ),
-                ),
-                _SettingsChoiceButton(
-                  label: 'Conectar',
-                  selected:
-                      simklAuth.isConnected || controller.isConnectingSimkl,
-                  onPressed: simklAuth.isConnected ||
-                          controller.isConnectingSimkl ||
-                          controller.isSyncingSimkl
-                      ? null
-                      : controller.beginSimklConnection,
-                ),
-                _SettingsChoiceButton(
-                  label: 'Abrir sitio',
-                  onPressed: controller.simklPendingAuthorization == null
-                      ? null
-                      : () => unawaited(_openSettingsUrl(
-                            controller
-                                .simklPendingAuthorization!.verificationUrl,
-                          )),
-                ),
-                _SettingsChoiceButton(
-                  label: 'Verificar ahora',
-                  onPressed: controller.simklPendingAuthorization == null
-                      ? null
-                      : controller.pollSimklAuthorizationNow,
-                ),
-                _SettingsChoiceButton(
-                  label: 'Sincronizar ahora',
-                  selected: controller.isSyncingSimkl,
-                  onPressed: simklAuth.isConnected && !controller.isSyncingSimkl
-                      ? controller.recordSimklSyncAttempt
-                      : null,
-                ),
-                _SettingsChoiceButton(
-                  label: 'Desconectar',
-                  onPressed: simklAuth.isConnected ||
-                          controller.simklPendingAuthorization != null
-                      ? controller.disconnectSimkl
-                      : null,
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            _SettingsStatusText(_simklSettingsStatus(controller)),
-            const SizedBox(height: 16),
-            _SettingsStatusText(_settingsSummary(controller)),
           ],
         ),
       ),
@@ -5816,6 +6484,78 @@ class _SettingsPanel extends StatelessWidget {
   }
 }
 
+class _AccountPairingQr extends StatelessWidget {
+  const _AccountPairingQr({
+    required this.title,
+    required this.data,
+    required this.helper,
+    this.code = '',
+  });
+
+  final String title;
+  final String data;
+  final String helper;
+  final String code;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101820),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: TanukiColors.orangeHot.withValues(alpha: .5)),
+      ),
+      child: Wrap(
+        spacing: 18,
+        runSpacing: 12,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: QrImageView(data: data, size: 156),
+            ),
+          ),
+          SizedBox(
+            width: 430,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(title,
+                    style: const TextStyle(
+                        fontSize: 17, fontWeight: FontWeight.w800)),
+                if (code.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  SelectableText(
+                    code,
+                    style: const TextStyle(
+                      color: TanukiColors.orangeHot,
+                      fontSize: 28,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 5,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Text(helper,
+                    style: const TextStyle(
+                        color: TanukiColors.muted, fontSize: 13)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _SettingsSectionTitle extends StatelessWidget {
   const _SettingsSectionTitle(this.text);
 
@@ -5837,31 +6577,38 @@ class _SettingsSectionTitle extends StatelessWidget {
   }
 }
 
-class _SettingsChoiceButton extends StatelessWidget {
-  const _SettingsChoiceButton({
-    required this.label,
+class _SettingsIconButton extends StatelessWidget {
+  const _SettingsIconButton({
+    required this.tooltip,
+    required this.icon,
     this.selected = false,
     this.onPressed,
   });
 
-  final String label;
+  final String tooltip;
+  final IconData icon;
   final bool selected;
   final VoidCallback? onPressed;
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      height: 40,
-      child: OutlinedButton(
-        onPressed: onPressed,
-        style: OutlinedButton.styleFrom(
-          backgroundColor: selected ? TanukiColors.orange : null,
-          foregroundColor: selected ? Colors.black : TanukiColors.text,
-          disabledForegroundColor: TanukiColors.subtle,
-          padding: const EdgeInsets.symmetric(horizontal: 14),
-          textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox.square(
+        dimension: 36,
+        child: OutlinedButton(
+          onPressed: onPressed,
+          style: OutlinedButton.styleFrom(
+            backgroundColor: selected ? TanukiColors.orange : null,
+            foregroundColor: selected ? Colors.black : TanukiColors.text,
+            disabledForegroundColor: TanukiColors.subtle,
+            padding: EdgeInsets.zero,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+          child: Icon(icon, size: 18),
         ),
-        child: Text(label),
       ),
     );
   }
@@ -5954,10 +6701,15 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
   for (final series in controller.library) {
     final seriesKey = series.stableKey;
     final titleKey = _seriesTitleDedupeKey(series.name);
-    final currentForSeries =
-        current != null && currentSeriesKey == series.stableKey;
     final watched = controller.watchedCountFor(series);
-    final partialEpisode = _partialPlaybackEpisode(controller, series);
+    final currentForSeries = current != null &&
+        currentSeriesKey == series.stableKey &&
+        current.episodeIndex >= watched;
+    final partialEpisode = _partialPlaybackEpisode(
+      controller,
+      series,
+      minimumEpisodeIndex: watched,
+    );
     final shouldInclude =
         currentForSeries || partialEpisode != null || watched > 0;
     if (!shouldInclude) {
@@ -5994,6 +6746,11 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
     final playbackProgress = _playbackProgress(playback);
     final seriesProgress =
         total > 0 ? (watched / total).clamp(0, 1).toDouble() : 0.0;
+    final progress = futureEpisode
+        ? 0.0
+        : playbackProgress > 0
+            ? playbackProgress
+            : seriesProgress;
     entries.add(
       _ContinueWatchingEntry(
         series: series,
@@ -6003,7 +6760,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         episode: episode,
         episodeCount: total,
         watchedCount: watched,
-        progress: playbackProgress > 0 ? playbackProgress : seriesProgress,
+        progress: progress,
         isCurrent: currentForSeries,
         enabled: !futureEpisode,
         scheduleLabel:
@@ -6020,6 +6777,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
       !seenKeys.contains(currentSeriesKey) &&
       (currentTitleKey.isEmpty || !seenTitleKeys.contains(currentTitleKey))) {
     final playback = controller.playbackForEpisode(current);
+    final futureEpisode = _episodeAirsInFuture(current.airDateIso);
     entries.add(
       _ContinueWatchingEntry(
         series: controller.findSeriesForEpisode(current),
@@ -6028,12 +6786,11 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         episode: current,
         episodeCount: 0,
         watchedCount: 0,
-        progress: _playbackProgress(playback),
+        progress: futureEpisode ? 0 : _playbackProgress(playback),
         isCurrent: true,
-        enabled: !_episodeAirsInFuture(current.airDateIso),
-        scheduleLabel: _episodeAirsInFuture(current.airDateIso)
-            ? _scheduleChipLabel(current.airDateIso)
-            : '',
+        enabled: !futureEpisode,
+        scheduleLabel:
+            futureEpisode ? _scheduleChipLabel(current.airDateIso) : '',
       ),
     );
   }
@@ -6140,12 +6897,16 @@ int _spaceSeriesCompletenessScore(SeriesItem series) {
 
 EpisodeItem? _partialPlaybackEpisode(
   AppController controller,
-  SeriesItem series,
-) {
+  SeriesItem series, {
+  required int minimumEpisodeIndex,
+}) {
   final episodes = [...series.episodes]..sort(
       (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
     );
   for (final episode in episodes) {
+    if (episode.episodeIndex < minimumEpisodeIndex) {
+      continue;
+    }
     final playback = controller.playbackForEpisode(episode);
     if (playback != null && !playback.completed && playback.positionMs > 1000) {
       return episode;
@@ -6200,46 +6961,14 @@ String _seriesKeyForEpisode(EpisodeItem episode) {
       : normalizeSeriesKey(episode.seriesName);
 }
 
-List<RemoteSearchCandidate> _upcomingCandidates(
-  Iterable<RemoteSearchCandidate> candidates,
-) {
-  final upcoming = candidates
-      .where((candidate) => _candidateScheduleChipLabel(candidate).isNotEmpty)
-      .toList();
-  upcoming.sort((left, right) {
-    final leftDate = _candidateNextAirDate(left);
-    final rightDate = _candidateNextAirDate(right);
-    if (leftDate == null && rightDate == null) {
-      return left.title.toLowerCase().compareTo(right.title.toLowerCase());
-    }
-    if (leftDate == null) {
-      return 1;
-    }
-    if (rightDate == null) {
-      return -1;
-    }
-    final dateCompare = leftDate.compareTo(rightDate);
-    if (dateCompare != 0) {
-      return dateCompare;
-    }
-    return left.title.toLowerCase().compareTo(right.title.toLowerCase());
-  });
-  return upcoming.take(20).toList(growable: false);
-}
-
-List<RemoteSearchCandidate> _seasonShelfCandidates(
-  Iterable<RemoteSearchCandidate> candidates,
-) {
-  return candidates
-      .where((candidate) => _candidateScheduleChipLabel(candidate).isEmpty)
-      .toList(growable: false);
-}
-
 List<RemoteSearchCandidate> _airingShelfCandidates(
   Iterable<RemoteSearchCandidate> candidates,
 ) {
   final byTitle = <String, RemoteSearchCandidate>{};
   for (final candidate in candidates) {
+    if (_candidateNextAirDate(candidate) == null) {
+      continue;
+    }
     final key = _seriesTitleDedupeKey(candidate.title);
     if (key.isEmpty) {
       continue;
@@ -6272,6 +7001,14 @@ List<RemoteSearchCandidate> _airingShelfCandidates(
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
   return ordered;
+}
+
+String _homeCandidateKey(RemoteSearchCandidate candidate) {
+  if (candidate.catalogId > 0) {
+    return 'catalog:${candidate.catalogId}';
+  }
+  final title = _seriesTitleDedupeKey(candidate.title);
+  return '${candidate.provider.name}:$title:${candidate.releaseYear}';
 }
 
 List<RemoteSearchCandidate> _latestMovieCandidates(
@@ -6528,8 +7265,8 @@ String _myAnimeListSettingsStatus(AppController controller) {
   final auth = controller.state.profile.myAnimeListAuth;
   final parts = <String>[
     controller.hasConfiguredMyAnimeListClientId
-        ? 'MyAnimeList configurado para iniciar OAuth.'
-        : 'Falta configurar el Client ID de MyAnimeList.',
+        ? 'MyAnimeList listo para iniciar OAuth.'
+        : 'MyAnimeList no disponible en esta build.',
     if (controller.myAnimeListPendingAuthorization != null)
       'Autorizacion pendiente. Redirect URI: ${MyAnimeListService.redirectUri}',
     if (controller.isSyncingMyAnimeList) 'Sincronizando con MyAnimeList...',
@@ -6549,8 +7286,8 @@ String _simklSettingsStatus(AppController controller) {
   final pending = controller.simklPendingAuthorization;
   final parts = <String>[
     controller.hasConfiguredSimklClientId
-        ? 'SIMKL configurado para PIN.'
-        : 'Falta configurar el Client ID de SIMKL.',
+        ? 'SIMKL listo para iniciar PIN.'
+        : 'SIMKL no disponible en esta build.',
     if (pending != null) ...[
       'Codigo: ${pending.userCode}.',
       'Abre ${pending.verificationUrl}.',
@@ -6578,31 +7315,12 @@ String _formatUnixMs(int value) {
   return '$year-$month-$day $hour:$minute';
 }
 
-String _settingsSummary(AppController controller) {
-  final profile = controller.state.profile;
-  final profileName = profile.name.trim().isEmpty ? 'Perfil' : profile.name;
-  final parts = [
-    'Perfil activo: $profileName',
-    'Series remotas importadas: ${controller.remoteLibrary.length}',
-    'Favoritos guardados: ${profile.favoriteSeries.length}',
-    'Series viendo: ${profile.watchingSeries.length}',
-    'Tarjetas en series: ${controller.state.showSeriesUpcomingCards ? 'activadas' : 'desactivadas'}',
-    'Tarjetas en playlist: ${controller.state.showPlaylistUpcomingCards ? 'activadas' : 'desactivadas'}',
-    'Saltar capitulos mixtos: ${controller.state.skipMixedEpisodes ? 'activado' : 'desactivado'}',
-    'Saltar capitulos de relleno: ${controller.state.skipFillerEpisodes ? 'activado' : 'desactivado'}',
-    'MyAnimeList: ${profile.myAnimeListAuth.isConnected ? 'conectado' : 'sin conectar'}',
-    'SIMKL: ${profile.simklAuth.isConnected ? 'conectado' : 'sin conectar'}',
-    if (controller.storePath.isNotEmpty) 'Estado: ${controller.storePath}',
-  ];
-  return parts.join('\n');
-}
-
 extension _StringBlankFallback on String {
   String ifBlank(String fallback) => trim().isEmpty ? fallback : this;
 }
 
-class _MiniSeriesTile extends StatelessWidget {
-  const _MiniSeriesTile({
+class _PlaylistSeriesPosterCard extends StatelessWidget {
+  const _PlaylistSeriesPosterCard({
     required this.controller,
     required this.series,
     required this.onTap,
@@ -6615,84 +7333,142 @@ class _MiniSeriesTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final watched = controller.watchedCountFor(series);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: _FocusableEpisodeSurface(
-        onTap: onTap,
-        color: const Color(0xFF10151C),
-        elevation: 8,
-        activeElevation: 10,
-        borderRadius: 10,
-        child: SizedBox(
-          height: 76,
-          child: Padding(
-            padding: const EdgeInsets.all(10),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 50,
-                  height: 56,
-                  child: _Poster(imageUrl: series.imageUrl, title: series.name),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        series.name,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: TanukiColors.text,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        '$watched / ${series.episodeCount}',
-                        style: const TextStyle(
-                          color: TanukiColors.muted,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
+    final progress = series.episodeCount <= 0
+        ? 0.0
+        : (watched / series.episodeCount).clamp(0, 1).toDouble();
+    return _FocusablePosterSurface(
+      onTap: onTap,
+      onLongPress: () {
+        unawaited(_confirmRemoveFromPlaylist(context));
+      },
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          _Poster(imageUrl: series.imageUrl, title: series.name),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(8, 7, 8, 8),
+              color: const Color(0xC010161D),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    series.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: TanukiColors.text,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w900,
+                      height: 1.05,
+                    ),
                   ),
-                ),
-                IconButton(
-                  onPressed: () => controller.toggleSeriesSelection(series),
-                  icon: const Icon(Icons.close),
-                  style: IconButton.styleFrom(
-                    fixedSize: const Size(40, 40),
-                    backgroundColor: const Color(0xFF1A2332),
-                    foregroundColor: TanukiColors.text,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8)),
+                  const SizedBox(height: 5),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: LinearProgressIndicator(
+                      minHeight: 4,
+                      value: progress,
+                      backgroundColor: const Color(0xFF243142),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        TanukiColors.orange,
+                      ),
+                    ),
                   ),
-                  tooltip: 'Quitar',
-                ),
-              ],
+                  const SizedBox(height: 4),
+                  Text(
+                    '$watched / ${series.episodeCount}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xFFB1C0CF),
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: IconButton(
+              onPressed: () {
+                unawaited(_confirmRemoveFromPlaylist(context));
+              },
+              onLongPress: () {
+                unawaited(_confirmRemoveFromPlaylist(context));
+              },
+              icon: const Icon(Icons.close, size: 16),
+              tooltip: 'Quitar',
+              style: IconButton.styleFrom(
+                fixedSize: const Size(30, 30),
+                minimumSize: const Size(30, 30),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                padding: EdgeInsets.zero,
+                backgroundColor: const Color(0xD6101822),
+                foregroundColor: TanukiColors.text,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
+  }
+
+  Future<void> _confirmRemoveFromPlaylist(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: TanukiColors.panelSolid,
+          title: const Text('Quitar de la lista'),
+          content: Text(
+            'Quieres sacar "${series.name}" de ${controller.activePlaylist.name}?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Quitar'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed == true && context.mounted) {
+      await controller.toggleSeriesSelection(series);
+    }
   }
 }
 
 class _QueueRow extends StatelessWidget {
   const _QueueRow({
+    required this.controller,
     required this.episode,
     required this.onPlay,
   });
 
+  final AppController controller;
   final EpisodeItem episode;
   final VoidCallback onPlay;
 
   @override
   Widget build(BuildContext context) {
+    final playback = controller.playbackForEpisode(episode);
+    final progress = _playbackProgress(playback);
+    final partialProgress = progress > 0 && progress < 1;
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: _FocusableEpisodeSurface(
@@ -6741,6 +7517,36 @@ class _QueueRow extends StatelessWidget {
                           fontSize: 12,
                         ),
                       ),
+                      if (partialProgress) ...[
+                        const SizedBox(height: 7),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(999),
+                                child: LinearProgressIndicator(
+                                  minHeight: 4,
+                                  value: progress,
+                                  backgroundColor: const Color(0xFF1A2332),
+                                  valueColor:
+                                      const AlwaysStoppedAnimation<Color>(
+                                    TanukiColors.orange,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              '${(progress * 100).round()}%',
+                              style: const TextStyle(
+                                color: TanukiColors.orange,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ],
                   ),
                 ),

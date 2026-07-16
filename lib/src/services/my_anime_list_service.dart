@@ -55,13 +55,22 @@ class MyAnimeListService {
   MyAnimeListPendingAuthorization buildAuthorizationRequest({
     required String clientId,
   }) {
+    return buildAuthorizationRequestWithState(clientId: clientId);
+  }
+
+  MyAnimeListPendingAuthorization buildAuthorizationRequestWithState({
+    required String clientId,
+    String stateOverride = '',
+  }) {
     final normalizedClientId = clientId.trim();
     if (normalizedClientId.isEmpty) {
       throw const MyAnimeListException('Falta el Client ID de MyAnimeList.');
     }
     final request = MyAnimeListPendingAuthorization(
       clientId: normalizedClientId,
-      state: _randomToken(48),
+      state: stateOverride.trim().isEmpty
+          ? _randomToken(48)
+          : stateOverride.trim(),
       codeVerifier: _randomToken(72),
       requestedAtMs: DateTime.now().millisecondsSinceEpoch,
     );

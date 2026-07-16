@@ -28,7 +28,9 @@ class PlaylistEngine {
         break;
       }
       entries.add(next);
-      final nextKey = next.seriesStateKey.isNotEmpty ? next.seriesStateKey : normalizeSeriesKey(next.seriesName);
+      final nextKey = next.seriesStateKey.isNotEmpty
+          ? next.seriesStateKey
+          : normalizeSeriesKey(next.seriesName);
       workingProgress[nextKey] = next.episodeIndex + 1;
       lastSeriesKey = nextKey;
     }
@@ -59,14 +61,25 @@ class PlaylistEngine {
 
     final playbackOrder =
         PlaylistPlaybackOrder.normalize(playlist.playbackOrder);
-    if (playbackOrder == PlaylistPlaybackOrder.series) {
-      final chosenSeries = availableSeries.first;
+    if (playbackOrder == PlaylistPlaybackOrder.tvRandom) {
+      final chosenSeries = _pickRandomRoundSeries(availableSeries, playlist);
       final nextEpisodeIndex = playlist.progress[chosenSeries.stableKey] ?? 0;
       return chosenSeries.episodes
           .skip(nextEpisodeIndex)
           .firstWhereOrNull(includeEpisode);
     }
 
+    final chosenSeries = _pickSerialSeries(availableSeries, playlist);
+    final nextEpisodeIndex = playlist.progress[chosenSeries.stableKey] ?? 0;
+    return chosenSeries.episodes
+        .skip(nextEpisodeIndex)
+        .firstWhereOrNull(includeEpisode);
+  }
+
+  SeriesItem _pickSerialSeries(
+    List<SeriesItem> availableSeries,
+    PlaylistState playlist,
+  ) {
     final startIndex = availableSeries.indexWhere(
       (series) => series.stableKey == playlist.lastPlayedSeriesName,
     );
@@ -76,11 +89,58 @@ class PlaylistEngine {
             ...availableSeries.take(startIndex + 1),
           ]
         : availableSeries;
-    final chosenSeries = ordered.first;
-    final nextEpisodeIndex = playlist.progress[chosenSeries.stableKey] ?? 0;
-    return chosenSeries.episodes
-        .skip(nextEpisodeIndex)
-        .firstWhereOrNull(includeEpisode);
+    return ordered.first;
+  }
+
+  SeriesItem _pickRandomRoundSeries(
+    List<SeriesItem> availableSeries,
+    PlaylistState playlist,
+  ) {
+    final round = availableSeries
+        .map((series) => playlist.progress[series.stableKey] ?? 0)
+        .reduce((left, right) => left < right ? left : right);
+    final roundSeries = availableSeries
+        .where((series) => (playlist.progress[series.stableKey] ?? 0) == round)
+        .toList(growable: false);
+    if (round == 0) {
+      return _pickSerialSeries(roundSeries, playlist);
+    }
+    final ordered = [...roundSeries]..sort((a, b) {
+        final scoreComparison = _roundShuffleScore(
+          playlist: playlist,
+          series: a,
+          round: round,
+        ).compareTo(_roundShuffleScore(
+          playlist: playlist,
+          series: b,
+          round: round,
+        ));
+        if (scoreComparison != 0) {
+          return scoreComparison;
+        }
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
+    final startIndex = ordered.indexWhere(
+      (series) => series.stableKey == playlist.lastPlayedSeriesName,
+    );
+    if (startIndex < 0) {
+      return ordered.first;
+    }
+    return ordered[(startIndex + 1) % ordered.length];
+  }
+
+  int _roundShuffleScore({
+    required PlaylistState playlist,
+    required SeriesItem series,
+    required int round,
+  }) {
+    final source = '${playlist.id}|$round|${series.stableKey}';
+    var hash = 0x811c9dc5;
+    for (final unit in source.codeUnits) {
+      hash ^= unit;
+      hash = (hash * 0x01000193) & 0x7fffffff;
+    }
+    return hash;
   }
 
   Iterable<SeriesItem> _dedupeSeries(

@@ -3,6 +3,7 @@ import 'package:toonami_viernes_noche_flutter/src/app_controller.dart';
 import 'package:toonami_viernes_noche_flutter/src/models.dart';
 import 'package:toonami_viernes_noche_flutter/src/services/app_store.dart';
 import 'package:toonami_viernes_noche_flutter/src/services/my_anime_list_service.dart';
+import 'package:toonami_viernes_noche_flutter/src/services/playlist_engine.dart';
 import 'package:toonami_viernes_noche_flutter/src/services/remote_catalog_service.dart';
 import 'package:toonami_viernes_noche_flutter/src/services/simkl_service.dart';
 
@@ -57,6 +58,50 @@ void main() {
       restored.remoteLibrary.single.trailerUrl,
       'https://www.youtube.com/watch?v=demo123',
     );
+  });
+
+  test('hydrates MAL placeholder episode metadata without replacing poster',
+      () async {
+    const placeholder = SeriesItem(
+      name: 'MAL Demo',
+      seriesStateKey: 'catalog:321',
+      sourceType: SourceType.remote,
+      slug: '321',
+      episodeCount: 1,
+      imageUrl: 'https://mal.test/poster.jpg',
+      releaseYear: 2024,
+      catalogId: 321,
+      episodes: [
+        EpisodeItem(
+          seriesName: 'MAL Demo',
+          seriesStateKey: 'catalog:321',
+          episodeIndex: 0,
+          episodeNumber: 1,
+          displayName: 'MAL Demo - Capitulo 1',
+          relativePath: 'MyAnimeList / Capitulo 1',
+          filePath: '',
+          sourceType: SourceType.remote,
+          imageUrl: 'https://mal.test/poster.jpg',
+        ),
+      ],
+    );
+    final controller = AppController(
+      store: _MemoryAppStore(const AppState(remoteLibrary: [placeholder])),
+      remoteCatalog: _FakeCatalogHydrationService(),
+    );
+    await controller.initialize();
+
+    final refreshed = await controller.refreshRemoteSeriesVisuals(placeholder);
+
+    expect(refreshed.provider, RemoteProvider.catalog);
+    expect(refreshed.imageUrl, 'https://mal.test/poster.jpg');
+    expect(refreshed.backgroundUrl, 'https://tmdb.test/background.jpg');
+    expect(refreshed.episodes.single.displayName, 'El primer episodio');
+    expect(
+        refreshed.episodes.single.imageUrl, 'https://tmdb.test/episode-1.jpg');
+    expect(refreshed.episodes.single.description, 'Resumen del episodio');
+    expect(refreshed.episodes.single.airDateIso, '2024-04-01');
+    expect(refreshed.episodes.single.durationLabel, '24 min');
   });
 
   test('serializes MAL and SIMKL profile state', () {
@@ -289,7 +334,13 @@ void main() {
           simklId: 654,
           malId: 321,
           episodeNumber: 3,
-          progressPercent: 100,
+          progressPercent: 90,
+        ),
+        SimklRemoteEpisodeProgress(
+          simklId: 654,
+          malId: 321,
+          episodeNumber: 4,
+          progressPercent: 97,
         ),
       ],
     );
@@ -311,14 +362,18 @@ void main() {
     final profile = store.state.profile;
     final episodeTwo = profile.episodePlayback['catalog:321|2'];
     final episodeThree = profile.episodePlayback['catalog:321|3'];
+    final episodeFour = profile.episodePlayback['catalog:321|4'];
     expect(episodeTwo?.completed, isFalse);
     expect(episodeTwo?.durationMs, const Duration(minutes: 24).inMilliseconds);
     expect(episodeTwo?.positionMs, const Duration(minutes: 12).inMilliseconds);
-    expect(episodeThree?.completed, isTrue);
-    expect(episodeThree?.positionMs, episodeThree?.durationMs);
+    expect(episodeThree?.completed, isFalse);
+    expect(episodeThree?.positionMs,
+        (const Duration(minutes: 24).inMilliseconds * .9).round());
+    expect(episodeFour?.completed, isTrue);
+    expect(episodeFour?.positionMs, episodeFour?.durationMs);
     expect(
       profile.simklAuth.lastSyncStatus,
-      'SIMKL actualizado: 1 series remotas importadas, 0 cambios locales enviados, 2 progresos de episodios importados.',
+      'SIMKL actualizado: 1 series remotas importadas, 0 cambios locales enviados, 3 progresos de episodios importados.',
     );
   });
 
@@ -439,7 +494,7 @@ void main() {
   });
 
   test(
-    'persists partial progress and completes at the 95 percent threshold',
+    'keeps progress partial below 97 percent and completes at 97 percent',
     () async {
       final store = _MemoryAppStore(
         const AppState(
@@ -480,8 +535,21 @@ void main() {
       );
 
       final record = controller.playbackForEpisode(episode);
-      expect(record?.completed, isTrue);
-      expect(record?.positionMs, const Duration(minutes: 24).inMilliseconds);
+      expect(record?.completed, isFalse);
+      expect(record?.positionMs, const Duration(minutes: 23).inMilliseconds);
+      expect(controller.resumePositionForEpisode(episode),
+          const Duration(minutes: 23));
+      expect(controller.activePlaylist.progress['demo'], isNull);
+
+      final thresholdPosition = Duration(
+        milliseconds: const Duration(minutes: 24).inMilliseconds * 97 ~/ 100,
+      );
+      await controller.saveEpisodePlayback(
+        episode,
+        position: thresholdPosition,
+        duration: const Duration(minutes: 24),
+      );
+
       expect(controller.resumePositionForEpisode(episode), isNull);
       expect(controller.activePlaylist.progress['demo'], 1);
       expect(
@@ -565,6 +633,84 @@ void main() {
     expect(restoredPreference?.facebookMode, 'dub');
     expect(restoredPreference?.facebookOption, 'option-2');
     expect(restoredPreference?.videoScaleMode, 'stretch');
+  });
+
+  test('creates selects and deletes playlists', () async {
+    final store = _MemoryAppStore(AppState.initial());
+    final controller = AppController(store: store);
+    await controller.initialize();
+
+    await controller.createPlaylist(name: 'Temporada');
+
+    expect(controller.state.profile.playlists, hasLength(2));
+    expect(controller.activePlaylist.name, 'Temporada');
+    final createdId = controller.activePlaylist.id;
+
+    await controller.selectPlaylist('default');
+    expect(controller.activePlaylist.id, 'default');
+
+    await controller.deletePlaylist(createdId);
+    expect(controller.state.profile.playlists, hasLength(1));
+    expect(controller.activePlaylist.id, 'default');
+  });
+
+  test('normalizes legacy playlist playback orders', () {
+    expect(
+        PlaylistPlaybackOrder.normalize('tv'), PlaylistPlaybackOrder.tvSerial);
+    expect(PlaylistPlaybackOrder.normalize('series'),
+        PlaylistPlaybackOrder.tvRandom);
+
+    final restored = PlaylistState.fromJson(const {
+      'id': 'default',
+      'name': 'Playlist principal',
+      'playbackOrder': 'series',
+    });
+
+    expect(restored.playbackOrder, PlaylistPlaybackOrder.tvRandom);
+  });
+
+  test('builds TV Serial and TV Random playlist queues', () {
+    final library = [
+      _playlistSeries('alpha', 'Alpha'),
+      _playlistSeries('beta', 'Beta'),
+      _playlistSeries('gamma', 'Gamma'),
+    ];
+    const engine = PlaylistEngine();
+    const selected = {'alpha', 'beta', 'gamma'};
+    const serialPlaylist = PlaylistState(
+      id: 'default',
+      name: 'Playlist principal',
+      selectedSeries: selected,
+      playbackOrder: PlaylistPlaybackOrder.tvSerial,
+    );
+    const randomPlaylist = PlaylistState(
+      id: 'default',
+      name: 'Playlist principal',
+      selectedSeries: selected,
+      playbackOrder: PlaylistPlaybackOrder.tvRandom,
+    );
+
+    final serialEntries = engine.buildNextEntries(
+      playlist: serialPlaylist,
+      library: library,
+      limit: 6,
+    );
+    final randomEntries = engine.buildNextEntries(
+      playlist: randomPlaylist,
+      library: library,
+      limit: 6,
+    );
+
+    expect(
+      serialEntries
+          .map((entry) => '${entry.seriesName} ${entry.episodeNumber}'),
+      ['Alpha 1', 'Beta 1', 'Gamma 1', 'Alpha 2', 'Beta 2', 'Gamma 2'],
+    );
+    expect(
+      randomEntries
+          .map((entry) => '${entry.seriesName} ${entry.episodeNumber}'),
+      ['Alpha 1', 'Beta 1', 'Gamma 1', 'Beta 2', 'Alpha 2', 'Gamma 2'],
+    );
   });
 
   test('normalizes disabled remote providers to automatic preferences',
@@ -1219,6 +1365,70 @@ EpisodeItem _episode() {
     slug: 'demo',
     watchUrl: 'https://jkanime.net/demo/',
   );
+}
+
+SeriesItem _playlistSeries(String key, String name) {
+  return SeriesItem(
+    name: name,
+    seriesStateKey: key,
+    sourceType: SourceType.remote,
+    episodeCount: 3,
+    episodes: List.generate(3, (index) {
+      final episodeNumber = index + 1;
+      return EpisodeItem(
+        seriesName: name,
+        seriesStateKey: key,
+        episodeIndex: index,
+        episodeNumber: episodeNumber,
+        displayName: '$name - Capitulo $episodeNumber',
+        relativePath: '$name / Capitulo $episodeNumber',
+        filePath: 'https://example.test/$key/$episodeNumber',
+        sourceType: SourceType.remote,
+      );
+    }),
+  );
+}
+
+class _FakeCatalogHydrationService extends RemoteCatalogService {
+  @override
+  Future<SeriesItem> buildImportSeries(
+    RemoteSearchCandidate candidate, {
+    required Iterable<String> existingNames,
+  }) async {
+    return SeriesItem(
+      name: candidate.title,
+      seriesStateKey: 'catalog:${candidate.catalogId}',
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.catalog,
+      slug: candidate.slug,
+      watchUrl: candidate.watchUrl,
+      episodeCount: 1,
+      imageUrl: 'https://tmdb.test/poster-that-must-not-win.jpg',
+      backgroundUrl: 'https://tmdb.test/background.jpg',
+      logoUrl: 'https://tmdb.test/logo.png',
+      releaseYear: candidate.releaseYear,
+      catalogId: candidate.catalogId,
+      episodes: const [
+        EpisodeItem(
+          seriesName: 'MAL Demo',
+          seriesStateKey: 'catalog:321',
+          episodeIndex: 0,
+          episodeNumber: 1,
+          displayName: 'El primer episodio',
+          relativePath: 'Episodio 1',
+          filePath: 'https://myanimelist.net/anime/321',
+          sourceType: SourceType.remote,
+          provider: RemoteProvider.catalog,
+          slug: '321',
+          watchUrl: 'https://myanimelist.net/anime/321',
+          imageUrl: 'https://tmdb.test/episode-1.jpg',
+          description: 'Resumen del episodio',
+          airDateIso: '2024-04-01',
+          durationLabel: '24 min',
+        ),
+      ],
+    );
+  }
 }
 
 class _MemoryAppStore extends AppStore {

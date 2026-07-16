@@ -168,7 +168,7 @@ JkAnimeServerPreference jkAnimeServerPreferenceFromId(Object? value) {
     String text when text.contains('magi') => JkAnimeServerPreference.magi,
     String text when text.contains('vidhide') || text.contains('vid hide') =>
       JkAnimeServerPreference.vidhide,
-    _ => JkAnimeServerPreference.desu,
+    _ => JkAnimeServerPreference.magi,
   };
 }
 
@@ -1144,32 +1144,43 @@ class SimklAuthState {
 }
 
 class EpisodePlaybackRecord {
+  static const int completionThresholdPercent = 97;
+
   const EpisodePlaybackRecord({
     this.positionMs = 0,
     this.durationMs = 0,
     this.completed = false,
+    this.remoteProgressPercent = 0,
+    this.updatedAtMs = 0,
   });
 
   final int positionMs;
   final int durationMs;
   final bool completed;
+  final double remoteProgressPercent;
+  final int updatedAtMs;
 
   factory EpisodePlaybackRecord.normalized({
     int positionMs = 0,
     int durationMs = 0,
     bool completed = false,
+    double remoteProgressPercent = 0,
+    int updatedAtMs = 0,
   }) {
     final normalizedDuration = durationMs < 0 ? 0 : durationMs;
     final rawPosition = positionMs < 0 ? 0 : positionMs;
     final isCompleted = completed ||
         (normalizedDuration > 0 &&
-            rawPosition >= (normalizedDuration * 95) ~/ 100);
+            rawPosition * 100 >=
+                normalizedDuration * completionThresholdPercent);
     return EpisodePlaybackRecord(
       positionMs: isCompleted && normalizedDuration > 0
           ? normalizedDuration
           : rawPosition,
       durationMs: normalizedDuration,
       completed: isCompleted,
+      remoteProgressPercent: remoteProgressPercent.clamp(0, 100).toDouble(),
+      updatedAtMs: updatedAtMs < 0 ? 0 : updatedAtMs,
     );
   }
 
@@ -1178,6 +1189,9 @@ class EpisodePlaybackRecord {
       positionMs: _readInt(json['positionMs']),
       durationMs: _readInt(json['durationMs']),
       completed: _readBool(json['completed']),
+      remoteProgressPercent:
+          double.tryParse('${json['remoteProgressPercent'] ?? 0}') ?? 0,
+      updatedAtMs: _readInt(json['updatedAtMs']),
     );
   }
 
@@ -1186,6 +1200,8 @@ class EpisodePlaybackRecord {
       'positionMs': positionMs,
       'durationMs': durationMs,
       'completed': completed,
+      'remoteProgressPercent': remoteProgressPercent,
+      'updatedAtMs': updatedAtMs,
     };
   }
 }
@@ -1317,13 +1333,20 @@ List<SeriesEpisodeMetadata> _readEpisodeMetadataList(Object? value) {
 class PlaylistPlaybackOrder {
   const PlaylistPlaybackOrder._();
 
-  static const tv = 'tv';
-  static const series = 'series';
+  static const tvSerial = 'tv_serial';
+  static const tvRandom = 'tv_random';
+  static const tv = tvSerial;
+  static const series = tvRandom;
 
   static String normalize(Object? value) {
     return switch ('$value'.trim().toLowerCase()) {
-      'series' => series,
-      _ => tv,
+      'series' ||
+      'tv_random' ||
+      'tv-random' ||
+      'tvrandom' ||
+      'random' =>
+        tvRandom,
+      _ => tvSerial,
     };
   }
 }

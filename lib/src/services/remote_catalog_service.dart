@@ -5718,7 +5718,9 @@ $airingScheduleFields
 
     return _copyCandidate(
       candidate,
-      imageUrl: _firstNonEmpty([visuals.imageUrl, candidate.imageUrl]),
+      // La caratula pertenece al catalogo de anime (Jikan/AniList o la
+      // fuente original). TMDB solo complementa artes horizontales y logos.
+      imageUrl: candidate.imageUrl,
       backgroundUrl:
           _firstNonEmpty([visuals.backgroundUrl, candidate.backgroundUrl]),
       logoUrl: _firstNonEmpty([visuals.logoUrl, candidate.logoUrl]),
@@ -6149,7 +6151,8 @@ $airingScheduleFields
       RemoteSearchCandidate candidate) async {
     try {
       return await _fetchTmdbVisuals(candidate);
-    } catch (_) {
+    } catch (error) {
+      _debugResolver('tmdb visuals failed: $error');
       return null;
     }
   }
@@ -6271,14 +6274,18 @@ $airingScheduleFields
   }
 
   int _explicitSeasonNumberForCandidate(RemoteSearchCandidate candidate) {
-    final text = _normalizeMatchText([
+    final seasonTexts = [
       candidate.title,
       candidate.japaneseTitle,
       ...candidate.aliases,
       candidate.format,
       candidate.watchUrl,
       candidate.seriesUrl,
-    ].join(' '));
+    ]
+        .map(_normalizeMatchText)
+        .where((entry) => entry.isNotEmpty)
+        .toList(growable: false);
+    final text = seasonTexts.join(' ');
     final patterns = [
       RegExp(r'(?:season|temporada|temp)\s*([0-9]{1,2})'),
       RegExp(r'\b([0-9]{1,2})(?:st|nd|rd|th)\s+season\b'),
@@ -6301,6 +6308,12 @@ $airingScheduleFields
     for (final entry in japaneseSeasonWords.entries) {
       if (text.contains(entry.key)) {
         return entry.value;
+      }
+    }
+    for (final entry in seasonTexts) {
+      final romanSeason = _romanSeasonSuffixNumber(entry);
+      if (romanSeason > 1) {
+        return romanSeason;
       }
     }
     return 0;
@@ -6574,17 +6587,24 @@ $airingScheduleFields
   }
 
   bool _candidateHasSeasonQualifier(RemoteSearchCandidate candidate) {
-    final text = _normalizeMatchText([
+    final seasonTexts = [
       candidate.title,
       candidate.japaneseTitle,
       ...candidate.aliases,
       candidate.format,
       candidate.watchUrl,
       candidate.seriesUrl,
-    ].join(' '));
+    ]
+        .map(_normalizeMatchText)
+        .where((entry) => entry.isNotEmpty)
+        .toList(growable: false);
+    final text = seasonTexts.join(' ');
     if (text.contains('season') ||
         text.contains('temporada') ||
         text.contains('part')) {
+      return true;
+    }
+    if (seasonTexts.any((entry) => _romanSeasonSuffixNumber(entry) > 1)) {
       return true;
     }
     return const [
@@ -6612,6 +6632,10 @@ $airingScheduleFields
       final baseSeasonTitle = _stripSeasonQualifier(cleaned);
       if (baseSeasonTitle.isNotEmpty) {
         queries.add(baseSeasonTitle);
+      }
+      final romanBaseSeasonTitle = _stripRomanSeasonSuffix(cleaned);
+      if (romanBaseSeasonTitle.isNotEmpty) {
+        queries.add(romanBaseSeasonTitle);
       }
     }
     return queries.toList();
@@ -6654,12 +6678,53 @@ $airingScheduleFields
           RegExp(r'\bpart\s*[0-9]{1,2}\b', caseSensitive: false),
           ' ',
         )
+        .replaceAll(
+          RegExp(r'\b(?:ii|iii|iv|v|vi|vii|viii|ix|x)\b\s*$',
+              caseSensitive: false),
+          ' ',
+        )
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
     if (normalized == value.trim()) {
       return '';
     }
     return normalized;
+  }
+
+  int _romanSeasonSuffixNumber(String normalizedText) {
+    final match = RegExp(r'\b(ii|iii|iv|v|vi|vii|viii|ix|x)\b$')
+        .firstMatch(normalizedText.trim().toLowerCase());
+    if (match == null) {
+      return 0;
+    }
+    return switch (match.group(1)) {
+      'ii' => 2,
+      'iii' => 3,
+      'iv' => 4,
+      'v' => 5,
+      'vi' => 6,
+      'vii' => 7,
+      'viii' => 8,
+      'ix' => 9,
+      'x' => 10,
+      _ => 0,
+    };
+  }
+
+  String _stripRomanSeasonSuffix(String value) {
+    final parts = value
+        .trim()
+        .split(RegExp(r'[^A-Za-z0-9]+'))
+        .where((entry) => entry.trim().isNotEmpty)
+        .toList(growable: false);
+    if (parts.length < 2) {
+      return '';
+    }
+    final season = _romanSeasonSuffixNumber(parts.last);
+    if (season <= 1) {
+      return '';
+    }
+    return parts.take(parts.length - 1).join(' ');
   }
 
   int _scoreTmdbMatch({
@@ -7745,6 +7810,9 @@ $airingScheduleFields
   }
 
   String _buildRemoteEpisodePageUrl(EpisodeItem entry) {
+    if (entry.provider == RemoteProvider.jkAnime) {
+      return _buildJkAnimeRemoteEpisodePageUrl(entry);
+    }
     final currentPath = entry.filePath.trim();
     if (currentPath.isNotEmpty) {
       return currentPath;
@@ -7764,6 +7832,47 @@ $airingScheduleFields
       RemoteProvider.facebook => entry.watchUrl,
       _ => entry.watchUrl,
     };
+  }
+
+  String _buildJkAnimeRemoteEpisodePageUrl(EpisodeItem entry) {
+    final currentPath = entry.filePath.trim();
+    if (_isJkAnimeEpisodePageUrl(currentPath)) {
+      return currentPath;
+    }
+    final episodeNumber = entry.episodeNumber < 1 ? 1 : entry.episodeNumber;
+    final movie = currentPath.toLowerCase().contains('/pelicula/') ||
+        entry.relativePath.toLowerCase().contains('pelicula');
+    final slug = [
+      _extractJkAnimeSlugFromUrlOrSlug(entry.slug),
+      _extractJkAnimeSlugFromUrlOrSlug(currentPath),
+      _extractJkAnimeSlugFromUrlOrSlug(entry.watchUrl),
+    ].map((value) => value.trim()).firstWhere(
+          (value) => value.isNotEmpty,
+          orElse: () => '',
+        );
+    if (slug.isNotEmpty) {
+      return _buildJkAnimeEpisodeUrl(slug, episodeNumber, movie: movie);
+    }
+    if (currentPath.isNotEmpty) {
+      return currentPath;
+    }
+    return entry.watchUrl.trim();
+  }
+
+  bool _isJkAnimeEpisodePageUrl(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null || !uri.hasScheme || !uri.host.contains('jkanime.net')) {
+      return false;
+    }
+    final segments = uri.pathSegments
+        .map((segment) => segment.trim())
+        .where((segment) => segment.isNotEmpty)
+        .toList();
+    if (segments.length < 2) {
+      return false;
+    }
+    final last = segments.last.toLowerCase();
+    return last == 'pelicula' || int.tryParse(last) != null;
   }
 
   String _findBestDirectMediaUrl(
@@ -8269,8 +8378,8 @@ $airingScheduleFields
 
   int _jkAnimeHostCandidateScoreBonus(String value) {
     return switch (_normalizeServerPreference(value)) {
-      'desu' => 1000,
-      'magi' => 940,
+      'magi' => 1000,
+      'desu' => 940,
       'streamwish' => 860,
       'mp4upload' => 800,
       'vidhide' => 720,
@@ -9365,9 +9474,9 @@ $airingScheduleFields
     final lower = value.toLowerCase();
     var score = 0;
     if (lower.contains('jkanime.net/jkplayer/umv')) {
-      score += 620;
-    } else if (lower.contains('jkanime.net/jkplayer/um')) {
       score += 760;
+    } else if (lower.contains('jkanime.net/jkplayer/um')) {
+      score += 620;
     }
     if (lower.contains('jkanime.net/jkplayer/jk')) {
       score += 560;
@@ -9395,8 +9504,10 @@ $airingScheduleFields
         lower.contains('megacloud')) {
       score += 360;
     }
-    if (lower.contains('desu')) {
+    if (lower.contains('magi')) {
       score += 360;
+    } else if (lower.contains('desu')) {
+      score += 320;
     }
     if (lower.contains('filemoon')) {
       score += 340;
@@ -10225,6 +10336,23 @@ $airingScheduleFields
         .replaceFirst('https://jkanime.net/', '')
         .replaceFirst('http://jkanime.net/', '');
     return source.split('/').first.trim();
+  }
+
+  String _extractJkAnimeSlugFromUrlOrSlug(String value) {
+    final source = value.trim();
+    if (source.isEmpty) {
+      return '';
+    }
+    final uri = Uri.tryParse(source);
+    if (uri != null && uri.hasScheme) {
+      if (!uri.host.contains('jkanime.net')) {
+        return '';
+      }
+      return uri.pathSegments
+          .map((segment) => segment.trim())
+          .firstWhere((segment) => segment.isNotEmpty, orElse: () => '');
+    }
+    return _extractJkAnimeSlug(source);
   }
 
   String _buildJkAnimeEpisodeUrl(

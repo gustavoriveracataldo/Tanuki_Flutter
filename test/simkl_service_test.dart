@@ -17,6 +17,7 @@ void main() {
             request.url.path == '/sync/all-items/anime/' ||
             request.url.path == '/sync/add-to-list' ||
             request.url.path == '/sync/history' ||
+            request.url.path == '/sync/playback/episodes' ||
             request.url.path == '/scrobble/start') {
           expect(request.headers['simkl-api-key'], 'client');
         }
@@ -71,31 +72,21 @@ void main() {
               200,
               request: request,
             ),
-          'GET /sync/history' => http.Response(
-              jsonEncode({
-                'shows': [
-                  {
+          'GET /sync/playback/episodes' => http.Response(
+              jsonEncode([
+                {
+                  'id': 12345,
+                  'progress': 42.5,
+                  'paused_at': '2026-07-15T12:30:00Z',
+                  'type': 'episode',
+                  'episode': {'season': 1, 'number': 4},
+                  'anime': {
                     'title': 'Remote Demo',
                     'year': 2024,
                     'ids': {'simkl': 654, 'mal': 321},
-                    'seasons': [
-                      {
-                        'number': 1,
-                        'episodes': [
-                          {'number': 4, 'progress': 42.5},
-                          {'number': 5, 'progress': 0},
-                        ],
-                      },
-                      {
-                        'number': 2,
-                        'episodes': [
-                          {'number': 1, 'progress': 50},
-                        ],
-                      },
-                    ],
                   },
-                ],
-              }),
+                },
+              ]),
               200,
               request: request,
             ),
@@ -180,17 +171,9 @@ void main() {
       postedBodies['/sync/history']['shows'].single['episodes'].last['number'],
       3,
     );
-    expect(
-      postedBodies['/scrobble/start']['shows'].single['ids']['simkl'],
-      654,
-    );
-    expect(
-      postedBodies['/scrobble/start']['shows']
-          .single['seasons']
-          .single['episodes']
-          .single['number'],
-      4,
-    );
+    expect(postedBodies['/scrobble/start']['anime']['ids']['simkl'], 654);
+    expect(postedBodies['/scrobble/start']['anime']['ids']['mal'], 321);
+    expect(postedBodies['/scrobble/start']['episode']['number'], 4);
     expect(postedBodies['/scrobble/start']['progress'], 42.5);
     expect(
       requests,

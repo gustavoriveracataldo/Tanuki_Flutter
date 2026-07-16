@@ -166,48 +166,43 @@ class SimklService {
     required String clientId,
   }) async {
     final response = await _get(
-      '/sync/history',
+      '/sync/playback/episodes',
       clientId: clientId,
       accessToken: accessToken,
     );
-    final json = _decodeJsonObject(response.body);
     if (!_isOk(response)) {
-      throw SimklException(_extractApiError(json, response.statusCode));
+      throw SimklException(
+        _extractApiError(_decodeJsonObject(response.body), response.statusCode),
+      );
     }
     final progress = <SimklRemoteEpisodeProgress>[];
-    for (final rawShow in _readList(json['shows']).whereType<Map>()) {
-      final show = Map<String, dynamic>.from(rawShow);
+    for (final rawPlayback in _decodeJsonList(response.body).whereType<Map>()) {
+      final playback = Map<String, dynamic>.from(rawPlayback);
+      final show = _readMap(playback['anime']).isNotEmpty
+          ? _readMap(playback['anime'])
+          : _readMap(playback['show']);
+      final episode = _readMap(playback['episode']);
       final ids = _readMap(show['ids']);
       final simklId = _readInt(ids['simkl']);
       final malId = _readInt(ids['mal']);
       final title = _readString(show['title']);
       final year = _readInt(show['year']);
-      for (final rawSeason in _readList(show['seasons']).whereType<Map>()) {
-        final season = Map<String, dynamic>.from(rawSeason);
-        if (_readInt(season['number']) != 1) {
-          continue;
-        }
-        for (final rawEpisode in _readList(
-          season['episodes'],
-        ).whereType<Map>()) {
-          final episode = Map<String, dynamic>.from(rawEpisode);
-          final episodeNumber = _readInt(episode['number']);
-          final progressPercent = _readDouble(episode['progress']);
-          if (episodeNumber <= 0 || progressPercent <= 0) {
-            continue;
-          }
-          progress.add(
-            SimklRemoteEpisodeProgress(
-              simklId: simklId,
-              malId: malId,
-              title: title,
-              year: year,
-              episodeNumber: episodeNumber,
-              progressPercent: progressPercent.clamp(0, 100).toDouble(),
-            ),
-          );
-        }
+      final episodeNumber = _readInt(episode['number']);
+      final progressPercent = _readDouble(playback['progress']);
+      if (episodeNumber <= 0 || progressPercent <= 0) {
+        continue;
       }
+      progress.add(
+        SimklRemoteEpisodeProgress(
+          simklId: simklId,
+          malId: malId,
+          title: title,
+          year: year,
+          episodeNumber: episodeNumber,
+          progressPercent: progressPercent.clamp(0, 100).toDouble(),
+          updatedAtMs: _readDateTimeMs(playback['paused_at']),
+        ),
+      );
     }
     return progress;
   }
@@ -274,19 +269,12 @@ class SimklService {
       clientId: clientId,
       accessToken: accessToken,
       body: {
-        'shows': [
-          {
-            'ids': itemPayload,
-            'seasons': [
-              {
-                'number': 1,
-                'episodes': [
-                  {'number': update.episodeNumber},
-                ],
-              },
-            ],
-          },
-        ],
+        'anime': {
+          'ids': itemPayload,
+          if (update.title.trim().isNotEmpty) 'title': update.title.trim(),
+          if (update.year > 0) 'year': update.year,
+        },
+        'episode': {'season': 1, 'number': update.episodeNumber},
         'progress': update.progressPercent.clamp(0, 100).toDouble(),
       },
     );
@@ -413,7 +401,7 @@ class SimklService {
   }) {
     return _client
         .get(
-          _uri(path, query),
+          _uri(path, _requestQuery(query, clientId)),
           headers: _headers(clientId: clientId, accessToken: accessToken),
         )
         .timeout(const Duration(seconds: 20));
@@ -427,7 +415,7 @@ class SimklService {
   }) {
     return _client
         .post(
-          _uri(path),
+          _uri(path, _requestQuery(const {}, clientId)),
           headers: {
             ..._headers(clientId: clientId, accessToken: accessToken),
             'Content-Type': 'application/json',
@@ -473,6 +461,28 @@ class SimklService {
     } catch (_) {
       return const {};
     }
+  }
+
+  List<dynamic> _decodeJsonList(String payload) {
+    try {
+      final decoded = jsonDecode(payload);
+      return decoded is List ? decoded : const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Map<String, String> _requestQuery(
+    Map<String, String> query,
+    String clientId,
+  ) {
+    final normalizedClientId = clientId.trim();
+    return {
+      ...query,
+      if (normalizedClientId.isNotEmpty) 'client_id': normalizedClientId,
+      'app-name': 'tanuki',
+      'app-version': '1.0.0',
+    };
   }
 
   String _extractApiError(Map<String, dynamic> json, int statusCode) {
@@ -588,6 +598,7 @@ class SimklRemoteEpisodeProgress {
     this.year = 0,
     required this.episodeNumber,
     required this.progressPercent,
+    this.updatedAtMs = 0,
   });
 
   final int simklId;
@@ -596,6 +607,7 @@ class SimklRemoteEpisodeProgress {
   final int year;
   final int episodeNumber;
   final double progressPercent;
+  final int updatedAtMs;
 }
 
 class SimklLocalAnimeUpdate {
@@ -700,4 +712,9 @@ double _readDouble(Object? value, {double fallback = 0}) {
     return value.toDouble();
   }
   return double.tryParse('$value') ?? fallback;
+}
+
+int _readDateTimeMs(Object? value) {
+  final parsed = DateTime.tryParse('${value ?? ''}'.trim());
+  return parsed?.millisecondsSinceEpoch ?? 0;
 }

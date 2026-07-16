@@ -1,7 +1,7 @@
 name: toonami_viernes_noche_flutter
 description: Port Flutter de Toonami Viernes Noche para Android, Windows y Linux.
 publish_to: "none"
-version: 1.0.0+1403
+version: 1.5.0+1500
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -17,6 +17,7 @@ dependencies:
   media_kit_libs_video: ^1.0.7
   media_kit_video: ^2.0.1
   path_provider: ^2.1.5
+  qr_flutter: ^4.1.0
   url_launcher: ^6.3.1
   video_player: ^2.11.1
   wakelock_plus: ^1.5.2

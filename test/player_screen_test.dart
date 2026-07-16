@@ -230,6 +230,39 @@ Solo en la oscuridad, la luz.
     );
   });
 
+  test('retries missing audio only after remote video is visible', () {
+    expect(
+      shouldRetryMissingAudioTrack(
+        isRemote: true,
+        hasVideoFrame: true,
+        audioTrackCount: 0,
+        attempt: 10,
+        maxAttempts: 10,
+      ),
+      isTrue,
+    );
+    expect(
+      shouldRetryMissingAudioTrack(
+        isRemote: true,
+        hasVideoFrame: false,
+        audioTrackCount: 0,
+        attempt: 10,
+        maxAttempts: 10,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldRetryMissingAudioTrack(
+        isRemote: true,
+        hasVideoFrame: true,
+        audioTrackCount: 1,
+        attempt: 10,
+        maxAttempts: 10,
+      ),
+      isFalse,
+    );
+  });
+
   test('recovers remote opening when resumed stream never advances', () {
     expect(
       shouldRecoverRemoteOpeningStall(
@@ -262,20 +295,6 @@ Solo en la oscuridad, la luz.
     expect(
       androidHardwareDecoderCodecs(disableAv1: false).split(','),
       contains('av1'),
-    );
-  });
-
-  test('ignores remote completion caused by a jump to the end', () {
-    final now = DateTime(2026, 7, 10);
-    expect(
-      shouldIgnoreRemoteCompletionAfterJump(
-        isRemote: true,
-        jumpAt: now.subtract(const Duration(seconds: 1)),
-        positionBeforeJump: const Duration(seconds: 10),
-        duration: const Duration(minutes: 24),
-        now: now,
-      ),
-      isTrue,
     );
   });
 

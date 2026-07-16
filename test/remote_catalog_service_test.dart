@@ -1114,7 +1114,7 @@ void main() {
     expect(calls.any((url) => url.contains('/3/search/tv')), isTrue);
     expect(calls.any((url) => url.contains('/v3/tv/1234')), isTrue);
     expect(series.logoUrl, 'https://image.tmdb.org/t/p/original/logo.png');
-    expect(series.imageUrl, 'https://fanart.test/season.jpg');
+    expect(series.imageUrl, 'https://jikan.test/poster.jpg');
     expect(
         series.backgroundUrl, 'https://image.tmdb.org/t/p/w1280/backdrop.jpg');
     expect(series.description, 'Descripcion TMDB');
@@ -1127,6 +1127,135 @@ void main() {
         'https://image.tmdb.org/t/p/w780/still.jpg');
     expect(series.episodes.single.durationLabel, '24 min');
     expect(series.episodes.single.airDateIso, '2024-04-05');
+  });
+
+  test('uses trailing roman numeral sequel title as TMDB season number',
+      () async {
+    final requestedTmdbPaths = <String>[];
+    final service = RemoteCatalogService(
+      tmdbApiKey: 'tmdb-key',
+      client: MockClient((request) async {
+        if (request.url.host != 'api.themoviedb.org') {
+          return http.Response('', 404, request: request);
+        }
+        requestedTmdbPaths.add(request.url.toString());
+        expect(request.url.queryParameters['api_key'], 'tmdb-key');
+        return switch (request.url.path) {
+          '/3/search/tv' => http.Response.bytes(
+              utf8.encode(jsonEncode({
+                'results': request.url.queryParameters.containsKey(
+                          'first_air_date_year',
+                        ) ||
+                        request.url.queryParameters.containsKey('year')
+                    ? []
+                    : [
+                        {
+                          'id': 69346,
+                          'name': 'Saga of Tanya the Evil',
+                          'original_name': '幼女戦記',
+                          'first_air_date': '2017-01-06',
+                          'poster_path': '/series-poster.jpg',
+                          'backdrop_path': '/series-backdrop.jpg',
+                        }
+                      ],
+              })),
+              200,
+              headers: {'content-type': 'application/json; charset=utf-8'},
+              request: request,
+            ),
+          '/3/tv/69346/keywords' => http.Response(
+              jsonEncode({
+                'results': [
+                  {'name': 'anime'}
+                ],
+              }),
+              200,
+              request: request,
+            ),
+          '/3/tv/69346' => http.Response.bytes(
+              utf8.encode(jsonEncode({
+                'id': 69346,
+                'name': 'Saga of Tanya the Evil',
+                'original_name': '幼女戦記',
+                'first_air_date': '2017-01-06',
+                'overview': 'TMDB detail',
+                'poster_path': '/series-poster.jpg',
+                'backdrop_path': '/series-backdrop.jpg',
+                'external_ids': {'tvdb_id': 0},
+                'seasons': [
+                  {
+                    'season_number': 1,
+                    'episode_count': 12,
+                    'air_date': '2017-01-06',
+                  },
+                  {
+                    'season_number': 2,
+                    'episode_count': 12,
+                    'air_date': '2026-07-08',
+                  },
+                ],
+              })),
+              200,
+              headers: {'content-type': 'application/json; charset=utf-8'},
+              request: request,
+            ),
+          '/3/tv/69346/images' ||
+          '/3/tv/69346/season/2/images' =>
+            http.Response('{"logos":[],"posters":[]}', 200, request: request),
+          '/3/tv/69346/season/2' => http.Response(
+              jsonEncode({
+                'episodes': [
+                  {
+                    'episode_number': 1,
+                    'name': 'Salamander Combat Team',
+                    'overview': 'Episode 1 detail',
+                    'still_path': '/youjo-s2e1.jpg',
+                    'runtime': 24,
+                    'air_date': '2026-07-08',
+                  },
+                  {
+                    'episode_number': 2,
+                    'name': 'Episodio 2',
+                    'still_path': '/youjo-s2e2.jpg',
+                    'runtime': 24,
+                    'air_date': '2026-07-15',
+                  },
+                ],
+              }),
+              200,
+              request: request,
+            ),
+          _ => http.Response('{"results":[]}', 200, request: request),
+        };
+      }),
+    );
+
+    final series = await service.buildImportSeries(
+      const RemoteSearchCandidate(
+        provider: RemoteProvider.catalog,
+        slug: '49233',
+        title: 'Youjo Senki II',
+        watchUrl: 'https://myanimelist.net/anime/49233/Youjo_Senki_II',
+        imageUrl: 'https://jikan.test/youjo.jpg',
+        episodeCount: 12,
+        format: 'TV',
+        releaseYear: 2026,
+        catalogId: 0,
+        aliases: ['Saga of Tanya the Evil II'],
+      ),
+      existingNames: const [],
+    );
+
+    expect(
+      requestedTmdbPaths.any((url) => url.contains('/3/tv/69346/season/2')),
+      isTrue,
+      reason: requestedTmdbPaths.join('\n'),
+    );
+    expect(series.episodes.first.displayName, 'Salamander Combat Team');
+    expect(series.episodes.first.imageUrl,
+        'https://image.tmdb.org/t/p/w780/youjo-s2e1.jpg');
+    expect(series.episodes[1].imageUrl,
+        'https://image.tmdb.org/t/p/w780/youjo-s2e2.jpg');
   });
 
   test('aligns split-cour catalog episodes to TMDB season episodes by air date',
@@ -1736,6 +1865,144 @@ void main() {
     expect(stream?.playbackKind, 'mp4');
     expect(stream?.playbackUrl, 'https://cdn.example.test/demo/video.mp4');
     expect(stream?.availableServers, contains('mp4upload'));
+  });
+
+  test('normalizes JKAnime series page to episode page before resolving',
+      () async {
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        return switch (request.url.toString()) {
+          'https://jkanime.net/demo/1/' => http.Response(
+              '''
+              <html><script>
+                var servers = [{
+                  "remote":"aHR0cHM6Ly93d3cubXA0dXBsb2FkLmNvbS9lbWJlZC1kZW1vLmh0bWw=",
+                  "server":"Mp4upload"
+                }];
+              </script></html>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://www.mp4upload.com/embed-demo.html' => http.Response(
+              '''
+              <script>
+                player.src({ src: "https://cdn.example.test/demo/video.mp4" });
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(_episode(
+      provider: RemoteProvider.jkAnime,
+      filePath: 'https://jkanime.net/demo/',
+      watchUrl: 'https://jkanime.net/demo/',
+      slug: 'demo',
+    ));
+
+    expect(requestedUrls.first, 'https://jkanime.net/demo/1/');
+    expect(requestedUrls, isNot(contains('https://jkanime.net/demo/')));
+    expect(stream?.playbackKind, 'mp4');
+    expect(stream?.playbackUrl, 'https://cdn.example.test/demo/video.mp4');
+  });
+
+  test('keeps JKAnime movie page when resolving peliculas', () async {
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        return switch (request.url.toString()) {
+          'https://jkanime.net/demo-movie/pelicula/' => http.Response(
+              '''
+              <html><script>
+                var servers = [{
+                  "remote":"aHR0cHM6Ly93d3cubXA0dXBsb2FkLmNvbS9lbWJlZC1tb3ZpZS5odG1s",
+                  "server":"Mp4upload"
+                }];
+              </script></html>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://www.mp4upload.com/embed-movie.html' => http.Response(
+              '''
+              <script>
+                player.src({ src: "https://cdn.example.test/demo/movie.mp4" });
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(_episode(
+      provider: RemoteProvider.jkAnime,
+      filePath: 'https://jkanime.net/demo-movie/pelicula/',
+      watchUrl: 'https://jkanime.net/demo-movie/',
+      slug: 'demo-movie',
+    ));
+
+    expect(requestedUrls.first, 'https://jkanime.net/demo-movie/pelicula/');
+    expect(requestedUrls, isNot(contains('https://jkanime.net/demo-movie/1/')));
+    expect(stream?.playbackKind, 'mp4');
+    expect(stream?.playbackUrl, 'https://cdn.example.test/demo/movie.mp4');
+  });
+
+  test('normalizes JKAnime movie series page to pelicula page before resolving',
+      () async {
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        return switch (request.url.toString()) {
+          'https://jkanime.net/demo-movie/pelicula/' => http.Response(
+              '''
+              <html><script>
+                var servers = [{
+                  "remote":"aHR0cHM6Ly93d3cubXA0dXBsb2FkLmNvbS9lbWJlZC1tb3ZpZS5odG1s",
+                  "server":"Mp4upload"
+                }];
+              </script></html>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://www.mp4upload.com/embed-movie.html' => http.Response(
+              '''
+              <script>
+                player.src({ src: "https://cdn.example.test/demo/movie.mp4" });
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(_episode(
+      provider: RemoteProvider.jkAnime,
+      filePath: 'https://jkanime.net/demo-movie/',
+      watchUrl: 'https://jkanime.net/demo-movie/',
+      slug: 'demo-movie',
+      relativePath: 'JKAnime / Pelicula',
+    ));
+
+    expect(requestedUrls.first, 'https://jkanime.net/demo-movie/pelicula/');
+    expect(requestedUrls, isNot(contains('https://jkanime.net/demo-movie/1/')));
+    expect(stream?.playbackKind, 'mp4');
+    expect(stream?.playbackUrl, 'https://cdn.example.test/demo/movie.mp4');
   });
 
   test('resolves JKAnime window.servers payload through a host page', () async {
@@ -2674,6 +2941,61 @@ void main() {
     expect(stream?.playbackKind, 'mp4');
     expect(stream?.playbackUrl, 'https://cdn.example.test/demo/mp4upload.mp4');
     expect(stream?.server, 'mp4upload');
+  });
+
+  test('uses Magi before Desu in JKAnime automatic host order', () async {
+    final desuUrl =
+        base64Encode(utf8.encode('https://generic-player.test/embed/desu'));
+    final magiUrl =
+        base64Encode(utf8.encode('https://generic-player.test/embed/magi'));
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        return switch (request.url.toString()) {
+          'https://jkanime.net/demo/1/' => http.Response(
+              '''
+              <html><script>
+                var servers = [
+                  {"remote":"$desuUrl","server":"Desu"},
+                  {"remote":"$magiUrl","server":"Magi"}
+                ];
+              </script></html>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://generic-player.test/embed/desu' => http.Response(
+              '''
+              <script>file: "https://cdn.example.test/demo/desu.m3u8"</script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://generic-player.test/embed/magi' => http.Response(
+              '''
+              <script>file: "https://cdn.example.test/demo/magi.m3u8"</script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(_episode(
+      provider: RemoteProvider.jkAnime,
+      filePath: 'https://jkanime.net/demo/1/',
+      watchUrl: 'https://jkanime.net/demo/',
+      slug: 'demo',
+    ));
+
+    expect(stream?.playbackKind, 'hls');
+    expect(stream?.playbackUrl, 'https://cdn.example.test/demo/magi.m3u8');
+    expect(stream?.server, 'magi');
+    expect(requestedUrls,
+        isNot(contains('https://generic-player.test/embed/desu')));
   });
 
   test('prefers JKAnime var servers over native iframe like Android', () async {
@@ -4323,6 +4645,7 @@ EpisodeItem _episode({
   required String watchUrl,
   required String slug,
   int episodeNumber = 1,
+  String? relativePath,
 }) {
   return EpisodeItem(
     seriesName: 'Demo',
@@ -4330,7 +4653,7 @@ EpisodeItem _episode({
     episodeIndex: episodeNumber - 1,
     episodeNumber: episodeNumber,
     displayName: 'Demo - Capitulo $episodeNumber',
-    relativePath: 'Demo / Capitulo $episodeNumber',
+    relativePath: relativePath ?? 'Demo / Capitulo $episodeNumber',
     filePath: filePath,
     sourceType: SourceType.remote,
     provider: provider,

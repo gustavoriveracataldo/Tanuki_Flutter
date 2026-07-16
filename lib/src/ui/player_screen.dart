@@ -30,6 +30,10 @@ const _playerOverlayAutoHideDelay = Duration(seconds: 5);
 const _remoteSeekJumpThreshold = Duration(seconds: 45);
 const _remoteSeekStallDelay = Duration(seconds: 11);
 const _remoteOpeningRecoveryMaxAttempts = 1;
+const _desktopVlcAudioRecoveryMaxAttempts = 10;
+const _mediaKitMaxVolume = 100.0;
+const _normalizedMaxVolume = 1.0;
+const _youtubeMaxVolume = 100;
 int _nextDesktopVlcPlayerId = 1;
 const _androidHardwareDecoderCodecs = 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1';
 const _androidHardwareDecoderCodecsWithoutAv1 =
@@ -38,6 +42,7 @@ const _androidHardwareDecoderCodecsWithoutAv1 =
 enum PlayerLaunchMode {
   normal,
   detail,
+  playlist,
   continueWatching,
 }
 
@@ -45,6 +50,18 @@ enum _UpcomingCardPhase {
   none,
   next,
   later,
+}
+
+class _ContinueWatchingCandidate {
+  const _ContinueWatchingCandidate({
+    required this.series,
+    required this.episode,
+    required this.progress,
+  });
+
+  final SeriesItem series;
+  final EpisodeItem episode;
+  final double progress;
 }
 
 class PlayerScreen extends StatefulWidget {
@@ -87,8 +104,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _completionCommitted = false;
   bool _androidExoCompletionHandled = false;
   bool _desktopVlcCompletionHandled = false;
+  bool _desktopVlcIsPlaying = false;
+  bool _desktopVlcAudioFallbackHandled = false;
   bool _handlingAndroidExoError = false;
   bool _simklScrobbleActive = false;
+  bool _remoteResumeRefined = false;
   bool _subtitlesEnabled = true;
   bool _handlingPlaybackError = false;
   bool _playerOverlaysVisible = true;
@@ -126,8 +146,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
   RemoteProvider? _serverFallbackProvider;
   DateTime _lastPlaybackSave = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastPositionChangeAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime? _lastLargePositionJumpAt;
-  Duration _positionBeforeLastLargeJump = Duration.zero;
   Duration _lastPosition = Duration.zero;
   Duration _lastDuration = Duration.zero;
   int _lastPositionDebugBucket = -1;
@@ -135,7 +153,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   DateTime _lastAndroidExoRebuild = DateTime.fromMillisecondsSinceEpoch(0);
   final Map<String, DateTime> _nativeLogLastPrintedAt = <String, DateTime>{};
   double _lastSimklScrobbleProgress = -1;
-  Timer? _simklScrobbleTimer;
+  Timer? _simklPauseDebounceTimer;
   Timer? _remoteVideoFrameWatchdogTimer;
   Timer? _remoteOpeningRecoveryTimer;
   Timer? _deferredAnimeAv1PlaybackErrorTimer;
@@ -189,6 +207,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         !_usesDesktopVlcPlayer &&
         PlaybackBackend.mediaKitAvailable) {
       _player = Player();
+      unawaited(_player!.setVolume(_mediaKitMaxVolume));
       _videoController = VideoController(
         _player!,
         configuration: VideoControllerConfiguration(
@@ -208,9 +227,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void dispose() {
     _desktopSubtitleLoadTicket += 1;
-    unawaited(_pauseSimklScrobble());
-    _schedulePlaybackPersistAfterDispose();
-    _simklScrobbleTimer?.cancel();
+    _schedulePlaybackFinalizationAfterDispose();
+    _simklPauseDebounceTimer?.cancel();
     _playerOverlayHideTimer?.cancel();
     _animeAv1SeekRecoveryTimer?.cancel();
     _youtubeWebStateTimer?.cancel();
@@ -301,7 +319,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  void _schedulePlaybackPersistAfterDispose() {
+  void _schedulePlaybackFinalizationAfterDispose() {
     final position = _lastPosition;
     final duration = _lastDuration;
     if (position <= Duration.zero && duration <= Duration.zero) {
@@ -309,14 +327,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     final controller = widget.controller;
     final episode = widget.episode;
-    Timer.run(() {
-      unawaited(
-        controller.saveEpisodePlayback(
-          episode,
-          position: position,
-          duration: duration,
-        ),
+    Timer.run(() async {
+      await controller.saveEpisodePlayback(
+        episode,
+        position: position,
+        duration: duration,
       );
+      if (duration > Duration.zero) {
+        final completed = _meetsPlaybackCompletionThreshold(position, duration);
+        await controller.sendSimklScrobble(
+          episode,
+          position: completed ? duration : position,
+          duration: duration,
+          action: completed ? 'stop' : 'pause',
+        );
+      }
     });
   }
 
@@ -422,6 +447,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _lastDesktopSubtitleCueIndex = -2;
     _openedNativeYoutubePlayer = false;
     _remotePlaybackAccepted = false;
+    _desktopVlcIsPlaying = false;
+    _desktopVlcAudioFallbackHandled = false;
     _remoteOpeningRecoveryAttempts = 0;
     _playerOverlaysVisible = true;
     _lastPosition = Duration.zero;
@@ -429,7 +456,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _lastPositionChangeAt = DateTime.now();
     _lastPositionDebugBucket = -1;
     _lastBufferDebugBucket = -1;
-    if (path.isEmpty) {
+    if (path.isEmpty && !widget.episode.isRemote) {
       setState(() {
         _error = 'El episodio no tiene una ruta reproducible.';
         _status = 'Sin ruta';
@@ -576,6 +603,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     try {
       await videoController.platform.future;
       await _configurePlatformPlayback(player);
+      await player.setVolume(_mediaKitMaxVolume);
       _attachPlaybackTracking(player);
       final resumePosition =
           widget.controller.resumePositionForEpisode(widget.episode);
@@ -693,6 +721,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
       final resumePosition =
           widget.controller.resumePositionForEpisode(widget.episode);
+      await controller.setVolume(_normalizedMaxVolume);
       await controller.seekTo(resumePosition ?? Duration.zero);
       _lastPosition = resumePosition ?? Duration.zero;
       _lastDuration = controller.value.duration;
@@ -770,7 +799,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _activeDesktopVlcPlayers.add(player);
     _desktopVlcSourcePath = path;
     player.setUserAgent(headers['User-Agent'] ?? _remotePlaybackUserAgent);
-    player.setVolume(1.0);
+    player.setVolume(_normalizedMaxVolume);
     _desktopVlcPositionSubscription = player.positionStream.listen((state) {
       if (_desktopVlcPlayer != player) {
         return;
@@ -778,11 +807,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       final previous = _lastPosition;
       _lastPosition = state.position ?? Duration.zero;
       _lastDuration = state.duration ?? Duration.zero;
+      _maybeRefineRemoteResume(_lastDuration);
       _logDesktopSubtitleCueAtPosition();
       if (_lastPosition != previous) {
         _lastPositionChangeAt = DateTime.now();
         _remotePlaybackAccepted = true;
       }
+      _maybeRetryDesktopVlcMissingVideoFrame(player, _lastPosition);
       if (_lastDuration > Duration.zero || _lastPosition > Duration.zero) {
         _setPlayerBuffering(false);
       }
@@ -795,6 +826,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _desktopVlcPlaybackSubscription = player.playbackStream.listen((state) {
       if (_desktopVlcPlayer != player) {
         return;
+      }
+      _desktopVlcIsPlaying = state.isPlaying;
+      _syncSimklPlaybackState(state.isPlaying);
+      if (state.isPlaying) {
+        _maybeRetryDesktopVlcMissingVideoFrame(player, _lastPosition);
       }
       if (state.isCompleted && !_desktopVlcCompletionHandled) {
         if (!_shouldAcceptPlaybackCompletion()) {
@@ -837,6 +873,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _remoteVideoWidth = dimensions.width;
       _remoteVideoHeight = dimensions.height;
       if (dimensions.width > 0 && dimensions.height > 0) {
+        if (_shouldWatchAnimeAv1VideoFrame()) {
+          _markRemoteVideoFrameReady();
+        }
         _setPlayerBuffering(false);
       }
       setState(() {});
@@ -897,7 +936,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(Future<void>.delayed(const Duration(milliseconds: 700), () {
       if (!mounted || _desktopVlcPlayer != player) return;
       try {
-        player.setVolume(1.0);
+        player.setVolume(_normalizedMaxVolume);
         final trackCount = player.audioTrackCount;
         _debugPlayerEvent(
           'VLC audio recovery attempt=$attempt tracks=$trackCount',
@@ -907,16 +946,49 @@ class _PlayerScreenState extends State<PlayerScreen> {
           _debugPlayerEvent('VLC audio recovery selected track=1');
           return;
         }
+        if (shouldRetryMissingAudioTrack(
+          isRemote: widget.episode.isRemote,
+          hasVideoFrame:
+              (_remoteVideoWidth ?? 0) > 0 && (_remoteVideoHeight ?? 0) > 0,
+          audioTrackCount: trackCount,
+          attempt: attempt,
+          maxAttempts: _desktopVlcAudioRecoveryMaxAttempts,
+        )) {
+          _retryDesktopVlcMissingAudioTrack();
+          return;
+        }
       } catch (error) {
         _debugPlayerEvent('VLC audio recovery ignored error: $error');
       }
       // HLS often exposes its AAC elementary stream only after VLC has parsed
       // the first transport-stream segments. Keep trying instead of treating
       // the initial zero as a stream without audio.
-      if (attempt < 10) {
+      if (attempt < _desktopVlcAudioRecoveryMaxAttempts) {
         _scheduleDesktopVlcAudioRecovery(player, attempt + 1);
       }
     }));
+  }
+
+  void _retryDesktopVlcMissingAudioTrack() {
+    if (_desktopVlcAudioFallbackHandled) {
+      return;
+    }
+    final provider =
+        _currentResolvedStream?.provider ?? widget.episode.provider;
+    if (provider == null || !_supportsRemoteServerFallback(provider)) {
+      return;
+    }
+    _desktopVlcAudioFallbackHandled = true;
+    _debugPlayerEvent(
+      'desktop VLC missing audio fallback '
+      'provider=${provider.id} server=${_currentResolvedStream?.server ?? ''}',
+    );
+    unawaited(
+      _retryRemoteServerFallback(
+        provider,
+        'VLC no detecto pista de audio',
+      ),
+    );
   }
 
   Duration _desktopVlcUrlStartPosition(
@@ -992,6 +1064,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _currentResolvedStream?.provider == RemoteProvider.bilibili;
     final retiredSourcePath = _desktopVlcSourcePath;
     _desktopVlcSourcePath = '';
+    _desktopVlcIsPlaying = false;
     final playbackUri = Uri.tryParse(retiredSourcePath);
     final wasLoopbackProxy = playbackUri != null &&
         (playbackUri.host == '127.0.0.1' || playbackUri.host == 'localhost');
@@ -1037,9 +1110,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _scheduleRetiredVlcDispose(vlc.Player player) {
     unawaited(Future<void>.delayed(const Duration(seconds: 3), () {
-      if (_activeDesktopVlcPlayers.isNotEmpty || _disposingRetiredVlc) {
+      if (_activeDesktopVlcPlayers.isNotEmpty ||
+          _disposingRetiredVlc ||
+          _remoteReloadInProgress) {
         _debugPlayerEvent(
-          'VLC deferred native dispose waiting for active player',
+          'VLC deferred native dispose waiting '
+          'active=${_activeDesktopVlcPlayers.length} '
+          'disposing=$_disposingRetiredVlc reload=$_remoteReloadInProgress',
         );
         _scheduleRetiredVlcDispose(player);
         return;
@@ -1219,7 +1296,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _youtubeWebEnded = true;
       _youtubeWebPlaying = false;
       _setPlayerBuffering(false);
-      if (!_completionCommitted) {
+      if (!_completionCommitted && _shouldAcceptPlaybackCompletion()) {
         unawaited(_commitPlaybackCompletion());
         if (mounted) {
           unawaited(_playNext());
@@ -1244,6 +1321,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _youtubeWebEnded = state == 'ended';
     _lastPosition = _youtubeWebPosition;
     _lastDuration = _youtubeWebDuration;
+    _syncSimklPlaybackState(_youtubeWebPlaying);
     if (_youtubeWebPosition != previous) {
       _lastPositionChangeAt = DateTime.now();
     }
@@ -1379,9 +1457,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
     _setPlayerBuffering(value.isBuffering);
+    _syncSimklPlaybackState(value.isPlaying);
     final previous = _lastPosition;
     _lastPosition = value.position;
     _lastDuration = value.duration;
+    _maybeRefineRemoteResume(value.duration);
     if (value.position != previous) {
       _lastPositionChangeAt = DateTime.now();
       _remotePlaybackAccepted = true;
@@ -1458,6 +1538,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _androidExoCompletionHandled = false;
     unawaited(_persistPlayback(force: true));
     _showPlayerOverlays();
+  }
+
+  void _maybeRefineRemoteResume(Duration duration) {
+    if (_remoteResumeRefined || duration <= Duration.zero) {
+      return;
+    }
+    final target = widget.controller.refinedRemoteResumePositionForEpisode(
+      widget.episode,
+      duration,
+    );
+    if (target == null) {
+      return;
+    }
+    _remoteResumeRefined = true;
+    if ((target - _lastPosition).abs() < const Duration(seconds: 8)) {
+      return;
+    }
+    _debugPlayerEvent(
+      'refining SIMKL resume to ${_formatPlaybackTime(target)} '
+      'using actual duration ${_formatPlaybackTime(duration)}',
+    );
+    if (_usesDesktopVlcPlayer) {
+      unawaited(_seekDesktopVlcPlayer(target));
+    } else if (_usesAndroidExoPlayer) {
+      unawaited(_seekAndroidExoPlayer(target));
+    } else if (_youtubeWebController != null) {
+      unawaited(_seekYoutubeWebPlayer(target));
+    } else if (_player != null) {
+      unawaited(_seekPrecisely(_player!, target));
+    }
   }
 
   bool _shouldAcceptPlaybackCompletion() {
@@ -1762,6 +1872,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _playingSubscription = player.stream.playing.listen((playing) {
       _debugPlayerEvent('playing=$playing ${_debugPlayerState(player)}');
+      _syncSimklPlaybackState(playing);
       if (playing) {
         _armRemoteVideoFrameWatchdog(player);
       } else {
@@ -1775,6 +1886,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (player.state.playing) {
       _armRemoteVideoFrameWatchdog(player);
     }
+  }
+
+  void _maybeRetryDesktopVlcMissingVideoFrame(
+    vlc.Player player,
+    Duration position,
+  ) {
+    if (!mounted ||
+        _desktopVlcPlayer != player ||
+        _remoteVideoFrameFallbackHandled ||
+        !_shouldWatchAnimeAv1VideoFrame()) {
+      return;
+    }
+    if (!shouldRetryMissingVideoFrame(
+      isPlaying: _desktopVlcIsPlaying,
+      isBuffering: _playerBuffering,
+      position: position,
+      width: _remoteVideoWidth,
+      height: _remoteVideoHeight,
+    )) {
+      return;
+    }
+    _debugPlayerEvent(
+      'desktop VLC missing video fallback position='
+      '${_formatPlaybackTime(position)} ${_remoteVideoWidth ?? 0}x'
+      '${_remoteVideoHeight ?? 0}',
+    );
+    _remoteVideoFrameFallbackHandled = true;
+    unawaited(_retryRemoteFallback('AnimeAV1 reprodujo audio pero no video'));
   }
 
   void _armRemoteVideoFrameWatchdog(Player player) {
@@ -2093,8 +2232,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
           previous > Duration.zero &&
           position > const Duration(seconds: 3) &&
           _durationDistance(previous, position) >= _remoteSeekJumpThreshold) {
-        _lastLargePositionJumpAt = DateTime.now();
-        _positionBeforeLastLargeJump = previous;
         _debugPlayerEvent(
           'position jump ${_formatPlaybackTime(previous)} -> '
           '${_formatPlaybackTime(position)}',
@@ -2106,6 +2243,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _durationSubscription = player.stream.duration.listen((duration) {
       _lastDuration = duration;
+      _maybeRefineRemoteResume(duration);
       _debugPlayerEvent(
         'duration=${_formatPlaybackTime(duration)} ${_debugPlayerState(player)}',
       );
@@ -2124,16 +2262,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
             '${_formatPlaybackTime(_lastDuration)} expected='
             '${_formatPlaybackTime(_expectedRemoteDuration)}',
           );
-          return;
-        }
-        if (shouldIgnoreRemoteCompletionAfterJump(
-          isRemote: widget.episode.isRemote,
-          jumpAt: _lastLargePositionJumpAt,
-          positionBeforeJump: _positionBeforeLastLargeJump,
-          duration: _lastDuration,
-          now: DateTime.now(),
-        )) {
-          _debugPlayerEvent('ignored completion after anomalous position jump');
           return;
         }
         unawaited(_commitPlaybackCompletion());
@@ -2237,6 +2365,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (_completionCommitted) {
       return;
     }
+    _simklPauseDebounceTimer?.cancel();
     _completionCommitted = true;
     await _persistPlayback(force: true, completed: true);
     await _stopSimklScrobble();
@@ -2244,14 +2373,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _startSimklScrobble() {
     if (_simklScrobbleActive) {
+      if (_lastSimklScrobbleProgress < 0 && _lastDuration > Duration.zero) {
+        unawaited(_sendSimklScrobble('start', force: true));
+      }
       return;
     }
     _simklScrobbleActive = true;
     _lastSimklScrobbleProgress = -1;
     unawaited(_sendSimklScrobble('start', force: true));
-    _simklScrobbleTimer?.cancel();
-    _simklScrobbleTimer = Timer.periodic(const Duration(seconds: 20), (_) {
-      unawaited(_sendSimklScrobble('start'));
+  }
+
+  void _syncSimklPlaybackState(bool playing) {
+    _simklPauseDebounceTimer?.cancel();
+    _simklPauseDebounceTimer = null;
+    if (playing) {
+      _startSimklScrobble();
+      return;
+    }
+    if (!_simklScrobbleActive || _completionCommitted) {
+      return;
+    }
+    _simklPauseDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+      _simklPauseDebounceTimer = null;
+      if (mounted && !_completionCommitted) {
+        unawaited(_pauseSimklScrobble());
+      }
     });
   }
 
@@ -2259,9 +2405,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!_simklScrobbleActive) {
       return;
     }
-    _simklScrobbleTimer?.cancel();
-    _simklScrobbleTimer = null;
-    await _sendSimklScrobble('pause', force: true);
+    final completed =
+        _meetsPlaybackCompletionThreshold(_lastPosition, _lastDuration);
+    await _sendSimklScrobble(
+      completed ? 'stop' : 'pause',
+      force: true,
+      completed: completed,
+    );
     _simklScrobbleActive = false;
   }
 
@@ -2269,8 +2419,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!_simklScrobbleActive) {
       return;
     }
-    _simklScrobbleTimer?.cancel();
-    _simklScrobbleTimer = null;
     await _sendSimklScrobble('stop', force: true, completed: true);
     _simklScrobbleActive = false;
   }
@@ -2291,13 +2439,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!force && (progress - _lastSimklScrobbleProgress).abs() < 1) {
       return;
     }
-    _lastSimklScrobbleProgress = progress;
-    await widget.controller.sendSimklScrobble(
+    final sent = await widget.controller.sendSimklScrobble(
       widget.episode,
       position: completed ? _lastDuration : _lastPosition,
       duration: _lastDuration,
       action: action,
     );
+    if (sent) {
+      _lastSimklScrobbleProgress = progress;
+    }
+  }
+
+  bool _meetsPlaybackCompletionThreshold(
+    Duration position,
+    Duration duration,
+  ) {
+    if (duration <= Duration.zero) {
+      return false;
+    }
+    return position.inMilliseconds * 100 >=
+        duration.inMilliseconds *
+            EpisodePlaybackRecord.completionThresholdPercent;
   }
 
   String _formatPlaybackTime(Duration duration) {
@@ -2465,8 +2627,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _scheduleOpeningUpcomingCards() {
     if (_startUpcomingCardsShown ||
-        !widget.controller.state.showPlaylistUpcomingCards ||
-        _nextEntriesAfterCurrent().isEmpty) {
+        !_upcomingCardsEnabled ||
+        _upcomingEntriesAfterCurrent().isEmpty) {
       return;
     }
     final ticket = _upcomingCardTicket;
@@ -2476,8 +2638,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (!mounted ||
           ticket != _upcomingCardTicket ||
           _startUpcomingCardsShown ||
-          !widget.controller.state.showPlaylistUpcomingCards ||
-          _nextEntriesAfterCurrent().isEmpty) {
+          !_upcomingCardsEnabled ||
+          _upcomingEntriesAfterCurrent().isEmpty) {
         return;
       }
       _startUpcomingCardsShown = true;
@@ -2486,13 +2648,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _maybeScheduleUpcomingCards(Duration position) {
-    if (!widget.controller.state.showPlaylistUpcomingCards ||
+    if (!_upcomingCardsEnabled ||
         position < Duration.zero ||
         _upcomingCardPhase != _UpcomingCardPhase.none ||
         _upcomingCardSequenceTimer != null) {
       return;
     }
-    if (_nextEntriesAfterCurrent().isEmpty) {
+    if (_upcomingEntriesAfterCurrent().isEmpty) {
       return;
     }
     if (!_endUpcomingCardsShown &&
@@ -2514,7 +2676,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (!mounted || ticket != _upcomingCardTicket) {
         return;
       }
-      if (_nextEntriesAfterCurrent().length < 2) {
+      if (_upcomingEntriesAfterCurrent().length < 2) {
         _upcomingCardSequenceTimer = null;
         _setUpcomingCardPhase(_UpcomingCardPhase.none);
         return;
@@ -2552,12 +2714,177 @@ class _PlayerScreenState extends State<PlayerScreen> {
     };
   }
 
-  List<EpisodeItem> _nextEntriesAfterCurrent() {
+  bool get _upcomingCardsEnabled {
+    return widget.launchMode == PlayerLaunchMode.playlist
+        ? widget.controller.state.showPlaylistUpcomingCards
+        : widget.controller.state.showSeriesUpcomingCards;
+  }
+
+  List<EpisodeItem> _upcomingEntriesAfterCurrent() {
+    return switch (widget.launchMode) {
+      PlayerLaunchMode.playlist => _playlistEntriesAfterCurrent(limit: 2),
+      PlayerLaunchMode.continueWatching =>
+        _continueWatchingEntriesAfterCurrent(limit: 2),
+      _ => _seriesEntriesAfterCurrent(limit: 2),
+    };
+  }
+
+  List<EpisodeItem> _playlistEntriesAfterCurrent({required int limit}) {
     return widget.controller
-        .buildNextEntries(limit: 4)
+        .buildNextEntries(limit: limit + 2)
         .where((entry) => !_isSameEpisode(entry, widget.episode))
-        .take(2)
+        .take(limit)
         .toList(growable: false);
+  }
+
+  List<EpisodeItem> _continueWatchingEntriesAfterCurrent({
+    required int limit,
+  }) {
+    final sameSeriesEntries = _seriesEntriesAfterCurrent(limit: limit);
+    if (sameSeriesEntries.isNotEmpty) {
+      return sameSeriesEntries;
+    }
+
+    final currentSeries = widget.controller.findSeriesForEpisode(
+      widget.episode,
+    );
+    final currentKey =
+        currentSeries?.stableKey ?? _seriesKeyFor(widget.episode);
+    final entries = <_ContinueWatchingCandidate>[];
+    final profile = widget.controller.state.profile;
+    for (final series in widget.controller.library) {
+      if (series.stableKey == currentKey) {
+        continue;
+      }
+      if (profile.completedSeries.contains(series.stableKey) ||
+          profile.abandonedSeries.contains(series.stableKey)) {
+        continue;
+      }
+      final watched = widget.controller.watchedCountFor(series);
+      final partialEpisode = _partialPlaybackEpisode(series);
+      final shouldInclude = profile.watchingSeries.contains(series.stableKey) ||
+          partialEpisode != null ||
+          watched > 0;
+      if (!shouldInclude) {
+        continue;
+      }
+      final episode = _continueWatchingEpisodeForSeries(series);
+      if (episode == null) {
+        continue;
+      }
+      final progress = _continueWatchingProgress(series, episode);
+      entries.add(
+        _ContinueWatchingCandidate(
+          series: series,
+          episode: episode,
+          progress: progress,
+        ),
+      );
+    }
+    entries.sort((left, right) {
+      final progressCompare = right.progress.compareTo(left.progress);
+      if (progressCompare != 0) {
+        return progressCompare;
+      }
+      return left.series.name.toLowerCase().compareTo(
+            right.series.name.toLowerCase(),
+          );
+    });
+    return entries
+        .map((entry) => entry.episode)
+        .take(limit)
+        .toList(growable: false);
+  }
+
+  List<EpisodeItem> _seriesEntriesAfterCurrent({required int limit}) {
+    final series = widget.controller.findSeriesForEpisode(widget.episode);
+    if (series == null || series.episodes.isEmpty) {
+      return const [];
+    }
+    final episodes = [...series.episodes]..sort(
+        (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
+      );
+    final currentIndex = episodes.indexWhere(
+      (entry) => _isSameEpisode(entry, widget.episode),
+    );
+    if (currentIndex < 0) {
+      return const [];
+    }
+    return episodes
+        .skip(currentIndex + 1)
+        .where(_canShowUpcomingEpisode)
+        .take(limit)
+        .toList(growable: false);
+  }
+
+  EpisodeItem? _continueWatchingEpisodeForSeries(SeriesItem series) {
+    final partial = _partialPlaybackEpisode(series);
+    if (partial != null) {
+      return partial;
+    }
+    final episodes = [...series.episodes]..sort(
+        (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
+      );
+    if (episodes.isEmpty) {
+      return null;
+    }
+    final watched = widget.controller.watchedCountFor(series);
+    if (watched >= episodes.length) {
+      return null;
+    }
+    for (final episode in episodes.skip(watched)) {
+      if (_canShowUpcomingEpisode(episode)) {
+        return episode;
+      }
+    }
+    return null;
+  }
+
+  EpisodeItem? _partialPlaybackEpisode(SeriesItem series) {
+    final episodes = [...series.episodes]..sort(
+        (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
+      );
+    for (final episode in episodes) {
+      final playback = widget.controller.playbackForEpisode(episode);
+      if (playback != null &&
+          !playback.completed &&
+          playback.positionMs > 1000) {
+        return episode;
+      }
+    }
+    return null;
+  }
+
+  double _continueWatchingProgress(SeriesItem series, EpisodeItem episode) {
+    final playback = widget.controller.playbackForEpisode(episode);
+    if (playback?.completed == true) {
+      return 1;
+    }
+    if (playback != null && playback.durationMs > 0) {
+      return (playback.positionMs / playback.durationMs).clamp(0, 1).toDouble();
+    }
+    final total =
+        series.episodeCount > 0 ? series.episodeCount : series.episodes.length;
+    if (total <= 0) {
+      return playback != null && playback.positionMs > 1000 ? 0.08 : 0;
+    }
+    return (widget.controller.watchedCountFor(series) / total)
+        .clamp(0, 1)
+        .toDouble();
+  }
+
+  bool _canShowUpcomingEpisode(EpisodeItem episode) {
+    if (_episodeAirsInFuture(episode.airDateIso)) {
+      return false;
+    }
+    final tag = episode.episodeTag.trim().toLowerCase();
+    if (widget.controller.state.skipFillerEpisodes && tag == 'filler') {
+      return false;
+    }
+    if (widget.controller.state.skipMixedEpisodes && tag == 'mixed') {
+      return false;
+    }
+    return true;
   }
 
   bool _isSameEpisode(EpisodeItem left, EpisodeItem right) {
@@ -2588,7 +2915,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   Widget build(BuildContext context) {
     final episode = widget.episode;
-    final nextEntries = _nextEntriesAfterCurrent();
+    final nextEntries = _upcomingEntriesAfterCurrent();
     final visibleUpcomingCard = _visibleUpcomingCardEpisode(nextEntries);
     final sourceStatus = _sourceStatus();
     final useDesktopYoutubeWebControls = _openedMedia &&
@@ -2715,21 +3042,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ),
                   ),
                 ),
-              if (widget.controller.state.showPlaylistUpcomingCards &&
-                  visibleUpcomingCard != null)
+              if (_upcomingCardsEnabled)
                 Positioned(
-                  right: 18,
-                  bottom: 24,
+                  right: 46,
+                  bottom: 72,
                   child: IgnorePointer(
                     ignoring: true,
-                    child: AnimatedOpacity(
-                      opacity: 1,
-                      duration: const Duration(milliseconds: 220),
-                      child: _UpcomingCard(
-                        label: _visibleUpcomingCardLabel(),
-                        labelColor: _visibleUpcomingCardColor(),
-                        episode: visibleUpcomingCard,
-                      ),
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 260),
+                      reverseDuration: const Duration(milliseconds: 260),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      child: visibleUpcomingCard == null
+                          ? const SizedBox(
+                              key: ValueKey('upcoming-none'),
+                              width: 300,
+                              height: 170,
+                            )
+                          : KeyedSubtree(
+                              key: ValueKey(
+                                'upcoming-${_upcomingCardPhase.name}-'
+                                '${_seriesKeyFor(visibleUpcomingCard)}-'
+                                '${visibleUpcomingCard.episodeNumber}',
+                              ),
+                              child: _UpcomingCard(
+                                label: _visibleUpcomingCardLabel(),
+                                labelColor: _visibleUpcomingCardColor(),
+                                episode: visibleUpcomingCard,
+                              ),
+                            ),
                     ),
                   ),
                 ),
@@ -3715,7 +4056,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   runSpacing: 8,
                   children: [
                     for (final mode in AnimeAv1PlaybackMode.values)
-                      _PlayerDialogButton(
+                      _PlayerDialogRadioButton(
                         label: mode.dialogLabel,
                         active: animeAv1Mode == mode,
                         onPressed: () => unawaited(
@@ -3732,12 +4073,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
               }
               if (provider == RemoteProvider.jkAnime) {
                 final availableServers = _availableJkAnimeServers();
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
+                return _PlayerDialogScrollableRadioColumn(
                   children: [
                     for (final server in availableServers)
-                      _PlayerDialogButton(
+                      _PlayerDialogRadioButton(
                         label: server.label,
                         active: jkAnimeServer == server,
                         onPressed: () => unawaited(
@@ -3753,12 +4092,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 );
               }
               if (provider == RemoteProvider.latAnime) {
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
+                return _PlayerDialogScrollableRadioColumn(
                   children: [
                     for (final server in LatAnimeServerPreference.values)
-                      _PlayerDialogButton(
+                      _PlayerDialogRadioButton(
                         label: server.label,
                         active: latAnimeServer == server,
                         onPressed: () => unawaited(
@@ -3784,7 +4121,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       runSpacing: 8,
                       children: [
                         for (final mode in JustAnimePlaybackMode.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: mode.buttonLabel,
                             active: justAnimeMode == mode,
                             onPressed: () => unawaited(savePreference(
@@ -3798,12 +4135,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     const SizedBox(height: 12),
                     const _PlayerDialogSectionTitle('Servidor'),
                     const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
+                    _PlayerDialogScrollableRadioColumn(
                       children: [
                         for (final server in JustAnimeServerPreference.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: server.label,
                             active: justAnimeServer == server,
                             onPressed: () => unawaited(savePreference(
@@ -3840,7 +4175,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       runSpacing: 8,
                       children: [
                         for (final mode in AniPmPlaybackMode.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: mode.buttonLabel,
                             active: aniPmMode == mode,
                             onPressed: () => unawaited(savePreference(
@@ -3853,11 +4188,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     const SizedBox(height: 12),
                     const _PlayerDialogSectionTitle('Servidor'),
                     const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
+                    _PlayerDialogScrollableRadioColumn(
                       children: [
-                        _PlayerDialogButton(
+                        _PlayerDialogRadioButton(
                           label: 'Automatico',
                           active: aniPmServer.isEmpty,
                           onPressed: () => unawaited(savePreference(
@@ -3866,7 +4199,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           )),
                         ),
                         for (final server in servers)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: remoteServerLabel(server),
                             active: aniPmServer == server,
                             onPressed: () => unawaited(savePreference(
@@ -3895,7 +4228,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       runSpacing: 8,
                       children: [
                         for (final mode in FacebookPlaybackMode.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: mode.dialogLabel,
                             active: facebookMode == mode,
                             onPressed: () => unawaited(
@@ -3916,7 +4249,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       runSpacing: 8,
                       children: [
                         for (final option in FacebookPlaybackOption.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: option.label,
                             active: facebookOption == option,
                             onPressed: () => unawaited(
@@ -3955,7 +4288,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       runSpacing: 8,
                       children: [
                         for (final mode in YoutubePlaybackMode.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: mode.buttonLabel,
                             active: youtubeMode == mode,
                             onPressed: () => unawaited(
@@ -3976,7 +4309,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       runSpacing: 8,
                       children: [
                         for (final option in YoutubePlaybackOption.values)
-                          _PlayerDialogButton(
+                          _PlayerDialogRadioButton(
                             label: option.label,
                             active: youtubeOption == option,
                             onPressed: () => unawaited(
@@ -4086,34 +4419,78 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       ),
                       const SizedBox(height: 14),
                       if (tab == 0)
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            _PlayerDialogButton(
-                              label: 'Fit',
-                              active: _videoScaleMode == VideoScaleMode.fit,
-                              onPressed: () => unawaited(
-                                _setVideoScaleMode(VideoScaleMode.fit),
-                              ),
+                            const _PlayerDialogSectionTitle('Pantalla'),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                _PlayerDialogRadioButton(
+                                  label: 'Fit',
+                                  active: _videoScaleMode == VideoScaleMode.fit,
+                                  onPressed: () => unawaited(
+                                    _setVideoScaleMode(VideoScaleMode.fit)
+                                        .then((_) {
+                                      if (dialogContext.mounted) {
+                                        setDialogState(() {});
+                                      }
+                                    }),
+                                  ),
+                                ),
+                                _PlayerDialogRadioButton(
+                                  label: 'Stretch',
+                                  active:
+                                      _videoScaleMode == VideoScaleMode.stretch,
+                                  onPressed: () => unawaited(
+                                    _setVideoScaleMode(
+                                      VideoScaleMode.stretch,
+                                    ).then((_) {
+                                      if (dialogContext.mounted) {
+                                        setDialogState(() {});
+                                      }
+                                    }),
+                                  ),
+                                ),
+                              ],
                             ),
-                            _PlayerDialogButton(
-                              label: 'Stretch',
-                              active: _videoScaleMode == VideoScaleMode.stretch,
-                              onPressed: () => unawaited(
-                                _setVideoScaleMode(VideoScaleMode.stretch),
-                              ),
-                            ),
-                            _PlayerDialogButton(
-                              label: 'Sub',
-                              active: _subtitlesEnabled,
-                              onPressed: () {
-                                Navigator.of(dialogContext).pop();
-                                Future<void>.delayed(
-                                  const Duration(milliseconds: 120),
-                                  _showSubtitleTrackDialog,
-                                );
-                              },
+                            const SizedBox(height: 18),
+                            const _PlayerDialogSectionTitle('Subtitulos'),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                _PlayerDialogRadioButton(
+                                  label: 'Desactivados',
+                                  active: !_subtitlesEnabled,
+                                  onPressed: () {
+                                    setState(() {
+                                      _subtitlesEnabled = false;
+                                      _status = 'Subtitulos desactivados';
+                                    });
+                                    unawaited(
+                                      _applyRemoteSubtitleTrackIfReady(),
+                                    );
+                                    setDialogState(() {});
+                                  },
+                                ),
+                                _PlayerDialogRadioButton(
+                                  label: _subtitlesEnabled
+                                      ? 'Activados'
+                                      : 'Activar',
+                                  active: _subtitlesEnabled,
+                                  onPressed: () {
+                                    Navigator.of(dialogContext).pop();
+                                    Future<void>.delayed(
+                                      const Duration(milliseconds: 120),
+                                      _showSubtitleTrackDialog,
+                                    );
+                                  },
+                                ),
+                              ],
                             ),
                           ],
                         )
@@ -4550,13 +4927,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _playNext() async {
-    final replacement = _adjacentEpisode(1);
+    final seriesNext = _seriesEntriesAfterCurrent(limit: 1);
+    final replacement = widget.launchMode == PlayerLaunchMode.playlist ||
+            widget.launchMode == PlayerLaunchMode.detail
+        ? _adjacentEpisode(1)
+        : seriesNext.isEmpty
+            ? null
+            : seriesNext.first;
     if (replacement == null) {
       if (widget.launchMode == PlayerLaunchMode.detail) {
         Navigator.of(context).maybePop();
         return;
       }
-      final entries = widget.controller.buildNextEntries(limit: 1);
+      final entries = widget.launchMode == PlayerLaunchMode.playlist
+          ? _playlistEntriesAfterCurrent(limit: 1)
+          : widget.launchMode == PlayerLaunchMode.continueWatching
+              ? _continueWatchingEntriesAfterCurrent(limit: 1)
+              : const <EpisodeItem>[];
       if (entries.isEmpty) {
         if (widget.launchMode == PlayerLaunchMode.continueWatching) {
           Navigator.of(context).maybePop();
@@ -4900,13 +5287,18 @@ String _youtubeSeriesWebPlayerHtml({
     function playWhenReady() {
       if (!player) return;
       try { player.unMute(); } catch (error) {}
+      try { player.setVolume($_youtubeMaxVolume); } catch (error) {}
       [0, 250, 900, 1800].forEach(function(delay) {
         window.setTimeout(function() {
+          try { player.unMute(); } catch (error) {}
+          try { player.setVolume($_youtubeMaxVolume); } catch (error) {}
           try { player.playVideo(); } catch (error) {}
         }, delay);
       });
     }
     function tanukiPlay() {
+      try { if (player) player.unMute(); } catch (error) {}
+      try { if (player) player.setVolume($_youtubeMaxVolume); } catch (error) {}
       try { if (player) player.playVideo(); } catch (error) {}
       window.setTimeout(tanukiNotifyState, 100);
     }
@@ -4981,6 +5373,8 @@ String _youtubeSeriesWebPlayerHtml({
           onReady: function(event) {
             player = event.target;
             ready = true;
+            try { player.unMute(); } catch (error) {}
+            try { player.setVolume($_youtubeMaxVolume); } catch (error) {}
             try {
               const iframe = player.getIframe();
               if (iframe) {
@@ -5942,6 +6336,106 @@ class _PlayerDialogButton extends StatelessWidget {
   }
 }
 
+class _PlayerDialogRadioButton extends StatelessWidget {
+  const _PlayerDialogRadioButton({
+    required this.label,
+    required this.active,
+    required this.onPressed,
+  });
+
+  final String label;
+  final bool active;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onPressed,
+        child: SizedBox(
+          height: 40,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  active ? Icons.radio_button_checked : Icons.radio_button_off,
+                  size: 17,
+                  color: active ? TanukiColors.orange : TanukiColors.muted,
+                ),
+                const SizedBox(width: 7),
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: active ? TanukiColors.text : const Color(0xFFD8E1EB),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlayerDialogScrollableRadioColumn extends StatefulWidget {
+  const _PlayerDialogScrollableRadioColumn({
+    required this.children,
+  });
+
+  final List<Widget> children;
+
+  @override
+  State<_PlayerDialogScrollableRadioColumn> createState() =>
+      _PlayerDialogScrollableRadioColumnState();
+}
+
+class _PlayerDialogScrollableRadioColumnState
+    extends State<_PlayerDialogScrollableRadioColumn> {
+  final ScrollController _controller = ScrollController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 178),
+      child: Scrollbar(
+        controller: _controller,
+        thumbVisibility: widget.children.length > 4,
+        child: SingleChildScrollView(
+          controller: _controller,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (var index = 0; index < widget.children.length; index += 1)
+                Padding(
+                  padding: EdgeInsets.only(
+                    bottom: index == widget.children.length - 1 ? 0 : 6,
+                  ),
+                  child: widget.children[index],
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _PlayerTopBar extends StatelessWidget {
   const _PlayerTopBar({
     required this.episode,
@@ -6312,22 +6806,6 @@ String androidHardwareDecoderCodecs({required bool disableAv1}) {
       : _androidHardwareDecoderCodecs;
 }
 
-bool shouldIgnoreRemoteCompletionAfterJump({
-  required bool isRemote,
-  required DateTime? jumpAt,
-  required Duration positionBeforeJump,
-  required Duration duration,
-  required DateTime now,
-}) {
-  if (!isRemote || jumpAt == null || duration <= Duration.zero) {
-    return false;
-  }
-  if (now.difference(jumpAt) > const Duration(seconds: 3)) {
-    return false;
-  }
-  return duration - positionBeforeJump > const Duration(seconds: 30);
-}
-
 bool shouldAcceptPlaybackCompletion({
   required bool isRemote,
   required Duration position,
@@ -6359,6 +6837,19 @@ bool shouldRetryMissingVideoFrame({
     return false;
   }
   return position >= _remoteVideoFramePlaybackGrace;
+}
+
+bool shouldRetryMissingAudioTrack({
+  required bool isRemote,
+  required bool hasVideoFrame,
+  required int audioTrackCount,
+  required int attempt,
+  required int maxAttempts,
+}) {
+  if (!isRemote || !hasVideoFrame || audioTrackCount > 0) {
+    return false;
+  }
+  return attempt >= maxAttempts;
 }
 
 bool shouldRecoverRemoteOpeningStall({
@@ -6710,70 +7201,135 @@ class _UpcomingCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 240,
-      padding: const EdgeInsets.all(10),
-      decoration: glassDecoration(color: const Color(0xC0141D28), radius: 8),
-      child: Row(
-        children: [
-          Container(
-            width: 48,
-            height: 64,
-            decoration: BoxDecoration(
-              color: TanukiColors.backgroundAlt,
-              borderRadius: BorderRadius.circular(6),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: episode.imageUrl.isNotEmpty
-                ? _FadeInNetworkImage(
-                    imageUrl: episode.imageUrl,
-                    fit: BoxFit.cover,
-                  )
-                : Image.asset('assets/images/tanuki_brand_icon.png',
-                    fit: BoxFit.cover),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
+    final episodeTitle = episode.displayName.trim();
+    final baseEpisodeLabel = 'Episodio ${episode.episodeNumber}';
+    final episodeLabel =
+        episodeTitle.isEmpty || episodeTitle == baseEpisodeLabel
+            ? baseEpisodeLabel
+            : '$baseEpisodeLabel - $episodeTitle';
+    return SizedBox(
+      width: 300,
+      height: 170,
+      child: DecoratedBox(
+        decoration: glassDecoration(color: const Color(0xD010161D), radius: 8),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (episode.imageUrl.isNotEmpty)
+                _FadeInNetworkImage(
+                  imageUrl: episode.imageUrl,
+                  fit: BoxFit.cover,
+                )
+              else
+                Image.asset(
+                  'assets/images/tanuki_tv_banner.png',
+                  fit: BoxFit.cover,
+                ),
+              const DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0x33000000),
+                      Color(0x10000000),
+                      Color(0xE010161D),
+                    ],
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 10,
+                left: 10,
+                child: Container(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                  color: labelColor.withValues(alpha: 0.22),
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: labelColor.withValues(alpha: 0.24),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: labelColor.withValues(alpha: 0.55),
+                    ),
+                  ),
                   child: Text(
                     label,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                        color: labelColor,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w800),
+                      color: labelColor,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w900,
+                    ),
                   ),
                 ),
-                const SizedBox(height: 7),
-                Text(
-                  episode.seriesName,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.labelLarge,
+              ),
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 34, 12, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        episode.seriesName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: TanukiColors.text,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w900,
+                          shadows: [Shadow(color: Colors.black, blurRadius: 4)],
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        episodeLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xFFCFD9E3),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                          shadows: [Shadow(color: Colors.black, blurRadius: 4)],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 4),
-                Text(
-                  'Episodio ${episode.episodeNumber}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyMedium
-                      ?.copyWith(fontSize: 12),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
+}
+
+String _seriesKeyFor(EpisodeItem episode) {
+  final explicit = episode.seriesStateKey.trim();
+  return explicit.isNotEmpty
+      ? explicit
+      : normalizeSeriesKey(episode.seriesName);
+}
+
+bool _episodeAirsInFuture(String airDateIso) {
+  final normalized = airDateIso.trim();
+  if (normalized.isEmpty) {
+    return false;
+  }
+  final source =
+      normalized.length >= 10 ? normalized.substring(0, 10) : normalized;
+  final parsed = DateTime.tryParse(source);
+  if (parsed == null) {
+    return false;
+  }
+  final airDate = DateTime(parsed.year, parsed.month, parsed.day);
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  return airDate.isAfter(today);
 }
