@@ -102,6 +102,29 @@ VideoScaleMode videoScaleModeFromId(Object? value) {
   };
 }
 
+enum AnimeSkipSegmentType {
+  opening('op', 'Opening'),
+  ending('ed', 'Ending'),
+  mixedOpening('mixed-op', 'Opening mezclado'),
+  mixedEnding('mixed-ed', 'Ending mezclado'),
+  recap('recap', 'Resumen');
+
+  const AnimeSkipSegmentType(this.id, this.label);
+
+  final String id;
+  final String label;
+}
+
+AnimeSkipSegmentType? animeSkipSegmentTypeFromId(Object? value) {
+  final normalized = '$value'.trim().toLowerCase();
+  for (final type in AnimeSkipSegmentType.values) {
+    if (type.id == normalized) {
+      return type;
+    }
+  }
+  return null;
+}
+
 enum AnimeAv1PlaybackMode {
   subHls('sub-hls', 'SUB', 'Hard Sub'),
   dubHls('dub-hls', 'DUB', 'Dub');
@@ -1616,6 +1639,11 @@ class AppState {
     this.showPlaylistUpcomingCards = true,
     this.skipMixedEpisodes = false,
     this.skipFillerEpisodes = false,
+    this.skipOpeningSegments = false,
+    this.skipEndingSegments = false,
+    this.skipMixedOpeningSegments = false,
+    this.skipMixedEndingSegments = false,
+    this.skipRecapSegments = false,
     this.overscanHorizontal = 0,
     this.overscanTop = 0,
     this.fillerCache = const {},
@@ -1634,6 +1662,11 @@ class AppState {
   final bool showPlaylistUpcomingCards;
   final bool skipMixedEpisodes;
   final bool skipFillerEpisodes;
+  final bool skipOpeningSegments;
+  final bool skipEndingSegments;
+  final bool skipMixedOpeningSegments;
+  final bool skipMixedEndingSegments;
+  final bool skipRecapSegments;
   final double overscanHorizontal;
   final double overscanTop;
   final Map<String, FillerMetadataRecord> fillerCache;
@@ -1680,6 +1713,11 @@ class AppState {
           _readBool(json['showPlaylistUpcomingCards'], fallback: true),
       skipMixedEpisodes: _readBool(json['skipMixedEpisodes']),
       skipFillerEpisodes: _readBool(json['skipFillerEpisodes']),
+      skipOpeningSegments: _readBool(json['skipOpeningSegments']),
+      skipEndingSegments: _readBool(json['skipEndingSegments']),
+      skipMixedOpeningSegments: _readBool(json['skipMixedOpeningSegments']),
+      skipMixedEndingSegments: _readBool(json['skipMixedEndingSegments']),
+      skipRecapSegments: _readBool(json['skipRecapSegments']),
       overscanHorizontal: _readDouble(json['overscanHorizontal']),
       overscanTop: _readDouble(json['overscanTop']),
       fillerCache: _readFillerCache(json['fillerCache']),
@@ -1722,6 +1760,11 @@ class AppState {
     bool? showPlaylistUpcomingCards,
     bool? skipMixedEpisodes,
     bool? skipFillerEpisodes,
+    bool? skipOpeningSegments,
+    bool? skipEndingSegments,
+    bool? skipMixedOpeningSegments,
+    bool? skipMixedEndingSegments,
+    bool? skipRecapSegments,
     double? overscanHorizontal,
     double? overscanTop,
     Map<String, FillerMetadataRecord>? fillerCache,
@@ -1751,6 +1794,13 @@ class AppState {
           showPlaylistUpcomingCards ?? this.showPlaylistUpcomingCards,
       skipMixedEpisodes: skipMixedEpisodes ?? this.skipMixedEpisodes,
       skipFillerEpisodes: skipFillerEpisodes ?? this.skipFillerEpisodes,
+      skipOpeningSegments: skipOpeningSegments ?? this.skipOpeningSegments,
+      skipEndingSegments: skipEndingSegments ?? this.skipEndingSegments,
+      skipMixedOpeningSegments:
+          skipMixedOpeningSegments ?? this.skipMixedOpeningSegments,
+      skipMixedEndingSegments:
+          skipMixedEndingSegments ?? this.skipMixedEndingSegments,
+      skipRecapSegments: skipRecapSegments ?? this.skipRecapSegments,
       overscanHorizontal: overscanHorizontal ?? this.overscanHorizontal,
       overscanTop: overscanTop ?? this.overscanTop,
       fillerCache: fillerCache ?? this.fillerCache,
@@ -1778,6 +1828,11 @@ class AppState {
       'showPlaylistUpcomingCards': showPlaylistUpcomingCards,
       'skipMixedEpisodes': skipMixedEpisodes,
       'skipFillerEpisodes': skipFillerEpisodes,
+      'skipOpeningSegments': skipOpeningSegments,
+      'skipEndingSegments': skipEndingSegments,
+      'skipMixedOpeningSegments': skipMixedOpeningSegments,
+      'skipMixedEndingSegments': skipMixedEndingSegments,
+      'skipRecapSegments': skipRecapSegments,
       'overscanHorizontal': overscanHorizontal,
       'overscanTop': overscanTop,
       'fillerCache': fillerCache.map(
@@ -1792,6 +1847,16 @@ class AppState {
       'profiles': profiles.map((profile) => profile.toJson()).toList(),
       'activeProfileId': activeProfileId,
       'defaultProfileId': defaultProfileId,
+    };
+  }
+
+  Set<AnimeSkipSegmentType> get enabledAnimeSkipSegmentTypes {
+    return {
+      if (skipOpeningSegments) AnimeSkipSegmentType.opening,
+      if (skipEndingSegments) AnimeSkipSegmentType.ending,
+      if (skipMixedOpeningSegments) AnimeSkipSegmentType.mixedOpening,
+      if (skipMixedEndingSegments) AnimeSkipSegmentType.mixedEnding,
+      if (skipRecapSegments) AnimeSkipSegmentType.recap,
     };
   }
 }

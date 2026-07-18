@@ -36,6 +36,9 @@ El workflow se ejecuta al subir un tag `v*` o manualmente desde `workflow_dispat
    sh scripts/build_release.sh
    ```
 
+   Android release requiere una firma estable. Si no la configuraste todavia,
+   revisa la seccion `Firma Android` antes de correr este script.
+
    Esto genera:
 
    ```text
@@ -89,9 +92,71 @@ TMDB_API_KEY o TMDB_BEARER_TOKEN
 FANART_API_KEY
 MYANIMELIST_CLIENT_ID
 SIMKL_CLIENT_ID
+TANUKI_ANDROID_KEYSTORE_BASE64
+TANUKI_ANDROID_KEYSTORE_PASSWORD
+TANUKI_ANDROID_KEY_ALIAS
+TANUKI_ANDROID_KEY_PASSWORD
 ```
 
 `MYANIMELIST_CLIENT_SECRET` se pasa si existe, pero no bloquea el workflow.
+
+## Firma Android
+
+La firma Android es gratis. La parte importante es conservar siempre la misma
+keystore para poder instalar futuras versiones encima de la app existente.
+
+Para crear una keystore local:
+
+```sh
+keytool -genkeypair -v \
+  -keystore android/tanuki-release.jks \
+  -keyalg RSA \
+  -keysize 2048 \
+  -validity 10000 \
+  -alias tanuki
+```
+
+Despues crea `android/key.properties`:
+
+```properties
+storeFile=tanuki-release.jks
+storePassword=TU_PASSWORD_DEL_KEYSTORE
+keyAlias=tanuki
+keyPassword=TU_PASSWORD_DE_LA_KEY
+```
+
+`android/key.properties` y los archivos `.jks` estan ignorados por git.
+
+Para GitHub Actions, convierte la keystore a base64:
+
+```sh
+base64 -w0 android/tanuki-release.jks
+```
+
+Configura estos secretos en el repositorio:
+
+```text
+TANUKI_ANDROID_KEYSTORE_BASE64
+TANUKI_ANDROID_KEYSTORE_PASSWORD
+TANUKI_ANDROID_KEY_ALIAS
+TANUKI_ANDROID_KEY_PASSWORD
+```
+
+Tambien puedes compilar usando variables de entorno locales en vez de
+`android/key.properties`:
+
+```sh
+export TANUKI_ANDROID_KEYSTORE_PATH="$PWD/android/tanuki-release.jks"
+export TANUKI_ANDROID_KEYSTORE_PASSWORD="TU_PASSWORD_DEL_KEYSTORE"
+export TANUKI_ANDROID_KEY_ALIAS="tanuki"
+export TANUKI_ANDROID_KEY_PASSWORD="TU_PASSWORD_DE_LA_KEY"
+sh scripts/build_android.sh
+```
+
+Si ya tenias instalada una APK firmada con otra clave, Android va a rechazar la
+actualizacion una vez. Desinstala esa version antigua y luego instala la nueva.
+Desde ahi, mientras uses esta misma keystore, las siguientes versiones se
+actualizan encima normalmente.
 
 ## 4. Ejecutar el release manualmente
 

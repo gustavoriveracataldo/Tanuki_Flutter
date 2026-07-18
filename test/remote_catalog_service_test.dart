@@ -423,6 +423,62 @@ void main() {
     ]);
   });
 
+  test('keeps full movie catalog pages without requiring per-card movie labels',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        if (request.url.host == 'jkanime.net') {
+          final data = List.generate(
+            15,
+            (index) => {
+              'title': 'JK Theatrical Demo ${index + 1}',
+              'image': 'https://cdn.jkdesa.com/movie-${index + 1}.jpg',
+              'slug': 'jk-theatrical-demo-${index + 1}',
+              'type': 'Serie',
+              'tipo': 'Serie',
+              'url': 'https://jkanime.net/jk-theatrical-demo-${index + 1}/',
+            },
+          );
+          return http.Response(
+            '<script>var animes = ${jsonEncode({'data': data})};</script>',
+            200,
+            request: request,
+          );
+        }
+        if (request.url.host == 'animeav1.com') {
+          final html = StringBuffer();
+          for (var index = 1; index <= 15; index += 1) {
+            html.write('''
+            <article class="group/item relative text-body">
+              <img src="https://cdn.animeav1.com/covers/$index.jpg" />
+              <div class="rounded bg-line px-2">TV Anime</div>
+              <h3>AnimeAV1 Theatrical Demo $index</h3>
+              <a href="/media/animeav1-theatrical-demo-$index">Ver</a>
+            </article>
+            ''');
+          }
+          return http.Response('$html', 200, request: request);
+        }
+        return http.Response('not found', 404, request: request);
+      }),
+    );
+
+    final movies = await service.discoverCatalogMovies(limit: 15);
+
+    expect(movies, hasLength(30));
+    expect(
+      movies.where((candidate) => candidate.provider == RemoteProvider.jkAnime),
+      hasLength(15),
+    );
+    expect(
+      movies.where(
+        (candidate) => candidate.provider == RemoteProvider.animeAv1,
+      ),
+      hasLength(15),
+    );
+    expect(movies.every((candidate) => candidate.format == 'Movie'), isTrue);
+  });
+
   test('aggregate search skips disabled AnimeFLV provider', () async {
     final requestedHosts = <String>[];
     final service = RemoteCatalogService(
@@ -3679,6 +3735,61 @@ void main() {
     expect(
       stream?.playbackUrl,
       'https://player.zilla-networks.com/m3u8/b340aa7e8c596a6c376adf1f44d8e2e1',
+    );
+  });
+
+  test('keeps AnimeAV1 episode zero urls when resolving specials', () async {
+    final requestedUrls = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        requestedUrls.add(request.url.toString());
+        return switch (request.url.toString()) {
+          'https://animeav1.com/media/mushoku-tensei-ii-isekai-ittara-honki-dasu/0' =>
+            http.Response(
+              '''
+              <script>
+                data:[{type:"data",data:{episode:{number:0},
+                embeds:{SUB:[{server:"HLS",url:"https://player.zilla-networks.com/play/00000000000000000000000000000000"}]}}}]
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.animeAv1,
+        episodeNumber: 0,
+        filePath:
+            'https://animeav1.com/media/mushoku-tensei-ii-isekai-ittara-honki-dasu/0',
+        watchUrl:
+            'https://animeav1.com/media/mushoku-tensei-ii-isekai-ittara-honki-dasu',
+        slug: 'mushoku-tensei-ii-isekai-ittara-honki-dasu',
+      ),
+    );
+
+    expect(
+      requestedUrls,
+      contains(
+        'https://animeav1.com/media/mushoku-tensei-ii-isekai-ittara-honki-dasu/0',
+      ),
+    );
+    expect(
+      requestedUrls,
+      isNot(
+        contains(
+          'https://animeav1.com/media/mushoku-tensei-ii-isekai-ittara-honki-dasu/1',
+        ),
+      ),
+    );
+    expect(stream?.selectedMode, 'sub-hls');
+    expect(
+      stream?.playbackUrl,
+      'https://player.zilla-networks.com/m3u8/00000000000000000000000000000000',
     );
   });
 

@@ -41,6 +41,35 @@ void main() {
     expect(restored.overscanTop, 20);
   });
 
+  test('serializes AniSkip segment settings disabled by default', () {
+    final initial = AppState.initial();
+
+    expect(initial.enabledAnimeSkipSegmentTypes, isEmpty);
+
+    const state = AppState(
+      skipOpeningSegments: true,
+      skipEndingSegments: true,
+      skipMixedOpeningSegments: true,
+      skipMixedEndingSegments: true,
+      skipRecapSegments: true,
+    );
+
+    final restored = AppState.fromJson(state.toJson());
+
+    expect(restored.skipOpeningSegments, isTrue);
+    expect(restored.skipEndingSegments, isTrue);
+    expect(restored.skipMixedOpeningSegments, isTrue);
+    expect(restored.skipMixedEndingSegments, isTrue);
+    expect(restored.skipRecapSegments, isTrue);
+    expect(restored.enabledAnimeSkipSegmentTypes, {
+      AnimeSkipSegmentType.opening,
+      AnimeSkipSegmentType.ending,
+      AnimeSkipSegmentType.mixedOpening,
+      AnimeSkipSegmentType.mixedEnding,
+      AnimeSkipSegmentType.recap,
+    });
+  });
+
   test('serializes series trailer url', () {
     const state = AppState(
       remoteLibrary: [

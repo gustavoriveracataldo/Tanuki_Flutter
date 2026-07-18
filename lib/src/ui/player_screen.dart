@@ -17,6 +17,7 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 import '../app_controller.dart';
 import '../models.dart';
+import '../services/aniskip_service.dart';
 import '../services/playback_backend.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
@@ -31,6 +32,8 @@ const _remoteSeekJumpThreshold = Duration(seconds: 45);
 const _remoteSeekStallDelay = Duration(seconds: 11);
 const _remoteOpeningRecoveryMaxAttempts = 1;
 const _desktopVlcAudioRecoveryMaxAttempts = 10;
+const _animeSkipPromptLead = Duration(seconds: 1);
+const _animeSkipSeekEndOffset = Duration(milliseconds: 500);
 const _mediaKitMaxVolume = 100.0;
 const _normalizedMaxVolume = 1.0;
 const _youtubeMaxVolume = 100;
@@ -80,7 +83,8 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
+class _PlayerScreenState extends State<PlayerScreen>
+    with WidgetsBindingObserver {
   static final List<vlc.Player> _retiredRemoteVlcPlayers = <vlc.Player>[];
   static final Set<vlc.Player> _activeDesktopVlcPlayers = <vlc.Player>{};
   static bool _disposingRetiredVlc = false;
@@ -115,6 +119,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _playerControlsFocused = false;
   bool _playerBuffering = false;
   bool _playerFullscreen = false;
+  bool _playerVolumeSliderVisible = false;
+  double _playerVolume = 1.0;
   final FocusNode _playerControlsRootFocusNode =
       FocusNode(debugLabel: 'playerControlsRoot');
   final FocusNode _playerBackButtonFocusNode =
@@ -131,12 +137,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
       FocusNode(debugLabel: 'playerSettingsButton');
   final FocusNode _playerEpisodesButtonFocusNode =
       FocusNode(debugLabel: 'playerEpisodesButton');
+  final FocusNode _playerVolumeButtonFocusNode =
+      FocusNode(debugLabel: 'playerVolumeButton');
   final FocusNode _playerFullscreenButtonFocusNode =
       FocusNode(debugLabel: 'playerFullscreenButton');
   final FocusNode _playerBottomPlayFocusNode =
       FocusNode(debugLabel: 'playerBottomPlay');
   final FocusNode _playerBottomProgressFocusNode =
       FocusNode(debugLabel: 'playerBottomProgress');
+  final FocusNode _animeSkipButtonFocusNode =
+      FocusNode(debugLabel: 'animeSkipButton');
   late VideoScaleMode _videoScaleMode;
   RemoteDirectStream? _currentResolvedStream;
   RemoteProvider? _automaticResolvingProvider;
@@ -194,8 +204,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
   int _remoteOpeningRecoveryAttempts = 0;
   int _openEpisodeTicket = 0;
   bool _remoteReloadInProgress = false;
+  bool _loadingAnimeSkipIntervals = false;
+  bool _animeSkipLoadCompleted = false;
+  Duration _animeSkipLoadedDuration = Duration.zero;
   String _deferredAnimeAv1PlaybackError = '';
   String _currentPlaybackPath = '';
+  int _animeSkipLoadTicket = 0;
+  List<AniSkipInterval> _animeSkipIntervals = const [];
+  AniSkipInterval? _activeAnimeSkipInterval;
+  final Set<String> _dismissedAnimeSkipIntervals = <String>{};
+  final Set<String> _usedAnimeSkipIntervals = <String>{};
   _UpcomingCardPhase _upcomingCardPhase = _UpcomingCardPhase.none;
   bool _startUpcomingCardsShown = false;
   bool _endUpcomingCardsShown = false;
@@ -204,6 +222,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_setPlaybackWakelock(enabled: true));
     _videoScaleMode =
         widget.controller.videoScaleModeForEpisode(widget.episode);
@@ -211,7 +230,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         !_usesDesktopVlcPlayer &&
         PlaybackBackend.mediaKitAvailable) {
       _player = Player();
-      unawaited(_player!.setVolume(_mediaKitMaxVolume));
+      unawaited(_player!.setVolume(_playerVolume * _mediaKitMaxVolume));
       _videoController = VideoController(
         _player!,
         configuration: VideoControllerConfiguration(
@@ -230,6 +249,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _desktopSubtitleLoadTicket += 1;
     _schedulePlaybackFinalizationAfterDispose();
     _simklPauseDebounceTimer?.cancel();
@@ -247,9 +267,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _playerFitButtonFocusNode.dispose();
     _playerSettingsButtonFocusNode.dispose();
     _playerEpisodesButtonFocusNode.dispose();
+    _playerVolumeButtonFocusNode.dispose();
     _playerFullscreenButtonFocusNode.dispose();
     _playerBottomPlayFocusNode.dispose();
     _playerBottomProgressFocusNode.dispose();
+    _animeSkipButtonFocusNode.dispose();
     _cancelRemoteVideoFrameWatchdog();
     _cancelDeferredAnimeAv1PlaybackError();
     final positionSubscription = _positionSubscription;
@@ -305,11 +327,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_setPlaybackWakelock(enabled: true));
+    }
+  }
+
   bool get _usesAndroidExoPlayer =>
       Platform.isAndroid && widget.episode.isRemote;
 
   bool get _usesDesktopVlcPlayer =>
       (Platform.isLinux || Platform.isWindows) && widget.episode.isRemote;
+
+  bool get _showsDesktopVolumeControl => Platform.isLinux || Platform.isWindows;
+
+  bool get _showsPlayerFullscreenControl => !Platform.isAndroid;
 
   Future<void> _setPlaybackWakelock({required bool enabled}) async {
     try {
@@ -443,6 +476,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await widget.controller.setCurrentEntry(widget.episode);
     _cancelRemoteVideoFrameWatchdog();
     _resetUpcomingCards();
+    _resetAnimeSkip();
     await _disposeYoutubeWebPlayer();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
@@ -608,7 +642,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     try {
       await videoController.platform.future;
       await _configurePlatformPlayback(player);
-      await player.setVolume(_mediaKitMaxVolume);
+      await player.setVolume(_playerVolume * _mediaKitMaxVolume);
       _attachPlaybackTracking(player);
       final resumePosition =
           widget.controller.resumePositionForEpisode(widget.episode);
@@ -810,7 +844,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _activeDesktopVlcPlayers.add(player);
     _desktopVlcSourcePath = path;
     player.setUserAgent(headers['User-Agent'] ?? _remotePlaybackUserAgent);
-    player.setVolume(_normalizedMaxVolume);
+    player.setVolume(_playerVolume);
     _desktopVlcPositionSubscription = player.positionStream.listen((state) {
       if (_desktopVlcPlayer != player) {
         return;
@@ -830,6 +864,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _setPlayerBuffering(false);
       }
       _maybeScheduleUpcomingCards(_lastPosition);
+      _maybeUpdateAnimeSkipPrompt(_lastPosition);
       _persistPlaybackThrottled();
       if (mounted) {
         setState(() {});
@@ -948,7 +983,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(Future<void>.delayed(const Duration(milliseconds: 700), () {
       if (!mounted || _desktopVlcPlayer != player) return;
       try {
-        player.setVolume(_normalizedMaxVolume);
+        player.setVolume(_playerVolume);
         final trackCount = player.audioTrackCount;
         _debugPlayerEvent(
           'VLC audio recovery attempt=$attempt tracks=$trackCount',
@@ -1222,6 +1257,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         title: widget.episode.displayName,
         sourceLabel: _sourceStatus().label,
         desktopControls: _usesDesktopYoutubeWebControls,
+        initialVolume: _playerVolume,
       ),
       baseUrl: 'https://www.youtube-nocookie.com',
     );
@@ -1343,6 +1379,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _lastPositionChangeAt = DateTime.now();
     }
     _maybeScheduleUpcomingCards(_youtubeWebPosition);
+    _maybeUpdateAnimeSkipPrompt(_youtubeWebPosition);
     _persistPlaybackThrottled();
     if (mounted) {
       setState(() {});
@@ -1401,6 +1438,62 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     await controller.runJavaScript('try { tanukiToggle(); } catch (e) {}');
     _showPlayerOverlays();
+  }
+
+  void _togglePlayerVolumeSlider() {
+    if (!_showsDesktopVolumeControl) {
+      return;
+    }
+    setState(() {
+      _playerVolumeSliderVisible = !_playerVolumeSliderVisible;
+      _playerOverlaysVisible = true;
+    });
+    _playerVolumeButtonFocusNode.requestFocus();
+    _schedulePlayerOverlayHide();
+  }
+
+  void _setPlayerVolume(double value) {
+    final next = value.clamp(0.0, 1.0).toDouble();
+    if ((_playerVolume - next).abs() < 0.001) {
+      return;
+    }
+    setState(() {
+      _playerVolume = next;
+      _status = 'Volumen ${(next * 100).round()}%';
+      _playerOverlaysVisible = true;
+    });
+    unawaited(_applyPlayerVolume());
+    _schedulePlayerOverlayHide();
+  }
+
+  Future<void> _applyPlayerVolume() async {
+    final mediaKitPlayer = _player;
+    if (mediaKitPlayer != null) {
+      try {
+        await mediaKitPlayer.setVolume(_playerVolume * _mediaKitMaxVolume);
+      } catch (error) {
+        _debugPlayerEvent('media_kit volume ignored error: $error');
+      }
+    }
+    final vlcPlayer = _desktopVlcPlayer;
+    if (vlcPlayer != null) {
+      try {
+        vlcPlayer.setVolume(_playerVolume);
+      } catch (error) {
+        _debugPlayerEvent('VLC volume ignored error: $error');
+      }
+    }
+    final youtubeController = _youtubeWebController;
+    if (youtubeController != null && _usesDesktopYoutubeWebControls) {
+      final volume = (_playerVolume * _youtubeMaxVolume).round();
+      try {
+        await youtubeController.runJavaScript(
+          'try { tanukiSetVolume($volume); } catch (e) {}',
+        );
+      } catch (error) {
+        _debugPlayerEvent('YouTube volume ignored error: $error');
+      }
+    }
   }
 
   Future<void> _seekYoutubeWebPlayer(Duration target) async {
@@ -1485,6 +1578,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _syncSimklPlaybackState(value.isPlaying, buffering: value.isBuffering);
     _maybeSendDeferredSimklStart();
     _maybeScheduleUpcomingCards(value.position);
+    _maybeUpdateAnimeSkipPrompt(value.position);
     _persistPlaybackThrottled();
 
     if (value.isCompleted && !_androidExoCompletionHandled) {
@@ -1617,6 +1711,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return candidates.reduce(
       (best, current) => current > best ? current : best,
     );
+  }
+
+  Duration get _animeSkipLookupDuration {
+    if (_lastDuration > Duration.zero) {
+      return _lastDuration;
+    }
+    if (_expectedRemoteDuration > Duration.zero) {
+      return _expectedRemoteDuration;
+    }
+    if (_storedPlaybackDuration > Duration.zero) {
+      return _storedPlaybackDuration;
+    }
+    return _episodeLabelDuration;
   }
 
   Duration get _storedPlaybackDuration {
@@ -2303,6 +2410,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         _scheduleRemoteSeekRecovery(position);
       }
       _maybeScheduleUpcomingCards(position);
+      _maybeUpdateAnimeSkipPrompt(position);
       _persistPlaybackThrottled();
     });
     _durationSubscription = player.stream.duration.listen((duration) {
@@ -2313,6 +2421,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         'duration=${_formatPlaybackTime(duration)} ${_debugPlayerState(player)}',
       );
       _maybeScheduleUpcomingCards(_lastPosition);
+      _maybeUpdateAnimeSkipPrompt(_lastPosition);
       _persistPlaybackThrottled();
     });
     _completedSubscription = player.stream.completed.listen((completed) {
@@ -2773,6 +2882,194 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _endUpcomingCardsShown = false;
   }
 
+  void _resetAnimeSkip() {
+    _animeSkipLoadTicket += 1;
+    _loadingAnimeSkipIntervals = false;
+    _animeSkipLoadCompleted = false;
+    _animeSkipIntervals = const [];
+    _activeAnimeSkipInterval = null;
+    _animeSkipLoadedDuration = Duration.zero;
+    _dismissedAnimeSkipIntervals.clear();
+    _usedAnimeSkipIntervals.clear();
+  }
+
+  void _maybeLoadAnimeSkipIntervals(Duration duration) {
+    if (_loadingAnimeSkipIntervals ||
+        duration <= Duration.zero ||
+        widget.controller.state.enabledAnimeSkipSegmentTypes.isEmpty) {
+      return;
+    }
+    if (_animeSkipLoadCompleted) {
+      final sameDuration = _animeSkipLoadedDuration > Duration.zero &&
+          _durationDistance(_animeSkipLoadedDuration, duration) <=
+              const Duration(seconds: 8);
+      if (_animeSkipIntervals.isNotEmpty || sameDuration) {
+        return;
+      }
+    }
+    final ticket = ++_animeSkipLoadTicket;
+    _loadingAnimeSkipIntervals = true;
+    unawaited(() async {
+      try {
+        final intervals = await widget.controller.fetchAnimeSkipTimesForEpisode(
+          widget.episode,
+          duration: duration,
+        );
+        if (!mounted || ticket != _animeSkipLoadTicket) {
+          return;
+        }
+        _animeSkipIntervals = intervals;
+        _animeSkipLoadCompleted = true;
+        _animeSkipLoadedDuration = duration;
+        _debugPlayerEvent('AniSkip intervals=${intervals.length}');
+        _maybeUpdateAnimeSkipPrompt(_lastPosition);
+      } catch (error) {
+        if (mounted && ticket == _animeSkipLoadTicket) {
+          _animeSkipLoadCompleted = true;
+          _animeSkipLoadedDuration = duration;
+          _debugPlayerEvent('AniSkip failed: $error');
+        }
+      } finally {
+        if (mounted && ticket == _animeSkipLoadTicket) {
+          _loadingAnimeSkipIntervals = false;
+        }
+      }
+    }());
+  }
+
+  void _maybeUpdateAnimeSkipPrompt(Duration position) {
+    final duration = _animeSkipLookupDuration;
+    _maybeLoadAnimeSkipIntervals(duration);
+    final next = _activePromptableAnimeSkipInterval(position);
+    if (next?.stableKey == _activeAnimeSkipInterval?.stableKey) {
+      return;
+    }
+    if (!mounted) {
+      _activeAnimeSkipInterval = next;
+      return;
+    }
+    setState(() {
+      _activeAnimeSkipInterval = next;
+      if (next != null) {
+        _playerControlsFocused = false;
+      }
+    });
+    if (next != null) {
+      _debugPlayerEvent(
+        'AniSkip prompt ${next.type.id} '
+        '${_formatPlaybackTime(next.start)}-${_formatPlaybackTime(next.end)} '
+        'at=${_formatPlaybackTime(position)}',
+      );
+      _playerOverlayHideTimer?.cancel();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted &&
+            _activeAnimeSkipInterval?.stableKey == next.stableKey &&
+            _animeSkipButtonFocusNode.canRequestFocus) {
+          _animeSkipButtonFocusNode.requestFocus();
+        }
+      });
+    } else if (_animeSkipButtonFocusNode.hasFocus) {
+      _playerControlsRootFocusNode.requestFocus();
+    }
+  }
+
+  AniSkipInterval? _activePromptableAnimeSkipInterval(Duration position) {
+    if (_animeSkipIntervals.isEmpty) {
+      return null;
+    }
+    final types = widget.controller.state.enabledAnimeSkipSegmentTypes;
+    for (final interval in _animeSkipIntervals) {
+      if (!_isPromptableAnimeSkipType(interval.type) ||
+          !types.contains(interval.type) ||
+          _dismissedAnimeSkipIntervals.contains(interval.stableKey) ||
+          _usedAnimeSkipIntervals.contains(interval.stableKey)) {
+        continue;
+      }
+      final promptStart = interval.start > _animeSkipPromptLead
+          ? interval.start - _animeSkipPromptLead
+          : Duration.zero;
+      if (position >= promptStart && position < interval.end) {
+        return interval;
+      }
+    }
+    return null;
+  }
+
+  bool _isPromptableAnimeSkipType(AnimeSkipSegmentType type) {
+    return type == AnimeSkipSegmentType.opening ||
+        type == AnimeSkipSegmentType.ending;
+  }
+
+  String _animeSkipPromptLabel(AnimeSkipSegmentType type) {
+    return switch (type) {
+      AnimeSkipSegmentType.opening => 'Saltar opening',
+      AnimeSkipSegmentType.ending => 'Saltar ending',
+      _ => 'Saltar',
+    };
+  }
+
+  Future<void> _skipActiveAnimeSegment() async {
+    final interval = _activeAnimeSkipInterval;
+    if (interval == null) {
+      return;
+    }
+    _usedAnimeSkipIntervals.add(interval.stableKey);
+    if (mounted) {
+      setState(() {
+        _activeAnimeSkipInterval = null;
+      });
+    }
+    _playerControlsRootFocusNode.requestFocus();
+    final target = interval.end > _animeSkipSeekEndOffset
+        ? interval.end - _animeSkipSeekEndOffset
+        : Duration.zero;
+    _debugPlayerEvent(
+      'AniSkip skip ${interval.type.id} to=${_formatPlaybackTime(target)}',
+    );
+    await _seekPlaybackForAnimeSkip(target);
+  }
+
+  void _dismissActiveAnimeSkip() {
+    final interval = _activeAnimeSkipInterval;
+    if (interval == null) {
+      return;
+    }
+    _dismissedAnimeSkipIntervals.add(interval.stableKey);
+    if (mounted) {
+      setState(() {
+        _activeAnimeSkipInterval = null;
+      });
+    }
+    _debugPlayerEvent('AniSkip dismissed ${interval.type.id}');
+    _playerControlsRootFocusNode.requestFocus();
+  }
+
+  Future<void> _seekPlaybackForAnimeSkip(Duration target) async {
+    final clamped = target < Duration.zero ? Duration.zero : target;
+    final android = _androidExoController;
+    if (android != null && android.value.isInitialized) {
+      await android.seekTo(clamped);
+      _androidExoCompletionHandled = false;
+    } else if (_youtubeWebController != null) {
+      final seconds = max(0, clamped.inMilliseconds / 1000).toStringAsFixed(3);
+      await _youtubeWebController!
+          .runJavaScript('try { tanukiSeekTo($seconds); } catch (e) {}');
+      _youtubeWebPosition = clamped;
+      _youtubeWebEnded = false;
+    } else if (_desktopVlcPlayer != null) {
+      if (_currentResolvedStream?.provider == RemoteProvider.bilibili) {
+        return;
+      }
+      _desktopVlcPlayer!.seek(clamped);
+      _desktopVlcCompletionHandled = false;
+    } else if (_player != null) {
+      await _seekPrecisely(_player!, clamped);
+    }
+    _lastPosition = clamped;
+    _lastPositionChangeAt = DateTime.now();
+    unawaited(_persistPlayback(force: true));
+  }
+
   void _scheduleOpeningUpcomingCards() {
     if (_startUpcomingCardsShown ||
         !_upcomingCardsEnabled ||
@@ -3157,6 +3454,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ),
                   ),
                 ),
+              Positioned(
+                left: 48,
+                bottom: 96,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 240),
+                  reverseDuration: const Duration(milliseconds: 220),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, animation) {
+                    return FadeTransition(
+                      opacity: animation,
+                      child: child,
+                    );
+                  },
+                  child: _activeAnimeSkipInterval == null
+                      ? const SizedBox.shrink(
+                          key: ValueKey('anime-skip-none'),
+                        )
+                      : _AnimeSkipPrompt(
+                          key: ValueKey(
+                            'anime-skip-${_activeAnimeSkipInterval!.stableKey}',
+                          ),
+                          label: _animeSkipPromptLabel(
+                            _activeAnimeSkipInterval!.type,
+                          ),
+                          focusNode: _animeSkipButtonFocusNode,
+                          onPressed: () => unawaited(_skipActiveAnimeSegment()),
+                        ),
+                ),
+              ),
               if (!useDesktopYoutubeWebControls)
                 Positioned(
                   left: 0,
@@ -3177,13 +3504,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         onNext: _playNext,
                         onSettings: _showPlayerSettingsDialog,
                         onEpisodes: () => unawaited(_showEpisodeListPanel()),
+                        onToggleVolume: _togglePlayerVolumeSlider,
+                        onVolumeChanged: _setPlayerVolume,
                         onFullscreen: () => unawaited(_toggleFullscreenMode()),
                         onControlFocusChanged: _setPlayerControlsFocused,
+                        showVolumeControl: _showsDesktopVolumeControl,
+                        showVolumeSlider: _playerVolumeSliderVisible,
+                        volume: _playerVolume,
+                        showFullscreenControl: _showsPlayerFullscreenControl,
                         backButtonFocusNode: _playerBackButtonFocusNode,
                         previousButtonFocusNode: _playerPreviousButtonFocusNode,
                         nextButtonFocusNode: _playerNextButtonFocusNode,
                         settingsButtonFocusNode: _playerSettingsButtonFocusNode,
                         episodesButtonFocusNode: _playerEpisodesButtonFocusNode,
+                        volumeButtonFocusNode: _playerVolumeButtonFocusNode,
                         fullscreenButtonFocusNode:
                             _playerFullscreenButtonFocusNode,
                       ),
@@ -3351,10 +3685,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
+    if (_activeAnimeSkipInterval != null) {
+      if (key == LogicalKeyboardKey.goBack ||
+          key == LogicalKeyboardKey.browserBack ||
+          key == LogicalKeyboardKey.escape) {
+        _dismissActiveAnimeSkip();
+        return KeyEventResult.handled;
+      }
+      if (_isPlayerActivationKey(key)) {
+        unawaited(_skipActiveAnimeSegment());
+        return KeyEventResult.handled;
+      }
+    }
     if (key == LogicalKeyboardKey.goBack ||
         key == LogicalKeyboardKey.browserBack ||
         key == LogicalKeyboardKey.escape) {
       return _handlePlayerBackKey();
+    }
+    if (_isPlayerActivationKey(key) &&
+        (!_playerOverlaysVisible || !_playerControlsFocused)) {
+      _showPlayerOverlays();
+      _requestPlayerControlFocus(preferBottom: true);
+      return KeyEventResult.handled;
     }
     if (_isPlayerActivationKey(key) && _activateFocusedPlayerControl()) {
       _showPlayerOverlays();
@@ -3471,6 +3823,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       unawaited(_showEpisodeListPanel());
       return true;
     }
+    if (_playerVolumeButtonFocusNode.hasFocus) {
+      _togglePlayerVolumeSlider();
+      return true;
+    }
     if (_playerFullscreenButtonFocusNode.hasFocus) {
       unawaited(_toggleFullscreenMode());
       return true;
@@ -3513,7 +3869,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _playerNextButtonFocusNode,
       _playerEpisodesButtonFocusNode,
       _playerSettingsButtonFocusNode,
-      _playerFullscreenButtonFocusNode,
+      if (_showsDesktopVolumeControl) _playerVolumeButtonFocusNode,
+      if (_showsPlayerFullscreenControl) _playerFullscreenButtonFocusNode,
     ];
     final currentIndex = nodes.indexWhere((node) => node.hasFocus);
     if (currentIndex < 0) {
@@ -3555,9 +3912,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!Platform.isAndroid) {
       return;
     }
-    final codecs = androidHardwareDecoderCodecs(
-      disableAv1: _shouldWatchAnimeAv1VideoFrame(),
-    );
+    final codecs = androidHardwareDecoderCodecs(disableAv1: false);
     if (widget.episode.isRemote) {
       await platform.setProperty('cache-on-disk', 'no');
     }
@@ -4709,7 +5064,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         : seriesNext.isEmpty
             ? null
             : seriesNext.first;
-    if (replacement == null) {
+    if (replacement == null ||
+        (widget.launchMode == PlayerLaunchMode.detail &&
+            _episodeAirsInFuture(replacement.airDateIso))) {
       if (widget.launchMode == PlayerLaunchMode.detail) {
         Navigator.of(context).maybePop();
         return;
@@ -4820,6 +5177,7 @@ String _youtubeSeriesWebPlayerHtml({
   required String title,
   required String sourceLabel,
   required bool desktopControls,
+  required double initialVolume,
 }) {
   final jsVideoId = jsonEncode(videoId);
   final jsTitle = jsonEncode(title.trim().isEmpty ? 'Episodio' : title.trim());
@@ -4828,6 +5186,8 @@ String _youtubeSeriesWebPlayerHtml({
   );
   final jsDesktopControls = desktopControls ? 'true' : 'false';
   final startSeconds = max(0, startPosition.inSeconds);
+  final initialYoutubeVolume =
+      (initialVolume.clamp(0.0, 1.0) * _youtubeMaxVolume).round();
   return '''
 <!doctype html>
 <html>
@@ -4951,6 +5311,21 @@ String _youtubeSeriesWebPlayerHtml({
       accent-color: #ff8a2a;
       cursor: pointer;
     }
+    #volumePanel {
+      width: 0;
+      height: 42px;
+      overflow: hidden;
+      transition: width 160ms ease;
+    }
+    body.volume-open #volumePanel {
+      width: 148px;
+    }
+    #volumeSlider {
+      width: 140px;
+      height: 42px;
+      accent-color: #ff8a2a;
+      cursor: pointer;
+    }
     #loading {
       position: fixed;
       inset: 0;
@@ -5010,6 +5385,12 @@ String _youtubeSeriesWebPlayerHtml({
     <button id="settings" class="icon-button" title="Configuracion" aria-label="Configuracion">
       <svg viewBox="0 0 24 24"><path d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65-2-3.46-2.49 1a7.28 7.28 0 0 0-1.69-.98L15 3h-4l-.36 2.93c-.6.23-1.16.56-1.69.98l-2.49-1-2 3.46 2.11 1.65c-.04.32-.07.65-.07.98s.02.66.07.98l-2.11 1.65 2 3.46 2.49-1c.52.4 1.09.73 1.69.98L11 21h4l.36-2.93c.6-.23 1.16-.56 1.69-.98l2.49 1 2-3.46-2.11-1.65zM13 15.5A3.5 3.5 0 1 1 13 8a3.5 3.5 0 0 1 0 7.5z"></path></svg>
     </button>
+    <button id="volume" class="icon-button" title="Volumen" aria-label="Volumen">
+      <svg id="volumeIcon" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05A4.5 4.5 0 0 0 16.5 12z"></path></svg>
+    </button>
+    <div id="volumePanel">
+      <input id="volumeSlider" type="range" min="0" max="100" step="1" value="$initialYoutubeVolume" aria-label="Volumen">
+    </div>
     <button id="fullscreen" class="icon-button" title="Pantalla completa" aria-label="Pantalla completa">
       <svg viewBox="0 0 24 24"><path d="M5 5h6v2H7v4H5V5zm12 2h-4V5h6v6h-2V7zM7 13v4h4v2H5v-6h2zm12 0v6h-6v-2h4v-4h2z"></path></svg>
     </button>
@@ -5028,8 +5409,11 @@ String _youtubeSeriesWebPlayerHtml({
     const titleText = $jsTitle;
     const sourceText = $jsSourceLabel;
     const playIcon = document.getElementById('playIcon');
+    const volumeIcon = document.getElementById('volumeIcon');
+    const volumeSlider = document.getElementById('volumeSlider');
     const progress = document.getElementById('progress');
     const timeLabel = document.getElementById('time');
+    let currentVolume = $initialYoutubeVolume;
     document.body.classList.toggle('desktop-controls', desktopControls);
     document.getElementById('title').textContent = titleText;
     document.getElementById('source').textContent = sourceText;
@@ -5091,22 +5475,37 @@ String _youtubeSeriesWebPlayerHtml({
       playIcon.innerHTML = state === 'playing'
         ? '<path d="M6 5h4v14H6V5zm8 0h4v14h-4V5z"></path>'
         : '<path d="M8 5v14l11-7z"></path>';
+      volumeIcon.innerHTML = currentVolume <= 0
+        ? '<path d="M16.5 12 21 16.5 19.5 18 15 13.5 10.5 18 9 16.5 13.5 12 9 7.5 10.5 6 15 10.5 19.5 6 21 7.5 16.5 12zM3 9v6h4l5 5V4L7 9H3z"></path>'
+        : currentVolume < 55
+          ? '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05A4.5 4.5 0 0 0 16.5 12z"></path>'
+          : '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05A4.5 4.5 0 0 0 16.5 12zm2.5 0a7 7 0 0 1-4 6.32v-2.23a5 5 0 0 0 0-9.18V5.68A7 7 0 0 1 19 12z"></path>';
+    }
+    function tanukiSetVolume(value) {
+      currentVolume = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+      volumeSlider.value = String(currentVolume);
+      try { if (player) player.setVolume(currentVolume); } catch (error) {}
+      try {
+        if (player && currentVolume > 0) player.unMute();
+        if (player && currentVolume <= 0) player.mute();
+      } catch (error) {}
+      renderChrome();
     }
     function playWhenReady() {
       if (!player) return;
       try { player.unMute(); } catch (error) {}
-      try { player.setVolume($_youtubeMaxVolume); } catch (error) {}
+      try { player.setVolume(currentVolume); } catch (error) {}
       [0, 250, 900, 1800].forEach(function(delay) {
         window.setTimeout(function() {
           try { player.unMute(); } catch (error) {}
-          try { player.setVolume($_youtubeMaxVolume); } catch (error) {}
+          try { player.setVolume(currentVolume); } catch (error) {}
           try { player.playVideo(); } catch (error) {}
         }, delay);
       });
     }
     function tanukiPlay() {
       try { if (player) player.unMute(); } catch (error) {}
-      try { if (player) player.setVolume($_youtubeMaxVolume); } catch (error) {}
+      try { if (player) player.setVolume(currentVolume); } catch (error) {}
       try { if (player) player.playVideo(); } catch (error) {}
       window.setTimeout(tanukiNotifyState, 100);
     }
@@ -5141,6 +5540,12 @@ String _youtubeSeriesWebPlayerHtml({
       document.getElementById('next').addEventListener('click', function() { postCommand('next'); });
       document.getElementById('episodes').addEventListener('click', function() { postCommand('episodes'); });
       document.getElementById('settings').addEventListener('click', function() { postCommand('settings'); });
+      document.getElementById('volume').addEventListener('click', function() {
+        document.body.classList.toggle('volume-open');
+      });
+      volumeSlider.addEventListener('input', function() {
+        tanukiSetVolume(Number(volumeSlider.value) || 0);
+      });
       document.getElementById('fullscreen').addEventListener('click', function() {
         try {
           const root = document.documentElement;
@@ -5182,7 +5587,7 @@ String _youtubeSeriesWebPlayerHtml({
             player = event.target;
             ready = true;
             try { player.unMute(); } catch (error) {}
-            try { player.setVolume($_youtubeMaxVolume); } catch (error) {}
+            try { player.setVolume(currentVolume); } catch (error) {}
             try {
               const iframe = player.getIframe();
               if (iframe) {
@@ -5462,6 +5867,67 @@ class _AndroidExoVideoSurface extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+class _AnimeSkipPrompt extends StatelessWidget {
+  const _AnimeSkipPrompt({
+    super.key,
+    required this.label,
+    required this.focusNode,
+    required this.onPressed,
+  });
+
+  final String label;
+  final FocusNode focusNode;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: Focus(
+        focusNode: focusNode,
+        child: Builder(
+          builder: (context) {
+            final focused = Focus.of(context).hasFocus;
+            return AnimatedScale(
+              scale: focused ? 1.06 : 1,
+              duration: const Duration(milliseconds: 130),
+              curve: Curves.easeOutCubic,
+              child: FilledButton.icon(
+                onPressed: onPressed,
+                style: FilledButton.styleFrom(
+                  backgroundColor:
+                      TanukiColors.orange.withValues(alpha: focused ? .88 : .7),
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 12,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: BorderSide(
+                      color: Colors.black.withValues(alpha: focused ? .42 : .2),
+                      width: focused ? 2 : 1,
+                    ),
+                  ),
+                  elevation: focused ? 8 : 2,
+                ),
+                icon: const Icon(Icons.skip_next, size: 20),
+                label: Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
     );
   }
 }
@@ -6255,13 +6721,20 @@ class _PlayerTopBar extends StatelessWidget {
     required this.onNext,
     required this.onSettings,
     required this.onEpisodes,
+    required this.onToggleVolume,
+    required this.onVolumeChanged,
     required this.onFullscreen,
     required this.onControlFocusChanged,
+    required this.showVolumeControl,
+    required this.showVolumeSlider,
+    required this.volume,
+    required this.showFullscreenControl,
     this.backButtonFocusNode,
     this.previousButtonFocusNode,
     this.nextButtonFocusNode,
     this.settingsButtonFocusNode,
     this.episodesButtonFocusNode,
+    this.volumeButtonFocusNode,
     this.fullscreenButtonFocusNode,
   });
 
@@ -6271,6 +6744,7 @@ class _PlayerTopBar extends StatelessWidget {
   final FocusNode? nextButtonFocusNode;
   final FocusNode? settingsButtonFocusNode;
   final FocusNode? episodesButtonFocusNode;
+  final FocusNode? volumeButtonFocusNode;
   final FocusNode? fullscreenButtonFocusNode;
   final String status;
   final IconData statusIcon;
@@ -6280,11 +6754,22 @@ class _PlayerTopBar extends StatelessWidget {
   final VoidCallback onNext;
   final VoidCallback onSettings;
   final VoidCallback onEpisodes;
+  final VoidCallback onToggleVolume;
+  final ValueChanged<double> onVolumeChanged;
   final VoidCallback onFullscreen;
   final ValueChanged<bool> onControlFocusChanged;
+  final bool showVolumeControl;
+  final bool showVolumeSlider;
+  final double volume;
+  final bool showFullscreenControl;
 
   @override
   Widget build(BuildContext context) {
+    final volumeIcon = volume <= 0.01
+        ? Icons.volume_off
+        : volume < 0.55
+            ? Icons.volume_down
+            : Icons.volume_up;
     return FocusTraversalGroup(
       policy: OrderedTraversalPolicy(),
       child: Container(
@@ -6380,17 +6865,66 @@ class _PlayerTopBar extends StatelessWidget {
                 onFocusChanged: onControlFocusChanged,
               ),
             ),
-            const SizedBox(width: 10),
-            FocusTraversalOrder(
-              order: const NumericFocusOrder(6),
-              child: _PlayerIconButton(
-                icon: Icons.fullscreen,
-                tooltip: 'Pantalla completa',
-                focusNode: fullscreenButtonFocusNode,
-                onPressed: onFullscreen,
-                onFocusChanged: onControlFocusChanged,
+            if (showVolumeControl) ...[
+              const SizedBox(width: 10),
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(6),
+                child: _PlayerIconButton(
+                  icon: volumeIcon,
+                  tooltip: 'Volumen',
+                  focusNode: volumeButtonFocusNode,
+                  onPressed: onToggleVolume,
+                  onFocusChanged: onControlFocusChanged,
+                ),
               ),
-            ),
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 160),
+                curve: Curves.easeOutCubic,
+                width: showVolumeSlider ? 152 : 0,
+                height: 44,
+                clipBehavior: Clip.hardEdge,
+                decoration: const BoxDecoration(),
+                child: showVolumeSlider
+                    ? Focus(
+                        canRequestFocus: false,
+                        descendantsAreFocusable: false,
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 3,
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 7,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 13,
+                            ),
+                            activeTrackColor: TanukiColors.orange,
+                            inactiveTrackColor: Colors.white24,
+                            thumbColor: Colors.white,
+                          ),
+                          child: Slider(
+                            min: 0,
+                            max: 1,
+                            value: volume.clamp(0.0, 1.0).toDouble(),
+                            onChanged: onVolumeChanged,
+                          ),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ],
+            if (showFullscreenControl) ...[
+              const SizedBox(width: 10),
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(7),
+                child: _PlayerIconButton(
+                  icon: Icons.fullscreen,
+                  tooltip: 'Pantalla completa',
+                  focusNode: fullscreenButtonFocusNode,
+                  onPressed: onFullscreen,
+                  onFocusChanged: onControlFocusChanged,
+                ),
+              ),
+            ],
           ],
         ),
       ),

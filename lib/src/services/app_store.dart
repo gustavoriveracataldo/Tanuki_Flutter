@@ -12,7 +12,7 @@ Future<Directory> _defaultAppStoreDirectory() {
 }
 
 class AppStore {
-  const AppStore() : _directoryProvider = _defaultAppStoreDirectory;
+  AppStore() : _directoryProvider = _defaultAppStoreDirectory;
 
   AppStore.inDirectory(Directory directory)
       : _directoryProvider = (() async => directory);
@@ -22,6 +22,7 @@ class AppStore {
   static const _tempFileName = 'tanuki_state.tmp.json';
 
   final AppStoreDirectoryProvider _directoryProvider;
+  Future<void> _saveQueue = Future.value();
 
   Future<AppState> load() async {
     final file = await _stateFile();
@@ -35,7 +36,13 @@ class AppStore {
     return AppState.initial();
   }
 
-  Future<void> save(AppState state) async {
+  Future<void> save(AppState state) {
+    final queuedSave = _saveQueue.then((_) => _writeState(state));
+    _saveQueue = queuedSave.catchError((_) {});
+    return queuedSave;
+  }
+
+  Future<void> _writeState(AppState state) async {
     final file = await _stateFile();
     final backupFile = await _backupStateFile();
     final tempFile = await _tempStateFile();

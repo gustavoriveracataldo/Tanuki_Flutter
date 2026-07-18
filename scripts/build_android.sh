@@ -61,6 +61,17 @@ write_android_local_properties() {
   } > "$target_properties"
 }
 
+write_android_release_keystore_from_env() {
+  target_root="$1"
+  [ -d "$target_root/android" ] || return 0
+  [ -n "${TANUKI_ANDROID_KEYSTORE_BASE64:-}" ] || return 0
+
+  keystore_path="$target_root/android/tanuki-release.jks"
+  printf '%s' "$TANUKI_ANDROID_KEYSTORE_BASE64" | base64 -d > "$keystore_path"
+  chmod 600 "$keystore_path"
+  export TANUKI_ANDROID_KEYSTORE_PATH="$keystore_path"
+}
+
 remove_stale_android_generated_registrant() {
   target_root="$1"
   stale_registrant="$target_root/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java"
@@ -98,6 +109,7 @@ if [ ! -x android/gradlew ]; then
     -cf - . | (cd "$BUILD_ROOT" && tar -xf -)
   chmod +x "$BUILD_ROOT/android/gradlew"
   write_android_local_properties "$BUILD_ROOT"
+  write_android_release_keystore_from_env "$BUILD_ROOT"
   remove_stale_android_generated_registrant "$BUILD_ROOT"
   AAPT2_OVERRIDE="$(find_android_aapt2)"
   if [ -n "$AAPT2_OVERRIDE" ]; then
@@ -107,6 +119,7 @@ if [ ! -x android/gradlew ]; then
 else
   BUILD_ROOT="$SOURCE_ROOT"
   write_android_local_properties "$BUILD_ROOT"
+  write_android_release_keystore_from_env "$BUILD_ROOT"
   remove_stale_android_generated_registrant "$BUILD_ROOT"
 fi
 

@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
 import 'models.dart';
+import 'services/aniskip_service.dart';
 import 'services/app_store.dart';
 import 'services/filler_metadata_service.dart';
 import 'services/local_library_scanner.dart';
@@ -274,13 +275,15 @@ class AppController extends ChangeNotifier {
     FillerMetadataService? fillerMetadata,
     MyAnimeListService? myAnimeListService,
     SimklService? simklService,
-  })  : _store = store ?? const AppStore(),
+    AniSkipService? aniSkipService,
+  })  : _store = store ?? AppStore(),
         _scanner = scanner ?? const LocalLibraryScanner(),
         _playlistEngine = playlistEngine ?? const PlaylistEngine(),
         _remoteCatalog = remoteCatalog ?? RemoteCatalogService(),
         _fillerMetadata = fillerMetadata ?? FillerMetadataService(),
         _myAnimeListService = myAnimeListService ?? MyAnimeListService(),
-        _simklService = simklService ?? SimklService() {
+        _simklService = simklService ?? SimklService(),
+        _aniSkipService = aniSkipService ?? AniSkipService() {
     _registerNativeDeepLinkHandler();
   }
 
@@ -291,6 +294,7 @@ class AppController extends ChangeNotifier {
   final FillerMetadataService _fillerMetadata;
   final MyAnimeListService _myAnimeListService;
   final SimklService _simklService;
+  final AniSkipService _aniSkipService;
 
   AppState _state = AppState.initial();
   List<SeriesItem> _localLibrary = const [];
@@ -1311,6 +1315,7 @@ class AppController extends ChangeNotifier {
     _fillerMetadata.close();
     _myAnimeListService.close();
     _simklService.close();
+    _aniSkipService.close();
     super.dispose();
   }
 
@@ -2110,7 +2115,10 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<SeriesItem> refreshRemoteSeriesVisuals(SeriesItem series) async {
+  Future<SeriesItem> refreshRemoteSeriesVisuals(
+    SeriesItem series, {
+    bool force = false,
+  }) async {
     final provider = series.provider ??
         (series.catalogId > 0 ? RemoteProvider.catalog : null);
     final needsCatalogHydration = provider == RemoteProvider.catalog &&
@@ -2123,7 +2131,9 @@ class AppController extends ChangeNotifier {
     if (!series.isRemote ||
         provider == null ||
         provider == RemoteProvider.animeKai ||
-        (!needsCatalogHydration && !_seriesNeedsVisualRefresh(series))) {
+        (!force &&
+            !needsCatalogHydration &&
+            !_seriesNeedsVisualRefresh(series))) {
       return series;
     }
     final catalogUrl = series.catalogId > 0
@@ -2139,11 +2149,11 @@ class AppController extends ChangeNotifier {
       title: series.name,
       watchUrl: series.watchUrl.isNotEmpty ? series.watchUrl : catalogUrl,
       seriesUrl: series.watchUrl.isNotEmpty ? series.watchUrl : catalogUrl,
-      imageUrl: series.imageUrl,
-      backgroundUrl: series.backgroundUrl,
-      logoUrl: series.logoUrl,
-      trailerUrl: series.trailerUrl,
-      description: series.description,
+      imageUrl: force ? '' : series.imageUrl,
+      backgroundUrl: force ? '' : series.backgroundUrl,
+      logoUrl: force ? '' : series.logoUrl,
+      trailerUrl: force ? '' : series.trailerUrl,
+      description: force ? '' : series.description,
       rating: series.rating,
       episodeCount: series.episodeCount,
       format: series.format,
@@ -2174,6 +2184,42 @@ class AppController extends ChangeNotifier {
     } catch (_) {
       return series;
     }
+  }
+
+  Future<SeriesItem> resetRemoteSeriesVisuals(SeriesItem series) async {
+    final candidate = RemoteSearchCandidate(
+      provider: series.provider ?? RemoteProvider.catalog,
+      slug: series.slug.isNotEmpty
+          ? series.slug
+          : series.catalogId > 0
+              ? '${series.catalogId}'
+              : '',
+      title: series.name,
+      watchUrl: series.watchUrl,
+      seriesUrl: series.watchUrl,
+      releaseYear: series.releaseYear,
+      catalogId: series.catalogId,
+    );
+    final cacheKey = _visualCacheKeyForCandidate(candidate);
+    final titleKey = normalizeSeriesKey(_stripProviderSuffix(series.name));
+    final nextCache = Map<String, CandidateVisualCacheEntry>.from(
+      _state.visualCache,
+    )..removeWhere((key, _) {
+        if (cacheKey.isNotEmpty && key == cacheKey) {
+          return true;
+        }
+        if (series.catalogId > 0 &&
+            key.contains(':catalog:${series.catalogId}')) {
+          return true;
+        }
+        return titleKey.isNotEmpty && key.contains(':title:$titleKey');
+      });
+    if (nextCache.length != _state.visualCache.length) {
+      _state = _state.copyWith(visualCache: nextCache);
+      await _save();
+      notifyListeners();
+    }
+    return refreshRemoteSeriesVisuals(series, force: true);
   }
 
   Future<void> setPreferredRemoteProvider(RemoteProvider? provider) async {
@@ -3414,7 +3460,8 @@ class AppController extends ChangeNotifier {
     if (watchedCount > current) {
       nextProgress[key] = watchedCount;
     }
-    final completedSeries = watchedCount >= series.episodes.length;
+    final completedSeries =
+        _seriesPlaybackComplete(series, watchedCount: watchedCount);
     var playlist = _state.profile.activePlaylist.copyWith(
       progress: nextProgress,
       lastPlayedSeriesName: key,
@@ -3660,18 +3707,110 @@ class AppController extends ChangeNotifier {
     bool? showPlaylistUpcomingCards,
     bool? skipMixedEpisodes,
     bool? skipFillerEpisodes,
+    bool? skipOpeningSegments,
+    bool? skipEndingSegments,
+    bool? skipMixedOpeningSegments,
+    bool? skipMixedEndingSegments,
+    bool? skipRecapSegments,
   }) async {
     _state = _state.copyWith(
       showSeriesUpcomingCards: showSeriesUpcomingCards,
       showPlaylistUpcomingCards: showPlaylistUpcomingCards,
       skipMixedEpisodes: skipMixedEpisodes,
       skipFillerEpisodes: skipFillerEpisodes,
+      skipOpeningSegments: skipOpeningSegments,
+      skipEndingSegments: skipEndingSegments,
+      skipMixedOpeningSegments: skipMixedOpeningSegments,
+      skipMixedEndingSegments: skipMixedEndingSegments,
+      skipRecapSegments: skipRecapSegments,
     );
     await _save();
     notifyListeners();
     if (skipFillerEpisodes == true || skipMixedEpisodes == true) {
       unawaited(refreshFillerMetadata());
     }
+  }
+
+  int myAnimeListIdForEpisode(EpisodeItem episode) {
+    final key = _seriesStateKeyForEpisode(episode);
+    final profile = _state.profile;
+    final mapped = profile.myAnimeListMappings[key] ??
+        profile.myAnimeListMappings[normalizeSeriesKey(key)] ??
+        0;
+    if (mapped > 0) {
+      return mapped;
+    }
+    final series = _findSeriesByKeyFallback(key);
+    final catalogId = series?.catalogId ?? 0;
+    if (catalogId > 0) {
+      return catalogId;
+    }
+    final keyCatalogId = _catalogIdFromSeriesKey(key);
+    if (keyCatalogId > 0) {
+      return keyCatalogId;
+    }
+    final normalizedName = normalizeSeriesKey(episode.seriesName);
+    for (final entry in profile.myAnimeListMappings.entries) {
+      if (normalizeSeriesKey(entry.key) == normalizedName && entry.value > 0) {
+        return entry.value;
+      }
+    }
+    return 0;
+  }
+
+  Future<List<AniSkipInterval>> fetchAnimeSkipTimesForEpisode(
+    EpisodeItem episode, {
+    required Duration duration,
+  }) async {
+    final types = _state.enabledAnimeSkipSegmentTypes;
+    final malId = myAnimeListIdForEpisode(episode);
+    final key = _seriesStateKeyForEpisode(episode);
+    assert(() {
+      debugPrint(
+        'AppControllerAniSkip: request series="${episode.seriesName}" '
+        'key="$key" episode=${episode.episodeNumber} '
+        'duration=${duration.inMilliseconds}ms malId=$malId '
+        'types=${types.map((type) => type.id).join(',')}',
+      );
+      return true;
+    }());
+    if (types.isEmpty ||
+        malId <= 0 ||
+        episode.episodeNumber <= 0 ||
+        duration <= Duration.zero) {
+      assert(() {
+        debugPrint(
+          'AppControllerAniSkip: skipped before API '
+          'typesEmpty=${types.isEmpty} malId=$malId '
+          'episode=${episode.episodeNumber} duration=${duration.inMilliseconds}ms',
+        );
+        return true;
+      }());
+      return const [];
+    }
+    final series = _findSeriesByKeyFallback(key);
+    final format = (series?.format ?? '').toLowerCase();
+    if (format.contains('movie') || format.contains('pelicula')) {
+      assert(() {
+        debugPrint('AppControllerAniSkip: skipped movie format="$format"');
+        return true;
+      }());
+      return const [];
+    }
+    final intervals = await _aniSkipService.fetchSkipTimes(
+      malId: malId,
+      episodeNumber: episode.episodeNumber,
+      episodeLength: duration,
+      types: types,
+    );
+    assert(() {
+      debugPrint(
+        'AppControllerAniSkip: response intervals=${intervals.length} '
+        'malId=$malId episode=${episode.episodeNumber}',
+      );
+      return true;
+    }());
+    return intervals;
   }
 
   Future<void> setOverscanPadding({
@@ -4878,8 +5017,9 @@ class AppController extends ChangeNotifier {
   }
 
   int watchedCountFor(SeriesItem series) {
+    final total = max(series.episodeCount, series.episodes.length);
     return (activePlaylist.progress[series.stableKey] ?? 0)
-        .clamp(0, series.episodeCount)
+        .clamp(0, total)
         .toInt();
   }
 
@@ -4932,6 +5072,19 @@ class AppController extends ChangeNotifier {
       return false;
     }
     return true;
+  }
+
+  bool _seriesPlaybackComplete(
+    SeriesItem series, {
+    required int watchedCount,
+  }) {
+    final total = max(series.episodeCount, series.episodes.length);
+    if (total <= 0 || watchedCount < total) {
+      return false;
+    }
+    return !series.episodes.any(
+      (episode) => _episodeAirsInFuture(episode.airDateIso),
+    );
   }
 
   bool _episodeAirsInFuture(String airDateIso) {
@@ -5087,8 +5240,7 @@ class AppController extends ChangeNotifier {
     }
     final completedSeries = key.isNotEmpty &&
         series != null &&
-        series.episodes.isNotEmpty &&
-        watchedCount >= series.episodes.length;
+        _seriesPlaybackComplete(series, watchedCount: watchedCount);
     var playlist = profile.activePlaylist.copyWith(
       progress: nextProgress,
       lastPlayedSeriesName: key,

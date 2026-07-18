@@ -22,6 +22,10 @@ env:
   MYANIMELIST_CLIENT_ID: ${{ secrets.MYANIMELIST_CLIENT_ID }}
   MYANIMELIST_CLIENT_SECRET: ${{ secrets.MYANIMELIST_CLIENT_SECRET }}
   SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+  TANUKI_ANDROID_KEYSTORE_BASE64: ${{ secrets.TANUKI_ANDROID_KEYSTORE_BASE64 }}
+  TANUKI_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.TANUKI_ANDROID_KEYSTORE_PASSWORD }}
+  TANUKI_ANDROID_KEY_ALIAS: ${{ secrets.TANUKI_ANDROID_KEY_ALIAS }}
+  TANUKI_ANDROID_KEY_PASSWORD: ${{ secrets.TANUKI_ANDROID_KEY_PASSWORD }}
 
 jobs:
   validate-secrets:
@@ -40,6 +44,13 @@ jobs:
             value="$(eval "printf '%s' \"\${$key:-}\"")"
             if [ -z "$value" ]; then
               echo "::error::Set $key in repository secrets."
+              missing=1
+            fi
+          done
+          for key in TANUKI_ANDROID_KEYSTORE_BASE64 TANUKI_ANDROID_KEYSTORE_PASSWORD TANUKI_ANDROID_KEY_ALIAS TANUKI_ANDROID_KEY_PASSWORD; do
+            value="$(eval "printf '%s' \"\${$key:-}\"")"
+            if [ -z "$value" ]; then
+              echo "::error::Set $key in repository secrets for Android release signing."
               missing=1
             fi
           done

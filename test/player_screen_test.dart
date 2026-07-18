@@ -287,7 +287,7 @@ Solo en la oscuridad, la luz.
     );
   });
 
-  test('disables only AV1 hardware decoding for AnimeAV1 streams', () {
+  test('builds Android hardware decoder codec lists with optional AV1', () {
     final codecs = androidHardwareDecoderCodecs(disableAv1: true);
 
     expect(codecs.split(','), isNot(contains('av1')));

@@ -63,6 +63,23 @@ void main() {
     expect(backup['myAnimeListClientId'], 'first');
   });
 
+  test('serializes concurrent saves without losing the temp file', () async {
+    await Future.wait([
+      store.save(const AppState(myAnimeListClientId: 'first')),
+      store.save(const AppState(myAnimeListClientId: 'second')),
+      store.save(const AppState(myAnimeListClientId: 'third')),
+    ]);
+
+    final restored = await store.load();
+
+    expect(
+      restored.myAnimeListClientId,
+      isIn(['first', 'second', 'third']),
+    );
+    expect(await stateFile('tanuki_state.json').exists(), isTrue);
+    expect(await stateFile('tanuki_state.tmp.json').exists(), isFalse);
+  });
+
   test('loads backup when the primary state file is corrupt', () async {
     await store.save(const AppState(myAnimeListClientId: 'first-valid'));
     await store.save(const AppState(myAnimeListClientId: 'second-valid'));

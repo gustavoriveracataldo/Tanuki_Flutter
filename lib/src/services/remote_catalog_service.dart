@@ -193,9 +193,7 @@ class RemoteCatalogService {
         ),
       ),
     ]);
-    return _dedupe(_interleaveCandidateLists(providerResults))
-        .take(normalizedLimit)
-        .toList(growable: false);
+    return _dedupe(_interleaveCandidateLists(providerResults));
   }
 
   Future<List<RemoteSearchCandidate>> discoverCatalogAiring({
@@ -1310,7 +1308,7 @@ $airingScheduleFields
       );
     }
     return _parseAnimeAv1Results(response.body)
-        .where((candidate) => _candidateLooksMovie(candidate))
+        .map(_withMovieFormat)
         .take(limit)
         .toList(growable: false);
   }
@@ -4723,7 +4721,7 @@ $airingScheduleFields
       );
     }
     return _parseJkAnimeResults(response.body, 0)
-        .where((candidate) => _candidateLooksMovie(candidate))
+        .map(_withMovieFormat)
         .take(limit)
         .toList(growable: false);
   }
@@ -7739,6 +7737,34 @@ $airingScheduleFields
         title.contains('pelicula');
   }
 
+  RemoteSearchCandidate _withMovieFormat(RemoteSearchCandidate candidate) {
+    if (_candidateLooksMovie(candidate)) {
+      return candidate;
+    }
+    return RemoteSearchCandidate(
+      provider: candidate.provider,
+      slug: candidate.slug,
+      title: candidate.title,
+      watchUrl: candidate.watchUrl,
+      seriesUrl: candidate.seriesUrl,
+      imageUrl: candidate.imageUrl,
+      backgroundUrl: candidate.backgroundUrl,
+      logoUrl: candidate.logoUrl,
+      trailerUrl: candidate.trailerUrl,
+      description: candidate.description,
+      rating: candidate.rating,
+      episodeCount: candidate.episodeCount,
+      format: 'Movie',
+      japaneseTitle: candidate.japaneseTitle,
+      aliases: candidate.aliases,
+      releaseYear: candidate.releaseYear,
+      airDateIso: candidate.airDateIso,
+      catalogId: candidate.catalogId,
+      cast: candidate.cast,
+      episodeDetails: candidate.episodeDetails,
+    );
+  }
+
   bool _seriesLooksMovie(SeriesItem series) {
     final format = _normalizeMatchText(series.format);
     final title = _normalizeMatchText(series.name);
@@ -10738,7 +10764,7 @@ $airingScheduleFields
     if (normalizedSeriesUrl.isEmpty) {
       return '';
     }
-    return '$normalizedSeriesUrl/${episodeNumber < 1 ? 1 : episodeNumber}';
+    return '$normalizedSeriesUrl/${episodeNumber < 0 ? 1 : episodeNumber}';
   }
 
   String _extractAnimeAv1PlayUrl(String html, String variant) {
