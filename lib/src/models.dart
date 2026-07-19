@@ -1859,6 +1859,16 @@ class AppState {
       if (skipRecapSegments) AnimeSkipSegmentType.recap,
     };
   }
+
+  Set<AnimeSkipSegmentType> get animeSkipLookupSegmentTypes {
+    return {
+      AnimeSkipSegmentType.opening,
+      AnimeSkipSegmentType.ending,
+      if (skipMixedOpeningSegments) AnimeSkipSegmentType.mixedOpening,
+      if (skipMixedEndingSegments) AnimeSkipSegmentType.mixedEnding,
+      if (skipRecapSegments) AnimeSkipSegmentType.recap,
+    };
+  }
 }
 
 List<UserProfileState> _normalizeProfiles(List<UserProfileState> profiles) {

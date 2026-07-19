@@ -3762,7 +3762,7 @@ class AppController extends ChangeNotifier {
     EpisodeItem episode, {
     required Duration duration,
   }) async {
-    final types = _state.enabledAnimeSkipSegmentTypes;
+    final types = _state.animeSkipLookupSegmentTypes;
     final malId = myAnimeListIdForEpisode(episode);
     final key = _seriesStateKeyForEpisode(episode);
     assert(() {

@@ -308,6 +308,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _openRemoteCandidate(candidate);
       },
       onPlayEpisode: _playEpisode,
+      onPlayContinueWatchingQueue: _playContinueWatchingRoundRobin,
       onOpenSeriesTrailer: _openSeriesTrailer,
       onPlayTrendingTrailers: _playTrendingTrailerQueue,
       onLoadMoreAiring: _loadMoreHomeAiring,
@@ -1070,6 +1071,36 @@ class _HomeScreenState extends State<HomeScreen> {
           controller: widget.controller,
           episode: episode,
           launchMode: launchMode,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _playContinueWatchingRoundRobin() async {
+    _ContinueWatchingEntry? entry;
+    for (final candidate in _continueWatchingEntries(widget.controller)) {
+      if (candidate.enabled) {
+        entry = candidate;
+        break;
+      }
+    }
+    if (entry == null) {
+      widget.controller.setStatusMessage(
+        'No hay episodios disponibles en Continuar viendo.',
+      );
+      return;
+    }
+    final selected = entry;
+    await widget.controller.setCurrentEntry(selected.episode);
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => PlayerScreen(
+          controller: widget.controller,
+          episode: selected.episode,
+          launchMode: PlayerLaunchMode.continueWatchingRoundRobin,
         ),
       ),
     );
@@ -3050,6 +3081,7 @@ class _AnimePanel extends StatelessWidget {
     required this.onSeriesCleared,
     required this.onRemoteCandidateSelected,
     required this.onPlayEpisode,
+    required this.onPlayContinueWatchingQueue,
     required this.onOpenSeriesTrailer,
     required this.onPlayTrendingTrailers,
     required this.onLoadMoreAiring,
@@ -3082,6 +3114,7 @@ class _AnimePanel extends StatelessWidget {
   final VoidCallback onSeriesCleared;
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final ValueChanged<EpisodeItem> onPlayEpisode;
+  final VoidCallback onPlayContinueWatchingQueue;
   final ValueChanged<SeriesItem> onOpenSeriesTrailer;
   final VoidCallback onPlayTrendingTrailers;
   final VoidCallback onLoadMoreAiring;
@@ -3146,6 +3179,7 @@ class _AnimePanel extends StatelessWidget {
         _ContinueWatchingShelf(
           entries: continueWatching,
           onPlayEpisode: onPlayEpisode,
+          onPlayQueue: onPlayContinueWatchingQueue,
           onStopWatchingSeries: onStopWatchingSeries,
           onAbandonSeries: onAbandonSeries,
           onGoToSeries: onSeriesSelected,
@@ -5316,6 +5350,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
   const _ContinueWatchingShelf({
     required this.entries,
     required this.onPlayEpisode,
+    required this.onPlayQueue,
     required this.onStopWatchingSeries,
     required this.onAbandonSeries,
     required this.onGoToSeries,
@@ -5324,6 +5359,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
 
   final List<_ContinueWatchingEntry> entries;
   final ValueChanged<EpisodeItem> onPlayEpisode;
+  final VoidCallback onPlayQueue;
   final ValueChanged<SeriesItem> onStopWatchingSeries;
   final ValueChanged<SeriesItem> onAbandonSeries;
   final ValueChanged<SeriesItem> onGoToSeries;
@@ -5347,9 +5383,22 @@ class _ContinueWatchingShelf extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _SectionHeader(
-          title: 'Continuar viendo',
-          trailing: '${entries.length} series',
+        Row(
+          children: [
+            Expanded(
+              child: _SectionHeader(
+                title: 'Continuar viendo',
+                trailing: '${entries.length} series',
+              ),
+            ),
+            const SizedBox(width: 8),
+            IconButton(
+              onPressed:
+                  entries.any((entry) => entry.enabled) ? onPlayQueue : null,
+              icon: const Icon(Icons.queue_play_next),
+              tooltip: 'Reproducir una por serie',
+            ),
+          ],
         ),
         const SizedBox(height: 4),
         SizedBox(
@@ -7345,6 +7394,8 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
     }
 
     final futureEpisode = _episodeAirsInFuture(episode.airDateIso);
+    final episodeAvailable =
+        !futureEpisode && _episodeHasPlaybackRoute(episode);
     final playback = controller.playbackForEpisode(episode);
     final playbackProgress = _playbackProgress(playback);
     final seriesProgress =
@@ -7364,7 +7415,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         watchedCount: watched,
         progress: progress,
         isCurrent: currentForSeries,
-        enabled: !futureEpisode,
+        enabled: episodeAvailable,
         scheduleLabel:
             futureEpisode ? _scheduleChipLabel(episode.airDateIso) : '',
       ),
@@ -7386,6 +7437,8 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
       (currentTitleKey.isEmpty || !seenTitleKeys.contains(currentTitleKey))) {
     final playback = controller.playbackForEpisode(current);
     final futureEpisode = _episodeAirsInFuture(current.airDateIso);
+    final episodeAvailable =
+        !futureEpisode && _episodeHasPlaybackRoute(current);
     entries.add(
       _ContinueWatchingEntry(
         series: currentSeries,
@@ -7399,7 +7452,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         watchedCount: 0,
         progress: futureEpisode ? 0 : _playbackProgress(playback),
         isCurrent: true,
-        enabled: !futureEpisode,
+        enabled: episodeAvailable,
         scheduleLabel:
             futureEpisode ? _scheduleChipLabel(current.airDateIso) : '',
       ),
@@ -7518,6 +7571,10 @@ EpisodeItem? _partialPlaybackEpisode(
     if (episode.episodeIndex < minimumEpisodeIndex) {
       continue;
     }
+    if (_episodeAirsInFuture(episode.airDateIso) ||
+        !_episodeHasPlaybackRoute(episode)) {
+      continue;
+    }
     final playback = controller.playbackForEpisode(episode);
     if (playback != null && !playback.completed && playback.positionMs > 1000) {
       return episode;
@@ -7547,9 +7604,27 @@ EpisodeItem? _continueWatchingEpisodeForSeries(
     return null;
   }
   if (watched >= 0 && watched < episodes.length) {
+    for (final episode in episodes.skip(watched)) {
+      if (!_episodeAirsInFuture(episode.airDateIso) &&
+          _episodeHasPlaybackRoute(episode)) {
+        return episode;
+      }
+    }
     return episodes[watched];
   }
   return controller.firstPlayableEpisode(series);
+}
+
+bool _episodeHasPlaybackRoute(EpisodeItem episode) {
+  if (episode.filePath.trim().isNotEmpty) {
+    return true;
+  }
+  if (!episode.isRemote) {
+    return false;
+  }
+  return episode.watchUrl.trim().isNotEmpty ||
+      episode.slug.trim().isNotEmpty ||
+      episode.provider != null;
 }
 
 EpisodeItem _matchingEpisodeInSeries(SeriesItem series, EpisodeItem episode) {

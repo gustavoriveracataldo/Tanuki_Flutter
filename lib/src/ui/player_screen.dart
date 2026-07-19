@@ -47,6 +47,7 @@ enum PlayerLaunchMode {
   detail,
   playlist,
   continueWatching,
+  continueWatchingRoundRobin,
 }
 
 enum _UpcomingCardPhase {
@@ -203,6 +204,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   int? _remoteVideoHeight;
   int _remoteOpeningRecoveryAttempts = 0;
   int _openEpisodeTicket = 0;
+  bool _leavingPlayer = false;
+  bool _episodeTransitionInProgress = false;
   bool _remoteReloadInProgress = false;
   bool _loadingAnimeSkipIntervals = false;
   bool _animeSkipLoadCompleted = false;
@@ -473,7 +476,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       'open start remote=${widget.episode.isRemote} '
       'episode="${widget.episode.displayName}"',
     );
-    await widget.controller.setCurrentEntry(widget.episode);
+    unawaited(widget.controller.setCurrentEntry(widget.episode));
     _cancelRemoteVideoFrameWatchdog();
     _resetUpcomingCards();
     _resetAnimeSkip();
@@ -526,10 +529,10 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (resolved != null && resolved.playbackUrl.isNotEmpty) {
         _currentResolvedStream = resolved;
         _reconcileRemoteSubtitleSelection(resolved);
-        await widget.controller.rememberResolvedPlaybackForEpisode(
+        unawaited(widget.controller.rememberResolvedPlaybackForEpisode(
           widget.episode,
           resolved,
-        );
+        ));
         if (!mounted || openTicket != _openEpisodeTicket) return;
         path = resolved.playbackUrl;
         _debugPlayerEvent(
@@ -719,7 +722,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (previous != null) {
       _debugPlayerEvent('ExoPlayer dispose previous controller');
       previous.removeListener(_handleAndroidExoValue);
-      await previous.dispose();
+      unawaited(previous.dispose());
     }
     _androidExoController = null;
     _androidExoCompletionHandled = false;
@@ -1115,11 +1118,11 @@ class _PlayerScreenState extends State<PlayerScreen>
     final playbackUri = Uri.tryParse(retiredSourcePath);
     final wasLoopbackProxy = playbackUri != null &&
         (playbackUri.host == '127.0.0.1' || playbackUri.host == 'localhost');
+    final player = _desktopVlcPlayer;
+    _desktopVlcPlayer = null;
     for (final subscription in subscriptions) {
       await subscription?.cancel();
     }
-    final player = _desktopVlcPlayer;
-    _desktopVlcPlayer = null;
     if (player != null) {
       _activeDesktopVlcPlayers.remove(player);
       if (delayForBiliBili &&
@@ -1390,7 +1393,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _showPlayerOverlays();
     switch (command) {
       case 'back':
-        Navigator.of(context).maybePop();
+        _exitPlayer();
         return;
       case 'previous':
         unawaited(_playPrevious());
@@ -2324,18 +2327,18 @@ class _PlayerScreenState extends State<PlayerScreen>
       _openedMedia = false;
       _remotePlaybackAccepted = false;
       _completionCommitted = false;
-      await _pauseSimklScrobble();
+      unawaited(_pauseSimklScrobble());
       final androidExoController = _androidExoController;
       if (androidExoController != null) {
         androidExoController.removeListener(_handleAndroidExoValue);
-        await androidExoController.dispose();
         _androidExoController = null;
+        unawaited(androidExoController.dispose());
       }
-      await _disposeDesktopVlcPlayer(
+      unawaited(_disposeDesktopVlcPlayer(
         delayForBiliBili: true,
         treatAsBiliBili: wasBiliBili,
-      );
-      await _player?.stop();
+      ));
+      unawaited(_player?.stop());
       if (!mounted) {
         return;
       }
@@ -2894,9 +2897,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   void _maybeLoadAnimeSkipIntervals(Duration duration) {
-    if (_loadingAnimeSkipIntervals ||
-        duration <= Duration.zero ||
-        widget.controller.state.enabledAnimeSkipSegmentTypes.isEmpty) {
+    if (_loadingAnimeSkipIntervals || duration <= Duration.zero) {
       return;
     }
     if (_animeSkipLoadCompleted) {
@@ -2940,6 +2941,11 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _maybeUpdateAnimeSkipPrompt(Duration position) {
     final duration = _animeSkipLookupDuration;
     _maybeLoadAnimeSkipIntervals(duration);
+    final autoSkip = _activeAutoSkippableAnimeSkipInterval(position);
+    if (autoSkip != null) {
+      unawaited(_skipAnimeSegment(autoSkip));
+      return;
+    }
     final next = _activePromptableAnimeSkipInterval(position);
     if (next?.stableKey == _activeAnimeSkipInterval?.stableKey) {
       return;
@@ -2977,10 +2983,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (_animeSkipIntervals.isEmpty) {
       return null;
     }
-    final types = widget.controller.state.enabledAnimeSkipSegmentTypes;
     for (final interval in _animeSkipIntervals) {
       if (!_isPromptableAnimeSkipType(interval.type) ||
-          !types.contains(interval.type) ||
+          _isAutoSkippableAnimeSkipType(interval.type) ||
           _dismissedAnimeSkipIntervals.contains(interval.stableKey) ||
           _usedAnimeSkipIntervals.contains(interval.stableKey)) {
         continue;
@@ -2993,6 +2998,33 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
     }
     return null;
+  }
+
+  AniSkipInterval? _activeAutoSkippableAnimeSkipInterval(Duration position) {
+    if (_animeSkipIntervals.isEmpty) {
+      return null;
+    }
+    for (final interval in _animeSkipIntervals) {
+      if (!_isAutoSkippableAnimeSkipType(interval.type) ||
+          _usedAnimeSkipIntervals.contains(interval.stableKey)) {
+        continue;
+      }
+      if (position >= interval.start && position < interval.end) {
+        return interval;
+      }
+    }
+    return null;
+  }
+
+  bool _isAutoSkippableAnimeSkipType(AnimeSkipSegmentType type) {
+    final state = widget.controller.state;
+    return switch (type) {
+      AnimeSkipSegmentType.opening => state.skipOpeningSegments,
+      AnimeSkipSegmentType.ending => state.skipEndingSegments,
+      AnimeSkipSegmentType.mixedOpening => state.skipMixedOpeningSegments,
+      AnimeSkipSegmentType.mixedEnding => state.skipMixedEndingSegments,
+      AnimeSkipSegmentType.recap => state.skipRecapSegments,
+    };
   }
 
   bool _isPromptableAnimeSkipType(AnimeSkipSegmentType type) {
@@ -3013,10 +3045,16 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (interval == null) {
       return;
     }
+    await _skipAnimeSegment(interval);
+  }
+
+  Future<void> _skipAnimeSegment(AniSkipInterval interval) async {
     _usedAnimeSkipIntervals.add(interval.stableKey);
     if (mounted) {
       setState(() {
-        _activeAnimeSkipInterval = null;
+        if (_activeAnimeSkipInterval?.stableKey == interval.stableKey) {
+          _activeAnimeSkipInterval = null;
+        }
       });
     }
     _playerControlsRootFocusNode.requestFocus();
@@ -3168,6 +3206,11 @@ class _PlayerScreenState extends State<PlayerScreen>
   List<EpisodeItem> _upcomingEntriesAfterCurrent() {
     return switch (widget.launchMode) {
       PlayerLaunchMode.playlist => _playlistEntriesAfterCurrent(limit: 2),
+      PlayerLaunchMode.continueWatchingRoundRobin =>
+        _continueWatchingEntriesAfterCurrent(
+          limit: 2,
+          preferSameSeries: false,
+        ),
       PlayerLaunchMode.continueWatching =>
         _continueWatchingEntriesAfterCurrent(limit: 2),
       _ => _seriesEntriesAfterCurrent(limit: 2),
@@ -3184,9 +3227,12 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   List<EpisodeItem> _continueWatchingEntriesAfterCurrent({
     required int limit,
+    bool preferSameSeries = true,
   }) {
-    final sameSeriesEntries = _seriesEntriesAfterCurrent(limit: limit);
-    if (sameSeriesEntries.isNotEmpty) {
+    final sameSeriesEntries = preferSameSeries
+        ? _seriesEntriesAfterCurrent(limit: limit)
+        : const <EpisodeItem>[];
+    if (preferSameSeries && sameSeriesEntries.isNotEmpty) {
       return sameSeriesEntries;
     }
 
@@ -3290,6 +3336,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
       );
     for (final episode in episodes) {
+      if (!_canShowUpcomingEpisode(episode)) {
+        continue;
+      }
       final playback = widget.controller.playbackForEpisode(episode);
       if (playback != null &&
           !playback.completed &&
@@ -3320,6 +3369,9 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   bool _canShowUpcomingEpisode(EpisodeItem episode) {
     if (_episodeAirsInFuture(episode.airDateIso)) {
+      return false;
+    }
+    if (!_episodeHasPlaybackRoute(episode)) {
       return false;
     }
     final tag = episode.episodeTag.trim().toLowerCase();
@@ -3499,7 +3551,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                         status: sourceStatus.label,
                         statusIcon: sourceStatus.icon,
                         statusColor: sourceStatus.color,
-                        onBack: () => Navigator.of(context).maybePop(),
+                        onBack: _exitPlayer,
                         onPrevious: _playPrevious,
                         onNext: _playNext,
                         onSettings: _showPlayerSettingsDialog,
@@ -3770,7 +3822,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _lastPlayerBackKeyAt = now;
     if (previous != null &&
         now.difference(previous) <= const Duration(milliseconds: 850)) {
-      Navigator.of(context).maybePop();
+      _exitPlayer();
       return KeyEventResult.handled;
     }
     _playerControlsRootFocusNode.requestFocus();
@@ -3796,7 +3848,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   bool _activateFocusedPlayerControl() {
     if (_playerBackButtonFocusNode.hasFocus) {
-      Navigator.of(context).maybePop();
+      _exitPlayer();
       return true;
     }
     if (_playerPreviousButtonFocusNode.hasFocus) {
@@ -3847,6 +3899,20 @@ class _PlayerScreenState extends State<PlayerScreen>
       return true;
     }
     return false;
+  }
+
+  void _exitPlayer() {
+    if (_leavingPlayer || !mounted) {
+      return;
+    }
+    _leavingPlayer = true;
+    _episodeTransitionInProgress = true;
+    ++_openEpisodeTicket;
+    _cancelRemoteVideoFrameWatchdog();
+    _cancelDeferredAnimeAv1PlaybackError();
+    _playerOverlayHideTimer?.cancel();
+    unawaited(_pauseSimklScrobble());
+    Navigator.of(context).maybePop();
   }
 
   void _requestPlayerControlFocus({bool preferBottom = false}) {
@@ -4519,9 +4585,6 @@ class _PlayerScreenState extends State<PlayerScreen>
                     delayForBiliBili: true,
                     treatAsBiliBili: true,
                   );
-                  await Future<void>.delayed(
-                    const Duration(milliseconds: 120),
-                  );
                 }
                 await _reloadRemoteSource();
               }
@@ -5045,62 +5108,75 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (replacement == null) {
       return;
     }
-    await Navigator.of(context).pushReplacement(
-      MaterialPageRoute(
-        builder: (_) => PlayerScreen(
-          controller: widget.controller,
-          episode: replacement,
-          launchMode: widget.launchMode,
-        ),
-      ),
-    );
+    await _replaceWithEpisode(replacement);
   }
 
   Future<void> _playNext() async {
+    if (_episodeTransitionInProgress || _leavingPlayer) {
+      return;
+    }
     final seriesNext = _seriesEntriesAfterCurrent(limit: 1);
     final replacement = widget.launchMode == PlayerLaunchMode.playlist ||
             widget.launchMode == PlayerLaunchMode.detail
         ? _adjacentEpisode(1)
-        : seriesNext.isEmpty
+        : widget.launchMode == PlayerLaunchMode.continueWatchingRoundRobin ||
+                seriesNext.isEmpty
             ? null
             : seriesNext.first;
     if (replacement == null ||
         (widget.launchMode == PlayerLaunchMode.detail &&
             _episodeAirsInFuture(replacement.airDateIso))) {
       if (widget.launchMode == PlayerLaunchMode.detail) {
-        Navigator.of(context).maybePop();
+        _exitPlayer();
         return;
       }
       final entries = widget.launchMode == PlayerLaunchMode.playlist
           ? _playlistEntriesAfterCurrent(limit: 1)
-          : widget.launchMode == PlayerLaunchMode.continueWatching
-              ? _continueWatchingEntriesAfterCurrent(limit: 1)
+          : widget.launchMode == PlayerLaunchMode.continueWatching ||
+                  widget.launchMode ==
+                      PlayerLaunchMode.continueWatchingRoundRobin
+              ? _continueWatchingEntriesAfterCurrent(
+                  limit: 1,
+                  preferSameSeries: widget.launchMode !=
+                      PlayerLaunchMode.continueWatchingRoundRobin,
+                )
               : const <EpisodeItem>[];
       if (entries.isEmpty) {
-        if (widget.launchMode == PlayerLaunchMode.continueWatching) {
-          Navigator.of(context).maybePop();
+        if (widget.launchMode == PlayerLaunchMode.continueWatching ||
+            widget.launchMode == PlayerLaunchMode.continueWatchingRoundRobin) {
+          _exitPlayer();
         }
         return;
       }
-      final nextEpisode = await _prepareEpisodeForPlayback(entries.first);
-      if (!mounted) {
-        return;
+      await _replaceWithEpisode(entries.first);
+      return;
+    }
+    await _replaceWithEpisode(replacement);
+  }
+
+  Future<void> _replaceWithEpisode(EpisodeItem episode) async {
+    if (_episodeTransitionInProgress || _leavingPlayer || !mounted) {
+      return;
+    }
+    _episodeTransitionInProgress = true;
+    ++_openEpisodeTicket;
+    _cancelRemoteVideoFrameWatchdog();
+    _cancelDeferredAnimeAv1PlaybackError();
+    _playerOverlayHideTimer?.cancel();
+    final EpisodeItem nextEpisode;
+    try {
+      nextEpisode = await _prepareEpisodeForPlayback(episode);
+    } catch (error) {
+      _episodeTransitionInProgress = false;
+      if (mounted) {
+        setState(() {
+          _status = 'No se pudo preparar el episodio';
+          _error = '$error';
+        });
       }
-      await Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => PlayerScreen(
-            controller: widget.controller,
-            episode: nextEpisode,
-            launchMode: widget.launchMode,
-          ),
-        ),
-      );
       return;
     }
-    final nextEpisode = await _prepareEpisodeForPlayback(replacement);
-    if (!mounted) {
-      return;
-    }
+    if (!mounted || _leavingPlayer) return;
     await Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (_) => PlayerScreen(
@@ -5117,9 +5193,36 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (series == null) {
       return episode;
     }
+    final current = _matchingEpisodeInSeries(series, episode);
+    if (_episodeHasPlaybackRoute(current)) {
+      _refreshSeriesVisualsInBackground(series);
+      return current;
+    }
     final refreshed =
         await widget.controller.refreshRemoteSeriesVisuals(series);
     return _matchingEpisodeInSeries(refreshed, episode);
+  }
+
+  bool _episodeHasPlaybackRoute(EpisodeItem episode) {
+    if (episode.filePath.trim().isNotEmpty) {
+      return true;
+    }
+    if (!episode.isRemote) {
+      return false;
+    }
+    return episode.watchUrl.trim().isNotEmpty ||
+        episode.slug.trim().isNotEmpty ||
+        episode.provider != null;
+  }
+
+  void _refreshSeriesVisualsInBackground(SeriesItem series) {
+    unawaited(() async {
+      try {
+        await widget.controller.refreshRemoteSeriesVisuals(series);
+      } catch (error) {
+        _debugPlayerEvent('background visual refresh ignored: $error');
+      }
+    }());
   }
 
   EpisodeItem _matchingEpisodeInSeries(SeriesItem series, EpisodeItem episode) {
@@ -5686,6 +5789,8 @@ class _YoutubeWebControls extends StatefulWidget {
 
 class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
   double? _dragPositionMs;
+  Timer? _keyboardSeekTimer;
+  Duration? _pendingKeyboardSeek;
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
@@ -5707,14 +5812,33 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
     setState(() {
       _dragPositionMs = clamped.inMilliseconds.toDouble();
     });
-    unawaited(widget.onSeek(clamped).whenComplete(() {
-      if (mounted) {
-        setState(() {
-          _dragPositionMs = null;
-        });
-      }
-    }));
+    _scheduleKeyboardSeek(clamped);
     return KeyEventResult.handled;
+  }
+
+  void _scheduleKeyboardSeek(Duration target) {
+    _pendingKeyboardSeek = target;
+    _keyboardSeekTimer?.cancel();
+    _keyboardSeekTimer = Timer(const Duration(milliseconds: 260), () {
+      final pending = _pendingKeyboardSeek;
+      _pendingKeyboardSeek = null;
+      if (pending == null) {
+        return;
+      }
+      unawaited(widget.onSeek(pending).whenComplete(() {
+        if (mounted && _pendingKeyboardSeek == null) {
+          setState(() {
+            _dragPositionMs = null;
+          });
+        }
+      }));
+    });
+  }
+
+  @override
+  void dispose() {
+    _keyboardSeekTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -5784,6 +5908,8 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
                           });
                         },
                         onChangeEnd: (position) {
+                          _keyboardSeekTimer?.cancel();
+                          _pendingKeyboardSeek = null;
                           setState(() {
                             _dragPositionMs = null;
                           });
@@ -6009,6 +6135,8 @@ class _AndroidExoControls extends StatefulWidget {
 
 class _AndroidExoControlsState extends State<_AndroidExoControls> {
   double? _dragPositionMs;
+  Timer? _keyboardSeekTimer;
+  Duration? _pendingKeyboardSeek;
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
@@ -6033,14 +6161,33 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
     setState(() {
       _dragPositionMs = clamped.inMilliseconds.toDouble();
     });
-    unawaited(widget.onSeek(clamped).whenComplete(() {
-      if (mounted) {
-        setState(() {
-          _dragPositionMs = null;
-        });
-      }
-    }));
+    _scheduleKeyboardSeek(clamped);
     return KeyEventResult.handled;
+  }
+
+  void _scheduleKeyboardSeek(Duration target) {
+    _pendingKeyboardSeek = target;
+    _keyboardSeekTimer?.cancel();
+    _keyboardSeekTimer = Timer(const Duration(milliseconds: 260), () {
+      final pending = _pendingKeyboardSeek;
+      _pendingKeyboardSeek = null;
+      if (pending == null) {
+        return;
+      }
+      unawaited(widget.onSeek(pending).whenComplete(() {
+        if (mounted && _pendingKeyboardSeek == null) {
+          setState(() {
+            _dragPositionMs = null;
+          });
+        }
+      }));
+    });
+  }
+
+  @override
+  void dispose() {
+    _keyboardSeekTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -6111,6 +6258,8 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
                           });
                         },
                         onChangeEnd: (position) {
+                          _keyboardSeekTimer?.cancel();
+                          _pendingKeyboardSeek = null;
                           setState(() {
                             _dragPositionMs = null;
                           });
@@ -6170,6 +6319,8 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
   StreamSubscription<vlc.PositionState>? _positionSubscription;
   StreamSubscription<vlc.PlaybackState>? _playbackSubscription;
   double? _dragPositionMs;
+  Timer? _keyboardSeekTimer;
+  Duration? _pendingKeyboardSeek;
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
@@ -6194,14 +6345,27 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
     setState(() {
       _dragPositionMs = clamped.inMilliseconds.toDouble();
     });
-    unawaited(widget.onSeek(clamped).whenComplete(() {
-      if (mounted) {
-        setState(() {
-          _dragPositionMs = null;
-        });
-      }
-    }));
+    _scheduleKeyboardSeek(clamped);
     return KeyEventResult.handled;
+  }
+
+  void _scheduleKeyboardSeek(Duration target) {
+    _pendingKeyboardSeek = target;
+    _keyboardSeekTimer?.cancel();
+    _keyboardSeekTimer = Timer(const Duration(milliseconds: 260), () {
+      final pending = _pendingKeyboardSeek;
+      _pendingKeyboardSeek = null;
+      if (pending == null) {
+        return;
+      }
+      unawaited(widget.onSeek(pending).whenComplete(() {
+        if (mounted && _pendingKeyboardSeek == null) {
+          setState(() {
+            _dragPositionMs = null;
+          });
+        }
+      }));
+    });
   }
 
   @override
@@ -6235,6 +6399,7 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
 
   @override
   void dispose() {
+    _keyboardSeekTimer?.cancel();
     unawaited(_positionSubscription?.cancel());
     unawaited(_playbackSubscription?.cancel());
     super.dispose();
@@ -6310,6 +6475,8 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
                           });
                         },
                         onChangeEnd: (value) {
+                          _keyboardSeekTimer?.cancel();
+                          _pendingKeyboardSeek = null;
                           setState(() {
                             _dragPositionMs = null;
                           });
