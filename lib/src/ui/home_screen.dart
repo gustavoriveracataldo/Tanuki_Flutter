@@ -75,6 +75,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _profilePickerVisible = false;
   bool _handlingTrailerDetailRequest = false;
   final Set<String> _continueWatchingVisualHydrationKeys = {};
+  final Map<String, DateTime> _continueWatchingVisualHydrationAttempts = {};
 
   @override
   void initState() {
@@ -470,9 +471,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _updateAnimePanelOpacity(double offset) {
-    if (offset != _animePanelScrollOffset) {
+    final steppedOffset = (offset / 4).roundToDouble() * 4;
+    if ((steppedOffset - _animePanelScrollOffset).abs() >= 4) {
       setState(() {
-        _animePanelScrollOffset = offset;
+        _animePanelScrollOffset = steppedOffset;
       });
     }
   }
@@ -540,13 +542,24 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _scheduleContinueWatchingVisualHydration(AppController controller) {
     final entries = _continueWatchingEntries(controller);
+    final now = DateTime.now();
+    _continueWatchingVisualHydrationAttempts.removeWhere(
+      (_, attemptedAt) =>
+          now.difference(attemptedAt) > const Duration(hours: 1),
+    );
     for (final entry in entries) {
       final series = entry.series;
+      final lastAttempt = series == null
+          ? null
+          : _continueWatchingVisualHydrationAttempts[series.stableKey];
       if (series == null ||
           !_continueWatchingEntryNeedsVisualHydration(entry) ||
+          (lastAttempt != null &&
+              now.difference(lastAttempt) < const Duration(minutes: 10)) ||
           !_continueWatchingVisualHydrationKeys.add(series.stableKey)) {
         continue;
       }
+      _continueWatchingVisualHydrationAttempts[series.stableKey] = now;
       unawaited(() async {
         try {
           await controller.refreshRemoteSeriesVisuals(series);
@@ -1780,12 +1793,10 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
   final TextEditingController _profileNameController = TextEditingController();
   final FocusScopeNode _focusScopeNode =
       FocusScopeNode(debugLabel: 'profileOverlayScope');
+  final FocusNode _profileNameFocusNode =
+      FocusNode(debugLabel: 'profileNameInput');
   final FocusNode _manageProfilesButtonFocusNode =
       FocusNode(debugLabel: 'manageProfilesButton');
-  late final List<FocusNode> _avatarFocusNodes = List.generate(
-    _profileAvatarPresets.length,
-    (index) => FocusNode(debugLabel: 'profileAvatar$index'),
-  );
   _ProfileOverlayMode _mode = _ProfileOverlayMode.picker;
   String _selectedProfileId = '';
 
@@ -1802,10 +1813,8 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
   @override
   void dispose() {
     _profileNameController.dispose();
+    _profileNameFocusNode.dispose();
     _manageProfilesButtonFocusNode.dispose();
-    for (final node in _avatarFocusNodes) {
-      node.dispose();
-    }
     _focusScopeNode.dispose();
     super.dispose();
   }
@@ -1817,49 +1826,60 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
       autofocus: true,
       onKeyEvent: _handleOverlayKeyEvent,
       child: FocusTraversalGroup(
+        policy: OrderedTraversalPolicy(),
         child: Material(
-          color: const Color(0xE812141A),
-          child: InkWell(
-            onTap: widget.onClose,
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final maxPanelWidth =
-                    _mode == _ProfileOverlayMode.picker ? 760.0 : 680.0;
-                final availableWidth = constraints.maxWidth - 32;
-                final panelWidth = availableWidth < maxPanelWidth
-                    ? availableWidth
-                    : maxPanelWidth;
-                return Center(
-                  child: InkWell(
-                    onTap: () {},
-                    child: Container(
-                      constraints: BoxConstraints(
-                        minWidth: constraints.maxWidth >= 700 ? 620 : 0,
-                        maxWidth: panelWidth,
-                      ),
-                      padding: const EdgeInsets.fromLTRB(44, 28, 44, 28),
-                      decoration:
-                          glassDecoration(color: const Color(0xEE141D28)),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            _title,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: TanukiColors.text,
-                              fontSize: 27,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                          const SizedBox(height: 24),
-                          _buildBody(),
-                        ],
-                      ),
+          color: Colors.black,
+          child: DecoratedBox(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Color(0xFF101924),
+                  Color(0xFF080C12),
+                  Color(0xFF05070B),
+                ],
+              ),
+            ),
+            child: SafeArea(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final compact = constraints.maxWidth < 760;
+                  return Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: compact ? 22 : 56,
+                      vertical: compact ? 28 : 44,
                     ),
-                  ),
-                );
-              },
+                    child: Column(
+                      children: [
+                        SizedBox(height: compact ? 12 : 36),
+                        Text(
+                          _title,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: TanukiColors.text,
+                            fontSize: compact ? 30 : 40,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        const Spacer(),
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          switchInCurve: Curves.easeOut,
+                          switchOutCurve: Curves.easeIn,
+                          child: KeyedSubtree(
+                            key: ValueKey(_mode),
+                            child: _buildBody(compact: compact),
+                          ),
+                        ),
+                        const Spacer(),
+                        _buildFooter(compact: compact),
+                        SizedBox(height: compact ? 8 : 18),
+                      ],
+                    ),
+                  );
+                },
+              ),
             ),
           ),
         ),
@@ -1867,15 +1887,395 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
     );
   }
 
+  Widget _buildFooter({required bool compact}) {
+    return switch (_mode) {
+      _ProfileOverlayMode.picker => SizedBox(
+          height: 48,
+          child: OutlinedButton.icon(
+            focusNode: _manageProfilesButtonFocusNode,
+            onPressed: () => _setMode(_ProfileOverlayMode.manage),
+            icon: const Icon(Icons.edit),
+            label: const Text('Administrar perfiles'),
+            style: OutlinedButton.styleFrom(
+              minimumSize: Size(compact ? 190 : 230, 46),
+              side: const BorderSide(color: TanukiColors.panelStroke),
+            ),
+          ),
+        ),
+      _ProfileOverlayMode.manage => _FooterButtons(
+          compact: compact,
+          children: [
+            OutlinedButton.icon(
+              onPressed: _openCreate,
+              icon: const Icon(Icons.person_add),
+              label: const Text('Agregar perfil'),
+            ),
+            OutlinedButton(
+              onPressed: () => _setMode(_ProfileOverlayMode.picker),
+              child: const Text('Volver'),
+            ),
+          ],
+        ),
+      _ProfileOverlayMode.actions ||
+      _ProfileOverlayMode.avatar ||
+      _ProfileOverlayMode.delete =>
+        _FooterButtons(
+          compact: compact,
+          children: [
+            OutlinedButton(
+              onPressed: () => _setMode(_ProfileOverlayMode.manage),
+              child: const Text('Volver'),
+            ),
+          ],
+        ),
+      _ProfileOverlayMode.create ||
+      _ProfileOverlayMode.rename =>
+        const SizedBox(
+          height: 48,
+        ),
+    };
+  }
+
+  Widget _buildBody({required bool compact}) {
+    return switch (_mode) {
+      _ProfileOverlayMode.picker => _buildPicker(compact: compact),
+      _ProfileOverlayMode.manage => _buildManage(compact: compact),
+      _ProfileOverlayMode.actions => _buildActions(compact: compact),
+      _ProfileOverlayMode.create => _buildNameForm(
+          hint: 'Nombre del perfil',
+          primaryLabel: 'Crear',
+          onSubmit: _submitCreate,
+        ),
+      _ProfileOverlayMode.rename => _buildNameForm(
+          hint: 'Nombre del perfil',
+          primaryLabel: 'Guardar',
+          onSubmit: _submitRename,
+        ),
+      _ProfileOverlayMode.avatar => _buildAvatarGrid(compact: compact),
+      _ProfileOverlayMode.delete => _buildDeleteConfirm(),
+    };
+  }
+
+  Widget _buildPicker({required bool compact}) {
+    final profiles = controller.profiles;
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      clipBehavior: Clip.none,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 18),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          for (var index = 0; index < profiles.length; index++) ...[
+            FocusTraversalOrder(
+              order: NumericFocusOrder(index.toDouble()),
+              child: _ProfileHubTile(
+                profile: profiles[index],
+                active: profiles[index].id == controller.activeProfileId,
+                isDefault: profiles[index].id == controller.defaultProfileId,
+                compact: compact,
+                onPressed: () => widget.onSelectProfile(profiles[index].id),
+              ),
+            ),
+            SizedBox(width: compact ? 22 : 34),
+          ],
+          FocusTraversalOrder(
+            order: NumericFocusOrder((profiles.length + 1).toDouble()),
+            child: _ProfileHubTile.add(
+              compact: compact,
+              onPressed: _openCreate,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildManage({required bool compact}) {
+    final profiles = controller.profiles;
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      clipBehavior: Clip.none,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 18),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          for (var index = 0; index < profiles.length; index++) ...[
+            _ProfileHubTile.manage(
+              profile: profiles[index],
+              active: profiles[index].id == controller.activeProfileId,
+              isDefault: profiles[index].id == controller.defaultProfileId,
+              compact: compact,
+              onPressed: () {
+                setState(() {
+                  _selectedProfileId = profiles[index].id;
+                  _mode = _ProfileOverlayMode.actions;
+                });
+                _focusNextFrame();
+              },
+            ),
+            SizedBox(width: compact ? 22 : 34),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActions({required bool compact}) {
+    final profile = _selectedProfile;
+    final defaultActive = profile.id == controller.defaultProfileId &&
+        controller.defaultProfileId.isNotEmpty;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 520),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _ProfileAvatar(
+            profile: profile,
+            size: compact ? 112 : 138,
+            radius: compact ? 56 : 69,
+            fontSize: compact ? 42 : 50,
+          ),
+          const SizedBox(height: 18),
+          Text(
+            profile.name.trim().isEmpty ? 'Perfil' : profile.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: TanukiColors.text,
+              fontSize: 22,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+          const SizedBox(height: 22),
+          _ProfileActionGrid(
+            children: [
+              _ProfileActionPill(
+                icon: Icons.check_circle_outline,
+                label: 'Seleccionar',
+                onPressed: () => widget.onSelectProfile(profile.id),
+              ),
+              _ProfileActionPill(
+                icon: Icons.edit,
+                label: 'Renombrar',
+                onPressed: () => _openRename(profile),
+              ),
+              _ProfileActionPill(
+                icon: Icons.palette_outlined,
+                label: 'Avatar',
+                onPressed: () => _setMode(_ProfileOverlayMode.avatar),
+              ),
+              _ProfileActionPill(
+                icon: Icons.star_outline,
+                label: defaultActive ? 'No predeterminado' : 'Predeterminado',
+                onPressed: () async {
+                  await widget.onSetDefaultProfile(
+                    defaultActive ? null : profile.id,
+                  );
+                  if (!mounted) {
+                    return;
+                  }
+                  _setMode(_ProfileOverlayMode.actions);
+                },
+              ),
+              if (controller.profiles.length > 1)
+                _ProfileActionPill(
+                  icon: Icons.delete_outline,
+                  label: 'Eliminar',
+                  danger: true,
+                  onPressed: () => _setMode(_ProfileOverlayMode.delete),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAvatarGrid({required bool compact}) {
+    final profile = _selectedProfile;
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: compact ? 520 : 760),
+      child: Wrap(
+        alignment: WrapAlignment.center,
+        spacing: compact ? 20 : 28,
+        runSpacing: compact ? 18 : 26,
+        children: [
+          for (var index = 0; index < _profileAvatarPresets.length; index++)
+            _AvatarPresetButton(
+              preset: _profileAvatarPresets[index],
+              label: 'Avatar ${index + 1}',
+              initial: _profileInitial(profile),
+              selected:
+                  profile.avatarPresetId == _profileAvatarPresets[index].id,
+              compact: compact,
+              autofocus: profile.avatarPresetId.trim().isEmpty
+                  ? index == 0
+                  : profile.avatarPresetId == _profileAvatarPresets[index].id,
+              onTap: () async {
+                await widget.onChangeProfileAvatar(
+                  profile.id,
+                  _profileAvatarPresets[index].id,
+                );
+                if (!mounted) {
+                  return;
+                }
+                _setMode(_ProfileOverlayMode.actions);
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDeleteConfirm() {
+    final profile = _selectedProfile;
+    final displayName = profile.name.trim().isEmpty ? 'Perfil' : profile.name;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 520),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.warning_amber_rounded,
+            color: TanukiColors.danger,
+            size: 54,
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Se borrara el perfil $displayName y sus listas/progreso guardados.',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: TanukiColors.muted,
+              fontSize: 15,
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: 24),
+          _FooterButtons(
+            compact: false,
+            children: [
+              FilledButton.icon(
+                onPressed: () async {
+                  await widget.onDeleteProfile(profile.id);
+                  if (!mounted) {
+                    return;
+                  }
+                  _selectedProfileId = '';
+                  _setMode(_ProfileOverlayMode.manage);
+                },
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Eliminar'),
+              ),
+              OutlinedButton(
+                onPressed: () => _setMode(_ProfileOverlayMode.actions),
+                child: const Text('Cancelar'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNameForm({
+    required String hint,
+    required String primaryLabel,
+    required Future<void> Function() onSubmit,
+  }) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 460),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _profileNameController,
+            focusNode: _profileNameFocusNode,
+            autofocus: true,
+            decoration: InputDecoration(hintText: hint),
+            onSubmitted: (_) => onSubmit(),
+          ),
+          const SizedBox(height: 22),
+          _FooterButtons(
+            compact: false,
+            children: [
+              FilledButton(
+                onPressed: onSubmit,
+                child: Text(primaryLabel),
+              ),
+              OutlinedButton(
+                onPressed: () => _setMode(
+                  _mode == _ProfileOverlayMode.create
+                      ? _ProfileOverlayMode.manage
+                      : _ProfileOverlayMode.actions,
+                ),
+                child: const Text('Cancelar'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _setMode(_ProfileOverlayMode mode) {
+    setState(() {
+      _mode = mode;
+    });
+    _focusNextFrame();
+  }
+
+  void _focusNextFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _focusFirstControlForMode();
+      }
+    });
+  }
+
+  void _focusFirstControlForMode() {
+    if (!mounted) {
+      return;
+    }
+    if (_mode == _ProfileOverlayMode.picker) {
+      _manageProfilesButtonFocusNode.requestFocus();
+      return;
+    }
+    if (_mode == _ProfileOverlayMode.create ||
+        _mode == _ProfileOverlayMode.rename) {
+      _profileNameFocusNode.requestFocus();
+      return;
+    }
+    _focusScopeNode.requestFocus();
+    _focusScopeNode.nextFocus();
+  }
+
+  void _goBack() {
+    switch (_mode) {
+      case _ProfileOverlayMode.picker:
+        widget.onClose();
+      case _ProfileOverlayMode.manage:
+        _setMode(_ProfileOverlayMode.picker);
+      case _ProfileOverlayMode.actions:
+        _setMode(_ProfileOverlayMode.manage);
+      case _ProfileOverlayMode.avatar:
+      case _ProfileOverlayMode.delete:
+      case _ProfileOverlayMode.rename:
+        _setMode(_ProfileOverlayMode.actions);
+      case _ProfileOverlayMode.create:
+        _setMode(_ProfileOverlayMode.manage);
+    }
+  }
+
   KeyEventResult _handleOverlayKeyEvent(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
     if (key == LogicalKeyboardKey.goBack ||
         key == LogicalKeyboardKey.browserBack ||
         key == LogicalKeyboardKey.escape) {
-      widget.onClose();
+      _goBack();
       return KeyEventResult.handled;
     }
     final direction = switch (key) {
@@ -1885,15 +2285,18 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
       LogicalKeyboardKey.arrowRight => TraversalDirection.right,
       _ => null,
     };
-    if (direction != null) {
-      if (!_hasFocusedOverlayDescendant()) {
-        _focusFirstControlForMode();
-      } else {
-        _focusScopeNode.focusInDirection(direction);
-      }
+    if (direction == null) {
+      return KeyEventResult.ignored;
+    }
+    if (!_hasFocusedOverlayDescendant()) {
+      _focusFirstControlForMode();
       return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+    final moved = _focusScopeNode.focusInDirection(direction);
+    if (!moved) {
+      FocusManager.instance.primaryFocus?.requestFocus();
+    }
+    return KeyEventResult.handled;
   }
 
   bool _hasFocusedOverlayDescendant() {
@@ -1903,33 +2306,17 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
         _focusScopeNode.descendants.contains(primaryFocus);
   }
 
-  void _focusFirstControlForMode() {
-    if (!mounted) {
-      return;
-    }
-    if (_mode == _ProfileOverlayMode.avatar && _avatarFocusNodes.isNotEmpty) {
-      _avatarFocusNodes[_selectedAvatarPresetIndex()].requestFocus();
-      return;
-    }
-    if (_mode == _ProfileOverlayMode.picker) {
-      _manageProfilesButtonFocusNode.requestFocus();
-      return;
-    }
-    _focusScopeNode.requestFocus();
-    _focusScopeNode.nextFocus();
-  }
-
   AppController get controller => widget.controller;
 
   String get _title {
     return switch (_mode) {
-      _ProfileOverlayMode.picker => 'Cambiar usuario',
+      _ProfileOverlayMode.picker => '¿Quien esta viendo?',
       _ProfileOverlayMode.manage => 'Administrar perfiles',
       _ProfileOverlayMode.actions =>
         _selectedProfile.name.trim().isEmpty ? 'Perfil' : _selectedProfile.name,
       _ProfileOverlayMode.create => 'Nuevo perfil',
       _ProfileOverlayMode.rename => 'Renombrar perfil',
-      _ProfileOverlayMode.avatar => 'Cambiar avatar',
+      _ProfileOverlayMode.avatar => 'Elige un avatar',
       _ProfileOverlayMode.delete => 'Eliminar perfil',
     };
   }
@@ -1946,365 +2333,12 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
     return controller.state.profile;
   }
 
-  Widget _buildBody() {
-    return switch (_mode) {
-      _ProfileOverlayMode.picker => _buildPicker(),
-      _ProfileOverlayMode.manage => _buildManage(),
-      _ProfileOverlayMode.actions => _buildActions(),
-      _ProfileOverlayMode.create => _buildNameForm(
-          hint: 'Nombre del perfil',
-          primaryLabel: 'Crear',
-          onSubmit: _submitCreate,
-        ),
-      _ProfileOverlayMode.rename => _buildNameForm(
-          hint: 'Nombre del perfil',
-          primaryLabel: 'Guardar',
-          onSubmit: _submitRename,
-        ),
-      _ProfileOverlayMode.avatar => _buildAvatarGrid(),
-      _ProfileOverlayMode.delete => _buildDeleteConfirm(),
-    };
-  }
-
-  Widget _buildPicker() {
-    final profiles = controller.profiles;
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final profileRowHeight = (screenHeight * 0.38).clamp(180.0, 260.0);
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        SizedBox(
-          height: profileRowHeight,
-          child: ListView.separated(
-            clipBehavior: Clip.none,
-            scrollDirection: Axis.horizontal,
-            shrinkWrap: true,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            itemBuilder: (context, index) {
-              final profile = profiles[index];
-              return _ProfileTile(
-                profile: profile,
-                active: profile.id == controller.activeProfileId,
-                isDefault: profile.id == controller.defaultProfileId,
-                onSelect: () => widget.onSelectProfile(profile.id),
-              );
-            },
-            separatorBuilder: (_, __) => const SizedBox(width: 14),
-            itemCount: profiles.length,
-          ),
-        ),
-        const SizedBox(height: 22),
-        SizedBox(
-          height: 42,
-          child: OutlinedButton.icon(
-            focusNode: _manageProfilesButtonFocusNode,
-            onPressed: () {
-              setState(() {
-                _mode = _ProfileOverlayMode.manage;
-              });
-            },
-            icon: const Icon(Icons.manage_accounts),
-            label: const Text('Administrar perfiles'),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildManage() {
-    final profiles = controller.profiles;
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final manageListMaxHeight = (screenHeight * 0.5).clamp(260.0, 380.0);
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: manageListMaxHeight),
-          child: ListView.separated(
-            shrinkWrap: true,
-            itemBuilder: (context, index) {
-              final profile = profiles[index];
-              return _ProfileManagementRow(
-                profile: profile,
-                meta: _profileMeta(profile),
-                onTap: () {
-                  setState(() {
-                    _selectedProfileId = profile.id;
-                    _mode = _ProfileOverlayMode.actions;
-                  });
-                },
-              );
-            },
-            separatorBuilder: (_, __) => const SizedBox(height: 10),
-            itemCount: profiles.length,
-          ),
-        ),
-        const SizedBox(height: 22),
-        Wrap(
-          alignment: WrapAlignment.center,
-          spacing: 12,
-          runSpacing: 10,
-          children: [
-            OutlinedButton.icon(
-              onPressed: _openCreate,
-              icon: const Icon(Icons.person_add),
-              label: const Text('Agregar perfil'),
-            ),
-            OutlinedButton(
-              onPressed: () {
-                setState(() {
-                  _mode = _ProfileOverlayMode.picker;
-                });
-              },
-              child: const Text('Cerrar'),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildActions() {
-    final profile = _selectedProfile;
-    final defaultActive = profile.id == controller.defaultProfileId &&
-        controller.defaultProfileId.isNotEmpty;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _ProfileActionButton(
-          icon: Icons.check_circle_outline,
-          label: 'Seleccionar ahora',
-          onPressed: () => widget.onSelectProfile(profile.id),
-        ),
-        _ProfileActionButton(
-          icon: Icons.edit,
-          label: 'Renombrar',
-          onPressed: () => _openRename(profile),
-        ),
-        _ProfileActionButton(
-          icon: Icons.palette_outlined,
-          label: 'Cambiar avatar',
-          onPressed: _openAvatarPicker,
-        ),
-        _ProfileActionButton(
-          icon: Icons.star_outline,
-          label: defaultActive
-              ? 'Quitar perfil predeterminado'
-              : 'Establecer como predeterminado',
-          onPressed: () async {
-            await widget.onSetDefaultProfile(defaultActive ? null : profile.id);
-            if (!mounted) {
-              return;
-            }
-            setState(() {
-              _mode = _ProfileOverlayMode.actions;
-            });
-          },
-        ),
-        if (controller.profiles.length > 1)
-          _ProfileActionButton(
-            icon: Icons.delete_outline,
-            label: 'Eliminar perfil',
-            danger: true,
-            onPressed: () {
-              setState(() {
-                _mode = _ProfileOverlayMode.delete;
-              });
-            },
-          ),
-        const SizedBox(height: 14),
-        OutlinedButton(
-          onPressed: () {
-            setState(() {
-              _mode = _ProfileOverlayMode.manage;
-            });
-          },
-          child: const Text('Volver'),
-        ),
-      ],
-    );
-  }
-
-  void _openAvatarPicker() {
-    setState(() {
-      _mode = _ProfileOverlayMode.avatar;
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _avatarFocusNodes.isEmpty) {
-        return;
-      }
-      _avatarFocusNodes[_selectedAvatarPresetIndex()].requestFocus();
-    });
-  }
-
-  int _selectedAvatarPresetIndex() {
-    final avatarPresetId = _selectedProfile.avatarPresetId.trim();
-    if (avatarPresetId.isEmpty) {
-      return 0;
-    }
-    final index = _profileAvatarPresets.indexWhere(
-      (preset) => preset.id == avatarPresetId,
-    );
-    return index < 0 ? 0 : index;
-  }
-
-  Widget _buildNameForm({
-    required String hint,
-    required String primaryLabel,
-    required Future<void> Function() onSubmit,
-  }) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        TextField(
-          controller: _profileNameController,
-          autofocus: true,
-          decoration: InputDecoration(hintText: hint),
-          onSubmitted: (_) => onSubmit(),
-        ),
-        const SizedBox(height: 22),
-        Wrap(
-          alignment: WrapAlignment.center,
-          spacing: 12,
-          runSpacing: 10,
-          children: [
-            FilledButton(
-              onPressed: onSubmit,
-              child: Text(primaryLabel),
-            ),
-            OutlinedButton(
-              onPressed: () {
-                setState(() {
-                  _mode = _mode == _ProfileOverlayMode.create
-                      ? _ProfileOverlayMode.manage
-                      : _ProfileOverlayMode.actions;
-                });
-              },
-              child: const Text('Cancelar'),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAvatarGrid() {
-    final profile = _selectedProfile;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Wrap(
-          alignment: WrapAlignment.center,
-          spacing: 14,
-          runSpacing: 14,
-          children: [
-            for (var index = 0; index < _profileAvatarPresets.length; index++)
-              _AvatarPresetButton(
-                preset: _profileAvatarPresets[index],
-                label: 'Avatar ${index + 1}',
-                initial: _profileInitial(profile),
-                selected:
-                    profile.avatarPresetId == _profileAvatarPresets[index].id,
-                focusNode: _avatarFocusNodes[index],
-                autofocus: profile.avatarPresetId.trim().isEmpty
-                    ? index == 0
-                    : profile.avatarPresetId == _profileAvatarPresets[index].id,
-                onTap: () async {
-                  await widget.onChangeProfileAvatar(
-                    profile.id,
-                    _profileAvatarPresets[index].id,
-                  );
-                  if (!mounted) {
-                    return;
-                  }
-                  setState(() {
-                    _mode = _ProfileOverlayMode.actions;
-                  });
-                },
-              ),
-          ],
-        ),
-        const SizedBox(height: 22),
-        OutlinedButton(
-          onPressed: () {
-            setState(() {
-              _mode = _ProfileOverlayMode.actions;
-            });
-          },
-          child: const Text('Volver'),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildDeleteConfirm() {
-    final profile = _selectedProfile;
-    final displayName = profile.name.trim().isEmpty ? 'Perfil' : profile.name;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'Se borrara el perfil $displayName y sus listas/progreso guardados.',
-          textAlign: TextAlign.center,
-          style: const TextStyle(
-            color: TanukiColors.muted,
-            fontSize: 14,
-            height: 1.35,
-          ),
-        ),
-        const SizedBox(height: 22),
-        Wrap(
-          alignment: WrapAlignment.center,
-          spacing: 12,
-          runSpacing: 10,
-          children: [
-            FilledButton.icon(
-              onPressed: () async {
-                await widget.onDeleteProfile(profile.id);
-                if (!mounted) {
-                  return;
-                }
-                setState(() {
-                  _selectedProfileId = '';
-                  _mode = _ProfileOverlayMode.manage;
-                });
-              },
-              icon: const Icon(Icons.delete_outline),
-              label: const Text('Eliminar'),
-            ),
-            OutlinedButton(
-              onPressed: () {
-                setState(() {
-                  _mode = _ProfileOverlayMode.actions;
-                });
-              },
-              child: const Text('Cancelar'),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  String _profileMeta(UserProfileState profile) {
-    final parts = <String>[];
-    if (profile.id == controller.activeProfileId) {
-      parts.add('activo');
-    }
-    if (profile.id == controller.defaultProfileId) {
-      parts.add('predeterminado');
-    }
-    return parts.isEmpty ? '' : parts.join(' | ');
-  }
-
   void _openCreate() {
     _profileNameController.text = 'Perfil ${controller.profiles.length + 1}';
     _profileNameController.selection = TextSelection.fromPosition(
       TextPosition(offset: _profileNameController.text.length),
     );
-    setState(() {
-      _mode = _ProfileOverlayMode.create;
-    });
+    _setMode(_ProfileOverlayMode.create);
   }
 
   void _openRename(UserProfileState profile) {
@@ -2316,6 +2350,7 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
       _selectedProfileId = profile.id;
       _mode = _ProfileOverlayMode.rename;
     });
+    _focusNextFrame();
   }
 
   Future<void> _submitCreate() async {
@@ -2323,10 +2358,8 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
     if (!mounted) {
       return;
     }
-    setState(() {
-      _selectedProfileId = controller.activeProfileId;
-      _mode = _ProfileOverlayMode.manage;
-    });
+    _selectedProfileId = controller.activeProfileId;
+    _setMode(_ProfileOverlayMode.manage);
   }
 
   Future<void> _submitRename() async {
@@ -2335,157 +2368,194 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
     if (!mounted) {
       return;
     }
-    setState(() {
-      _mode = _ProfileOverlayMode.actions;
-    });
+    _setMode(_ProfileOverlayMode.actions);
   }
 }
 
-class _ProfileTile extends StatelessWidget {
-  const _ProfileTile({
-    required this.profile,
-    required this.active,
-    required this.isDefault,
-    required this.onSelect,
+class _FooterButtons extends StatelessWidget {
+  const _FooterButtons({
+    required this.compact,
+    required this.children,
   });
 
-  final UserProfileState profile;
-  final bool active;
-  final bool isDefault;
-  final VoidCallback onSelect;
+  final bool compact;
+  final List<Widget> children;
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final tileWidth = (screenWidth * 0.14).clamp(120.0, 160.0);
+    return Wrap(
+      alignment: WrapAlignment.center,
+      spacing: compact ? 10 : 14,
+      runSpacing: 10,
+      children: children,
+    );
+  }
+}
+
+class _ProfileHubTile extends StatelessWidget {
+  const _ProfileHubTile({
+    required this.profile,
+    required this.active,
+    required this.isDefault,
+    required this.compact,
+    required this.onPressed,
+  })  : add = false,
+        manage = false;
+
+  const _ProfileHubTile.add({
+    required this.compact,
+    required this.onPressed,
+  })  : profile = null,
+        active = false,
+        isDefault = false,
+        add = true,
+        manage = false;
+
+  const _ProfileHubTile.manage({
+    required this.profile,
+    required this.active,
+    required this.isDefault,
+    required this.compact,
+    required this.onPressed,
+  })  : add = false,
+        manage = true;
+
+  final UserProfileState? profile;
+  final bool active;
+  final bool isDefault;
+  final bool compact;
+  final VoidCallback onPressed;
+  final bool add;
+  final bool manage;
+
+  @override
+  Widget build(BuildContext context) {
+    final profile = this.profile;
+    final diameter = compact ? 104.0 : 140.0;
+    final tileWidth = compact ? 136.0 : 178.0;
+    final name = add
+        ? 'Nuevo perfil'
+        : (profile?.name.trim().isEmpty ?? true)
+            ? 'Perfil'
+            : profile!.name;
     return SizedBox(
       width: tileWidth,
-      child: InkWell(
-        onTap: onSelect,
-        borderRadius: BorderRadius.circular(26),
-        child: Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: active ? const Color(0xFF171E27) : Colors.transparent,
-            borderRadius: BorderRadius.circular(26),
-            border: Border.all(
-              color:
-                  isDefault ? const Color(0xFF94A5B7) : const Color(0xFF24303D),
-              width: isDefault ? 3 : 1,
-            ),
-          ),
-          child: Column(
+      child: _RemoteFocusButton(
+        onPressed: onPressed,
+        borderRadius: BorderRadius.circular(diameter / 2),
+        builder: (context, focused, hovered) {
+          final highlighted = focused || hovered;
+          return Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              _ProfileAvatar(
-                profile: profile,
-                size: 114,
-                radius: 28,
-                fontSize: 40,
+              AnimatedScale(
+                scale: focused ? 1.08 : 1,
+                duration: const Duration(milliseconds: 140),
+                curve: Curves.easeOut,
+                child: Container(
+                  width: diameter,
+                  height: diameter,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: add ? const Color(0xFF171E27) : Colors.transparent,
+                    border: Border.all(
+                      color: highlighted
+                          ? TanukiColors.orange
+                          : isDefault
+                              ? const Color(0xFF94A5B7)
+                              : active
+                                  ? const Color(0x88F28C28)
+                                  : const Color(0x55334A62),
+                      width: highlighted ? 4 : 2,
+                    ),
+                    boxShadow: highlighted
+                        ? const [
+                            BoxShadow(
+                              color: Color(0x662EA7FF),
+                              blurRadius: 28,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  child: add
+                      ? Icon(
+                          Icons.add,
+                          color: highlighted
+                              ? TanukiColors.text
+                              : TanukiColors.muted,
+                          size: compact ? 54 : 70,
+                        )
+                      : ClipOval(
+                          child: _ProfileAvatar(
+                            profile: profile!,
+                            size: diameter - 10,
+                            radius: diameter / 2,
+                            fontSize: compact ? 38 : 52,
+                          ),
+                        ),
+                ),
               ),
-              const SizedBox(height: 10),
+              const SizedBox(height: 16),
               Text(
-                profile.name.trim().isEmpty ? 'Perfil' : profile.name,
+                name,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: TanukiColors.text,
-                  fontSize: 14,
+                style: TextStyle(
+                  color: highlighted ? TanukiColors.text : TanukiColors.muted,
+                  fontSize: compact ? 13 : 15,
                   fontWeight: FontWeight.w800,
                 ),
               ),
-              const SizedBox(height: 4),
+              SizedBox(height: compact ? 5 : 7),
               SizedBox(
-                height: 24,
+                height: 18,
                 child: Text(
-                  isDefault ? 'Predeterminado' : '',
-                  maxLines: 2,
+                  add
+                      ? ''
+                      : manage
+                          ? 'Editar'
+                          : active
+                              ? 'Activo'
+                              : '',
+                  maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.center,
                   style: const TextStyle(
-                    color: Color(0xFFD3DEE8),
-                    fontSize: 10,
+                    color: TanukiColors.orange,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
               ),
             ],
-          ),
-        ),
+          );
+        },
       ),
     );
   }
 }
 
-class _ProfileManagementRow extends StatelessWidget {
-  const _ProfileManagementRow({
-    required this.profile,
-    required this.meta,
-    required this.onTap,
-  });
+class _ProfileActionGrid extends StatelessWidget {
+  const _ProfileActionGrid({required this.children});
 
-  final UserProfileState profile;
-  final String meta;
-  final VoidCallback onTap;
+  final List<Widget> children;
 
   @override
   Widget build(BuildContext context) {
-    final name = profile.name.trim().isEmpty ? 'Perfil' : profile.name;
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: const Color(0x88101923),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0x6624303D)),
-        ),
-        child: Row(
-          children: [
-            _ProfileAvatar(
-              profile: profile,
-              size: 52,
-              radius: 14,
-              fontSize: 23,
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: TanukiColors.text,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    meta.isEmpty ? 'Perfil guardado' : meta,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: TanukiColors.muted,
-                      fontSize: 12,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const Icon(Icons.chevron_right, color: TanukiColors.subtle),
-          ],
-        ),
-      ),
+    return Wrap(
+      alignment: WrapAlignment.center,
+      spacing: 12,
+      runSpacing: 12,
+      children: children,
     );
   }
 }
 
-class _ProfileActionButton extends StatelessWidget {
-  const _ProfileActionButton({
+class _ProfileActionPill extends StatelessWidget {
+  const _ProfileActionPill({
     required this.icon,
     required this.label,
     required this.onPressed,
@@ -2499,27 +2569,17 @@ class _ProfileActionButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Align(
-        alignment: Alignment.center,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final maxButtonWidth =
-                (constraints.maxWidth * 0.85).clamp(220.0, 360.0);
-            return ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: maxButtonWidth),
-              child: SizedBox(
-                width: double.infinity,
-                height: 44,
-                child: OutlinedButton.icon(
-                  onPressed: onPressed,
-                  icon: Icon(icon, color: danger ? TanukiColors.danger : null),
-                  label: Text(label),
-                ),
-              ),
-            );
-          },
+    return SizedBox(
+      width: 158,
+      height: 46,
+      child: OutlinedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon, color: danger ? TanukiColors.danger : null),
+        label: Text(label, overflow: TextOverflow.ellipsis),
+        style: OutlinedButton.styleFrom(
+          side: BorderSide(
+            color: danger ? TanukiColors.danger : TanukiColors.panelStroke,
+          ),
         ),
       ),
     );
@@ -2532,7 +2592,7 @@ class _AvatarPresetButton extends StatelessWidget {
     required this.label,
     required this.initial,
     required this.selected,
-    required this.focusNode,
+    required this.compact,
     required this.autofocus,
     required this.onTap,
   });
@@ -2541,145 +2601,133 @@ class _AvatarPresetButton extends StatelessWidget {
   final String label;
   final String initial;
   final bool selected;
-  final FocusNode focusNode;
+  final bool compact;
   final bool autofocus;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return _FocusableAvatarPresetButton(
+    final diameter = compact ? 82.0 : 104.0;
+    final fallback = _AvatarFallback(
       preset: preset,
-      label: label,
       initial: initial,
-      selected: selected,
-      focusNode: focusNode,
-      autofocus: autofocus,
-      onTap: onTap,
+      fontSize: compact ? 30 : 38,
+      borderRadius: diameter / 2,
+    );
+    return SizedBox(
+      width: compact ? 104 : 126,
+      child: _RemoteFocusButton(
+        autofocus: autofocus,
+        onPressed: onTap,
+        borderRadius: BorderRadius.circular(diameter / 2),
+        builder: (context, focused, hovered) {
+          final highlighted = focused || hovered;
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedScale(
+                scale: focused ? 1.08 : 1,
+                duration: const Duration(milliseconds: 130),
+                curve: Curves.easeOut,
+                child: Container(
+                  width: diameter,
+                  height: diameter,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: highlighted || selected
+                          ? TanukiColors.orange
+                          : preset.accentColor,
+                      width: highlighted || selected ? 3 : 1,
+                    ),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: preset.assetPath.isEmpty
+                      ? fallback
+                      : Image.asset(
+                          preset.assetPath,
+                          fit: BoxFit.cover,
+                          alignment: Alignment.topCenter,
+                          errorBuilder: (_, __, ___) => fallback,
+                        ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: highlighted ? TanukiColors.text : TanukiColors.muted,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
     );
   }
 }
 
-class _FocusableAvatarPresetButton extends StatefulWidget {
-  const _FocusableAvatarPresetButton({
-    required this.preset,
-    required this.label,
-    required this.initial,
-    required this.selected,
-    required this.focusNode,
-    required this.autofocus,
-    required this.onTap,
+class _RemoteFocusButton extends StatefulWidget {
+  const _RemoteFocusButton({
+    required this.onPressed,
+    required this.builder,
+    required this.borderRadius,
+    this.autofocus = false,
   });
 
-  final _ProfileAvatarPreset preset;
-  final String label;
-  final String initial;
-  final bool selected;
-  final FocusNode focusNode;
+  final VoidCallback onPressed;
+  final Widget Function(BuildContext context, bool focused, bool hovered)
+      builder;
+  final BorderRadius borderRadius;
   final bool autofocus;
-  final VoidCallback onTap;
 
   @override
-  State<_FocusableAvatarPresetButton> createState() =>
-      _FocusableAvatarPresetButtonState();
+  State<_RemoteFocusButton> createState() => _RemoteFocusButtonState();
 }
 
-class _FocusableAvatarPresetButtonState
-    extends State<_FocusableAvatarPresetButton> {
+class _RemoteFocusButtonState extends State<_RemoteFocusButton> {
   bool _focused = false;
   bool _hovered = false;
-
-  bool get _active => _focused || _hovered;
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (!_isRemoteActivateKey(event.logicalKey)) {
       return KeyEventResult.ignored;
     }
     if (event is KeyDownEvent) {
-      widget.onTap();
+      widget.onPressed();
     }
     return KeyEventResult.handled;
   }
 
   @override
   Widget build(BuildContext context) {
-    final fallback = _AvatarFallback(
-      preset: widget.preset,
-      initial: widget.initial,
-      fontSize: 28,
-      borderRadius: 18,
-    );
-    return SizedBox(
-      width: 92,
-      child: Focus(
-        focusNode: widget.focusNode,
-        autofocus: widget.autofocus,
-        onKeyEvent: _handleKey,
-        onFocusChange: (value) {
-          if (_focused != value) {
-            setState(() => _focused = value);
+    return Focus(
+      autofocus: widget.autofocus,
+      onKeyEvent: _handleKey,
+      onFocusChange: (value) {
+        if (_focused != value) {
+          setState(() => _focused = value);
+        }
+      },
+      child: InkWell(
+        canRequestFocus: false,
+        onTap: widget.onPressed,
+        onHover: (value) {
+          if (_hovered != value) {
+            setState(() => _hovered = value);
           }
         },
-        child: InkWell(
-          canRequestFocus: false,
-          onTap: widget.onTap,
-          onHover: (value) {
-            if (_hovered != value) {
-              setState(() => _hovered = value);
-            }
-          },
-          borderRadius: BorderRadius.circular(10),
-          child: Column(
-            children: [
-              SizedBox(
-                width: 78,
-                height: 78,
-                child: Center(
-                  child: AnimatedScale(
-                    scale: _focused ? 1.08 : 1,
-                    duration: const Duration(milliseconds: 120),
-                    curve: Curves.easeOut,
-                    child: Container(
-                      width: 72,
-                      height: 72,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF080C12),
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(
-                          color: widget.selected
-                              ? TanukiColors.orange
-                              : widget.preset.accentColor,
-                          width: widget.selected ? 3 : 1,
-                        ),
-                      ),
-                      clipBehavior: Clip.antiAlias,
-                      child: widget.preset.assetPath.isEmpty
-                          ? fallback
-                          : Image.asset(
-                              widget.preset.assetPath,
-                              fit: BoxFit.cover,
-                              alignment: Alignment.topCenter,
-                              errorBuilder: (_, __, ___) => fallback,
-                            ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                widget.label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: _active ? TanukiColors.text : TanukiColors.muted,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
-        ),
+        borderRadius: widget.borderRadius,
+        focusColor: Colors.transparent,
+        hoverColor: Colors.transparent,
+        splashColor: Colors.transparent,
+        child: widget.builder(context, _focused, _hovered),
       ),
     );
   }
@@ -8832,40 +8880,42 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
           _ensureFocusableVisible(context, alignment: 0.54);
         }
       },
-      child: AnimatedScale(
-        scale: _active ? 1.015 : 1,
-        duration: const Duration(milliseconds: 120),
-        curve: Curves.easeOut,
-        child: Material(
-          color: Colors.transparent,
-          elevation: _active ? 12 : widget.elevation,
-          shadowColor: const Color(0x77000000),
-          borderRadius: BorderRadius.circular(8),
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
-            canRequestFocus: false,
-            onTap: () {
-              if (_remoteLongPressTriggered) {
-                _remoteLongPressTriggered = false;
-                return;
-              }
-              widget.onTap();
-            },
-            onLongPress: widget.onLongPress,
-            onHover: (value) {
-              if (_hovered != value) {
-                setState(() => _hovered = value);
-              }
-            },
-            child: Container(
-              foregroundDecoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: _active ? TanukiColors.orange : Colors.transparent,
-                  width: 3,
+      child: RepaintBoundary(
+        child: AnimatedScale(
+          scale: _active ? 1.015 : 1,
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.easeOut,
+          child: Material(
+            color: Colors.transparent,
+            elevation: _active ? 12 : widget.elevation,
+            shadowColor: const Color(0x77000000),
+            borderRadius: BorderRadius.circular(8),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              canRequestFocus: false,
+              onTap: () {
+                if (_remoteLongPressTriggered) {
+                  _remoteLongPressTriggered = false;
+                  return;
+                }
+                widget.onTap();
+              },
+              onLongPress: widget.onLongPress,
+              onHover: (value) {
+                if (_hovered != value) {
+                  setState(() => _hovered = value);
+                }
+              },
+              child: Container(
+                foregroundDecoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: _active ? TanukiColors.orange : Colors.transparent,
+                    width: 3,
+                  ),
                 ),
+                child: widget.child,
               ),
-              child: widget.child,
             ),
           ),
         ),
@@ -8987,42 +9037,44 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
           _ensureFocusableVisible(context, alignment: 0.48);
         }
       },
-      child: AnimatedScale(
-        scale: _active ? 1.004 : 1,
-        duration: const Duration(milliseconds: 90),
-        curve: Curves.easeOut,
-        child: Material(
-          color: widget.color,
-          elevation: _active ? widget.activeElevation : widget.elevation,
-          borderRadius: BorderRadius.circular(widget.borderRadius),
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
-            canRequestFocus: false,
-            onTap: () {
-              if (!widget.enabled) {
-                return;
-              }
-              if (_remoteLongPressTriggered) {
-                _remoteLongPressTriggered = false;
-                return;
-              }
-              widget.onTap?.call();
-            },
-            onLongPress: widget.enabled ? widget.onLongPress : null,
-            onHover: (value) {
-              if (_hovered != value) {
-                setState(() => _hovered = value);
-              }
-            },
-            child: Container(
-              foregroundDecoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(widget.borderRadius),
-                border: Border.all(
-                  color: _active ? TanukiColors.orange : Colors.transparent,
-                  width: 3,
+      child: RepaintBoundary(
+        child: AnimatedScale(
+          scale: _active ? 1.004 : 1,
+          duration: const Duration(milliseconds: 90),
+          curve: Curves.easeOut,
+          child: Material(
+            color: widget.color,
+            elevation: _active ? widget.activeElevation : widget.elevation,
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              canRequestFocus: false,
+              onTap: () {
+                if (!widget.enabled) {
+                  return;
+                }
+                if (_remoteLongPressTriggered) {
+                  _remoteLongPressTriggered = false;
+                  return;
+                }
+                widget.onTap?.call();
+              },
+              onLongPress: widget.enabled ? widget.onLongPress : null,
+              onHover: (value) {
+                if (_hovered != value) {
+                  setState(() => _hovered = value);
+                }
+              },
+              child: Container(
+                foregroundDecoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(widget.borderRadius),
+                  border: Border.all(
+                    color: _active ? TanukiColors.orange : Colors.transparent,
+                    width: 3,
+                  ),
                 ),
+                child: widget.child,
               ),
-              child: widget.child,
             ),
           ),
         ),

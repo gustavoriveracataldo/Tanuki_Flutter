@@ -47,11 +47,10 @@ class AppStore {
     final backupFile = await _backupStateFile();
     final tempFile = await _tempStateFile();
     await file.parent.create(recursive: true);
-    const encoder = JsonEncoder.withIndent('  ');
     if (await file.exists()) {
       await file.copy(backupFile.path);
     }
-    await tempFile.writeAsString(encoder.convert(state.toJson()), flush: true);
+    await tempFile.writeAsString(jsonEncode(state.toJson()), flush: true);
     if (await file.exists()) {
       await file.delete();
     }

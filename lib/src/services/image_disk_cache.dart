@@ -10,6 +10,7 @@ class ImageDiskCache {
   static final ImageDiskCache instance = ImageDiskCache._();
 
   final Map<String, Future<io.File?>> _pending = {};
+  final Map<String, _ImageDiskCacheMemoryEntry> _memory = {};
 
   Future<io.File?> getFile(
     String url, {
@@ -20,13 +21,31 @@ class ImageDiskCache {
         !normalized.startsWith('https://')) {
       return Future.value(null);
     }
+    final memoryEntry = _memory[normalized];
+    if (memoryEntry != null && DateTime.now().isBefore(memoryEntry.expiresAt)) {
+      return Future.value(memoryEntry.file);
+    }
     return _pending.putIfAbsent(normalized, () async {
       try {
-        return await _getFile(normalized, ttl: ttl);
+        final file = await _getFile(normalized, ttl: ttl);
+        if (file != null) {
+          _remember(normalized, file, ttl: ttl);
+        }
+        return file;
       } finally {
         _pending.remove(normalized);
       }
     });
+  }
+
+  void _remember(String url, io.File file, {required Duration ttl}) {
+    if (_memory.length >= 512) {
+      _memory.remove(_memory.keys.first);
+    }
+    _memory[url] = _ImageDiskCacheMemoryEntry(
+      file: file,
+      expiresAt: DateTime.now().add(ttl),
+    );
   }
 
   Future<io.File?> _getFile(String url, {required Duration ttl}) async {
@@ -83,4 +102,14 @@ class ImageDiskCache {
     }
     return hash.toRadixString(16).padLeft(16, '0');
   }
+}
+
+class _ImageDiskCacheMemoryEntry {
+  const _ImageDiskCacheMemoryEntry({
+    required this.file,
+    required this.expiresAt,
+  });
+
+  final io.File file;
+  final DateTime expiresAt;
 }
