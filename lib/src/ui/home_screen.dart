@@ -41,6 +41,9 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _sideAnimeFocusNode = FocusNode(debugLabel: 'sideAnime');
+  final FocusNode _homeContentFocusNode = FocusNode(
+    debugLabel: 'homeFirstContent',
+  );
   _Section _section = _Section.anime;
   SeriesItem? _selectedSeries;
   _Section? _detailReturnSection;
@@ -92,6 +95,7 @@ class _HomeScreenState extends State<HomeScreen> {
     widget.controller.removeListener(_handlePendingTrailerDetailRequest);
     _searchController.dispose();
     _sideAnimeFocusNode.dispose();
+    _homeContentFocusNode.dispose();
     super.dispose();
   }
 
@@ -177,6 +181,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                 activeSection: _section,
                                 profile: widget.controller.state.profile,
                                 animeFocusNode: _sideAnimeFocusNode,
+                                homeContentFocusNode: _homeContentFocusNode,
                                 onSectionSelected: _selectSection,
                                 onProfilePressed: _showProfilePicker,
                               ),
@@ -309,6 +314,7 @@ class _HomeScreenState extends State<HomeScreen> {
       },
       onPlayEpisode: _playEpisode,
       onPlayContinueWatchingQueue: _playContinueWatchingRoundRobin,
+      homeContentFocusNode: _homeContentFocusNode,
       onOpenSeriesTrailer: _openSeriesTrailer,
       onPlayTrendingTrailers: _playTrendingTrailerQueue,
       onLoadMoreAiring: _loadMoreHomeAiring,
@@ -1201,11 +1207,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-class _SideRail extends StatelessWidget {
+class _SideRail extends StatefulWidget {
   const _SideRail({
     required this.activeSection,
     required this.profile,
     required this.animeFocusNode,
+    required this.homeContentFocusNode,
     required this.onSectionSelected,
     required this.onProfilePressed,
   });
@@ -1213,13 +1220,69 @@ class _SideRail extends StatelessWidget {
   final _Section activeSection;
   final UserProfileState profile;
   final FocusNode animeFocusNode;
+  final FocusNode homeContentFocusNode;
   final ValueChanged<_Section> onSectionSelected;
   final VoidCallback onProfilePressed;
 
   @override
-  Widget build(BuildContext context) {
-    final items = _navigationItems();
+  State<_SideRail> createState() => _SideRailState();
+}
 
+class _SideRailState extends State<_SideRail> {
+  late final FocusNode _profileFocusNode = FocusNode(debugLabel: 'sideProfile');
+  late final List<_RailItem> _items = _navigationItems();
+  late final Map<_Section, FocusNode> _itemFocusNodes = {
+    for (final item in _items)
+      item.section: item.section == _Section.anime
+          ? widget.animeFocusNode
+          : FocusNode(debugLabel: 'side${item.section.name}'),
+  };
+
+  @override
+  void dispose() {
+    _profileFocusNode.dispose();
+    for (final entry in _itemFocusNodes.entries) {
+      if (entry.value != widget.animeFocusNode) {
+        entry.value.dispose();
+      }
+    }
+    super.dispose();
+  }
+
+  KeyEventResult _moveVertical({
+    required FocusNode current,
+    required bool down,
+  }) {
+    final order = [
+      _profileFocusNode,
+      for (final item in _items) _itemFocusNodes[item.section]!,
+    ];
+    final index = order.indexOf(current);
+    if (index < 0) {
+      return KeyEventResult.ignored;
+    }
+    final targetIndex = index + (down ? 1 : -1);
+    if (targetIndex < 0 || targetIndex >= order.length) {
+      current.requestFocus();
+      return KeyEventResult.handled;
+    }
+    order[targetIndex].requestFocus();
+    return KeyEventResult.handled;
+  }
+
+  KeyEventResult _focusHomeContent() {
+    if (widget.activeSection != _Section.anime) {
+      return KeyEventResult.ignored;
+    }
+    if (widget.homeContentFocusNode.canRequestFocus) {
+      widget.homeContentFocusNode.requestFocus();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
       width: 72,
       height: double.infinity,
@@ -1241,29 +1304,37 @@ class _SideRail extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             _SideRailProfileButton(
-              profile: profile,
-              onPressed: onProfilePressed,
+              profile: widget.profile,
+              focusNode: _profileFocusNode,
+              onArrowUp: () => _moveVertical(
+                current: _profileFocusNode,
+                down: false,
+              ),
+              onArrowDown: () => _moveVertical(
+                current: _profileFocusNode,
+                down: true,
+              ),
+              onArrowRight: _focusHomeContent,
+              onPressed: widget.onProfilePressed,
             ),
             const Spacer(),
-            for (final item in items)
+            for (final item in _items)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
                 child: _SideRailButton(
                   item: item,
-                  active: activeSection == item.section,
-                  focusNode:
-                      item.section == _Section.anime ? animeFocusNode : null,
-                  onArrowRight: item.section == _Section.anime
-                      ? () {
-                          final scope = FocusScope.of(context);
-                          if (!scope.focusInDirection(
-                            TraversalDirection.right,
-                          )) {
-                            scope.nextFocus();
-                          }
-                        }
-                      : null,
-                  onPressed: () => onSectionSelected(item.section),
+                  active: widget.activeSection == item.section,
+                  focusNode: _itemFocusNodes[item.section],
+                  onArrowUp: () => _moveVertical(
+                    current: _itemFocusNodes[item.section]!,
+                    down: false,
+                  ),
+                  onArrowDown: () => _moveVertical(
+                    current: _itemFocusNodes[item.section]!,
+                    down: true,
+                  ),
+                  onArrowRight: _focusHomeContent,
+                  onPressed: () => widget.onSectionSelected(item.section),
                 ),
               ),
             const Spacer(),
@@ -1277,10 +1348,18 @@ class _SideRail extends StatelessWidget {
 class _SideRailProfileButton extends StatefulWidget {
   const _SideRailProfileButton({
     required this.profile,
+    required this.focusNode,
+    required this.onArrowUp,
+    required this.onArrowDown,
+    required this.onArrowRight,
     required this.onPressed,
   });
 
   final UserProfileState profile;
+  final FocusNode focusNode;
+  final KeyEventResult Function() onArrowUp;
+  final KeyEventResult Function() onArrowDown;
+  final KeyEventResult Function() onArrowRight;
   final VoidCallback onPressed;
 
   @override
@@ -1293,21 +1372,43 @@ class _SideRailProfileButtonState extends State<_SideRailProfileButton> {
 
   bool get _active => _focused || _hovered;
 
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+      return widget.onArrowUp();
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+      return widget.onArrowDown();
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+      return widget.onArrowRight();
+    }
+    if (_isRemoteActivateKey(event.logicalKey)) {
+      if (event is KeyDownEvent) {
+        widget.onPressed();
+      }
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Tooltip(
       message: widget.profile.name,
-      child: AnimatedScale(
-        scale: _focused ? 1.14 : 1,
-        duration: const Duration(milliseconds: 120),
-        curve: Curves.easeOut,
+      child: Focus(
+        focusNode: widget.focusNode,
+        onKeyEvent: _handleKeyEvent,
+        onFocusChange: (value) {
+          if (_focused != value) {
+            setState(() => _focused = value);
+          }
+        },
         child: InkWell(
+          canRequestFocus: false,
           onTap: widget.onPressed,
-          onFocusChange: (value) {
-            if (_focused != value) {
-              setState(() => _focused = value);
-            }
-          },
           onHover: (value) {
             if (_hovered != value) {
               setState(() => _hovered = value);
@@ -1316,23 +1417,23 @@ class _SideRailProfileButtonState extends State<_SideRailProfileButton> {
           borderRadius: BorderRadius.circular(16),
           focusColor: Colors.transparent,
           hoverColor: Colors.transparent,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 120),
-            curve: Curves.easeOut,
-            padding: EdgeInsets.all(_active ? 3 : 0),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(18),
-              border: Border.all(
-                color: _active ? TanukiColors.orange : const Color(0x00334A62),
-                width: 2,
+          child: SizedBox(
+            width: 56,
+            height: 56,
+            child: Center(
+              child: AnimatedScale(
+                scale: _focused ? 1.14 : 1,
+                duration: const Duration(milliseconds: 120),
+                curve: Curves.easeOut,
+                child: _ProfileAvatar(
+                  profile: widget.profile,
+                  size: 42,
+                  radius: 21,
+                  fontSize: 20,
+                  borderColor:
+                      _active ? TanukiColors.orange : const Color(0x55334A62),
+                ),
               ),
-            ),
-            child: _ProfileAvatar(
-              profile: widget.profile,
-              size: 42,
-              radius: 21,
-              fontSize: 20,
-              borderColor: const Color(0x55334A62),
             ),
           ),
         ),
@@ -1347,6 +1448,8 @@ class _SideRailButton extends StatefulWidget {
     required this.active,
     required this.onPressed,
     this.focusNode,
+    this.onArrowUp,
+    this.onArrowDown,
     this.onArrowRight,
   });
 
@@ -1354,7 +1457,9 @@ class _SideRailButton extends StatefulWidget {
   final bool active;
   final VoidCallback onPressed;
   final FocusNode? focusNode;
-  final VoidCallback? onArrowRight;
+  final KeyEventResult Function()? onArrowUp;
+  final KeyEventResult Function()? onArrowDown;
+  final KeyEventResult Function()? onArrowRight;
 
   @override
   State<_SideRailButton> createState() => _SideRailButtonState();
@@ -1376,10 +1481,24 @@ class _SideRailButtonState extends State<_SideRailButton> {
       child: Focus(
         focusNode: widget.focusNode,
         onKeyEvent: (node, event) {
-          if (event is KeyDownEvent &&
-              event.logicalKey == LogicalKeyboardKey.arrowRight &&
-              widget.onArrowRight != null) {
-            widget.onArrowRight!();
+          if (event is KeyDownEvent || event is KeyRepeatEvent) {
+            if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
+                widget.onArrowUp != null) {
+              return widget.onArrowUp!();
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowDown &&
+                widget.onArrowDown != null) {
+              return widget.onArrowDown!();
+            }
+            if (event.logicalKey == LogicalKeyboardKey.arrowRight &&
+                widget.onArrowRight != null) {
+              return widget.onArrowRight!();
+            }
+          }
+          if (_isRemoteActivateKey(event.logicalKey)) {
+            if (event is KeyDownEvent) {
+              widget.onPressed();
+            }
             return KeyEventResult.handled;
           }
           return KeyEventResult.ignored;
@@ -1417,14 +1536,15 @@ class _SideRailButtonState extends State<_SideRailButton> {
                     color: foreground,
                   ),
                   if (widget.active)
-                    const Positioned(
-                      bottom: 3,
-                      child: DecoratedBox(
+                    Positioned(
+                      bottom: 4,
+                      child: Container(
+                        width: 18,
+                        height: 3,
                         decoration: BoxDecoration(
                           color: TanukiColors.orange,
-                          borderRadius: BorderRadius.all(Radius.circular(2)),
+                          borderRadius: BorderRadius.circular(4),
                         ),
-                        child: SizedBox(width: 16, height: 3),
                       ),
                     ),
                 ],
@@ -1660,6 +1780,12 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
   final TextEditingController _profileNameController = TextEditingController();
   final FocusScopeNode _focusScopeNode =
       FocusScopeNode(debugLabel: 'profileOverlayScope');
+  final FocusNode _manageProfilesButtonFocusNode =
+      FocusNode(debugLabel: 'manageProfilesButton');
+  late final List<FocusNode> _avatarFocusNodes = List.generate(
+    _profileAvatarPresets.length,
+    (index) => FocusNode(debugLabel: 'profileAvatar$index'),
+  );
   _ProfileOverlayMode _mode = _ProfileOverlayMode.picker;
   String _selectedProfileId = '';
 
@@ -1668,7 +1794,7 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        _focusScopeNode.requestFocus();
+        _focusFirstControlForMode();
       }
     });
   }
@@ -1676,6 +1802,10 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
   @override
   void dispose() {
     _profileNameController.dispose();
+    _manageProfilesButtonFocusNode.dispose();
+    for (final node in _avatarFocusNodes) {
+      node.dispose();
+    }
     _focusScopeNode.dispose();
     super.dispose();
   }
@@ -1756,10 +1886,37 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
       _ => null,
     };
     if (direction != null) {
-      FocusScope.of(context).focusInDirection(direction);
+      if (!_hasFocusedOverlayDescendant()) {
+        _focusFirstControlForMode();
+      } else {
+        _focusScopeNode.focusInDirection(direction);
+      }
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
+  }
+
+  bool _hasFocusedOverlayDescendant() {
+    final primaryFocus = FocusManager.instance.primaryFocus;
+    return primaryFocus != null &&
+        primaryFocus != _focusScopeNode &&
+        _focusScopeNode.descendants.contains(primaryFocus);
+  }
+
+  void _focusFirstControlForMode() {
+    if (!mounted) {
+      return;
+    }
+    if (_mode == _ProfileOverlayMode.avatar && _avatarFocusNodes.isNotEmpty) {
+      _avatarFocusNodes[_selectedAvatarPresetIndex()].requestFocus();
+      return;
+    }
+    if (_mode == _ProfileOverlayMode.picker) {
+      _manageProfilesButtonFocusNode.requestFocus();
+      return;
+    }
+    _focusScopeNode.requestFocus();
+    _focusScopeNode.nextFocus();
   }
 
   AppController get controller => widget.controller;
@@ -1840,6 +1997,7 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
         SizedBox(
           height: 42,
           child: OutlinedButton.icon(
+            focusNode: _manageProfilesButtonFocusNode,
             onPressed: () {
               setState(() {
                 _mode = _ProfileOverlayMode.manage;
@@ -1926,11 +2084,7 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
         _ProfileActionButton(
           icon: Icons.palette_outlined,
           label: 'Cambiar avatar',
-          onPressed: () {
-            setState(() {
-              _mode = _ProfileOverlayMode.avatar;
-            });
-          },
+          onPressed: _openAvatarPicker,
         ),
         _ProfileActionButton(
           icon: Icons.star_outline,
@@ -1969,6 +2123,29 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
         ),
       ],
     );
+  }
+
+  void _openAvatarPicker() {
+    setState(() {
+      _mode = _ProfileOverlayMode.avatar;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _avatarFocusNodes.isEmpty) {
+        return;
+      }
+      _avatarFocusNodes[_selectedAvatarPresetIndex()].requestFocus();
+    });
+  }
+
+  int _selectedAvatarPresetIndex() {
+    final avatarPresetId = _selectedProfile.avatarPresetId.trim();
+    if (avatarPresetId.isEmpty) {
+      return 0;
+    }
+    final index = _profileAvatarPresets.indexWhere(
+      (preset) => preset.id == avatarPresetId,
+    );
+    return index < 0 ? 0 : index;
   }
 
   Widget _buildNameForm({
@@ -2028,6 +2205,10 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
                 initial: _profileInitial(profile),
                 selected:
                     profile.avatarPresetId == _profileAvatarPresets[index].id,
+                focusNode: _avatarFocusNodes[index],
+                autofocus: profile.avatarPresetId.trim().isEmpty
+                    ? index == 0
+                    : profile.avatarPresetId == _profileAvatarPresets[index].id,
                 onTap: () async {
                   await widget.onChangeProfileAvatar(
                     profile.id,
@@ -2351,6 +2532,8 @@ class _AvatarPresetButton extends StatelessWidget {
     required this.label,
     required this.initial,
     required this.selected,
+    required this.focusNode,
+    required this.autofocus,
     required this.onTap,
   });
 
@@ -2358,58 +2541,144 @@ class _AvatarPresetButton extends StatelessWidget {
   final String label;
   final String initial;
   final bool selected;
+  final FocusNode focusNode;
+  final bool autofocus;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final fallback = _AvatarFallback(
+    return _FocusableAvatarPresetButton(
       preset: preset,
+      label: label,
       initial: initial,
+      selected: selected,
+      focusNode: focusNode,
+      autofocus: autofocus,
+      onTap: onTap,
+    );
+  }
+}
+
+class _FocusableAvatarPresetButton extends StatefulWidget {
+  const _FocusableAvatarPresetButton({
+    required this.preset,
+    required this.label,
+    required this.initial,
+    required this.selected,
+    required this.focusNode,
+    required this.autofocus,
+    required this.onTap,
+  });
+
+  final _ProfileAvatarPreset preset;
+  final String label;
+  final String initial;
+  final bool selected;
+  final FocusNode focusNode;
+  final bool autofocus;
+  final VoidCallback onTap;
+
+  @override
+  State<_FocusableAvatarPresetButton> createState() =>
+      _FocusableAvatarPresetButtonState();
+}
+
+class _FocusableAvatarPresetButtonState
+    extends State<_FocusableAvatarPresetButton> {
+  bool _focused = false;
+  bool _hovered = false;
+
+  bool get _active => _focused || _hovered;
+
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (!_isRemoteActivateKey(event.logicalKey)) {
+      return KeyEventResult.ignored;
+    }
+    if (event is KeyDownEvent) {
+      widget.onTap();
+    }
+    return KeyEventResult.handled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fallback = _AvatarFallback(
+      preset: widget.preset,
+      initial: widget.initial,
       fontSize: 28,
       borderRadius: 18,
     );
     return SizedBox(
       width: 92,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
-        child: Column(
-          children: [
-            Container(
-              width: 72,
-              height: 72,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: const Color(0xFF080C12),
-                borderRadius: BorderRadius.circular(18),
-                border: Border.all(
-                  color: selected ? TanukiColors.orange : preset.accentColor,
-                  width: selected ? 3 : 1,
+      child: Focus(
+        focusNode: widget.focusNode,
+        autofocus: widget.autofocus,
+        onKeyEvent: _handleKey,
+        onFocusChange: (value) {
+          if (_focused != value) {
+            setState(() => _focused = value);
+          }
+        },
+        child: InkWell(
+          canRequestFocus: false,
+          onTap: widget.onTap,
+          onHover: (value) {
+            if (_hovered != value) {
+              setState(() => _hovered = value);
+            }
+          },
+          borderRadius: BorderRadius.circular(10),
+          child: Column(
+            children: [
+              SizedBox(
+                width: 78,
+                height: 78,
+                child: Center(
+                  child: AnimatedScale(
+                    scale: _focused ? 1.08 : 1,
+                    duration: const Duration(milliseconds: 120),
+                    curve: Curves.easeOut,
+                    child: Container(
+                      width: 72,
+                      height: 72,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF080C12),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: widget.selected
+                              ? TanukiColors.orange
+                              : widget.preset.accentColor,
+                          width: widget.selected ? 3 : 1,
+                        ),
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: widget.preset.assetPath.isEmpty
+                          ? fallback
+                          : Image.asset(
+                              widget.preset.assetPath,
+                              fit: BoxFit.cover,
+                              alignment: Alignment.topCenter,
+                              errorBuilder: (_, __, ___) => fallback,
+                            ),
+                    ),
+                  ),
                 ),
               ),
-              clipBehavior: Clip.antiAlias,
-              child: preset.assetPath.isEmpty
-                  ? fallback
-                  : Image.asset(
-                      preset.assetPath,
-                      fit: BoxFit.cover,
-                      alignment: Alignment.topCenter,
-                      errorBuilder: (_, __, ___) => fallback,
-                    ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: TanukiColors.muted,
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
+              const SizedBox(height: 8),
+              Text(
+                widget.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: _active ? TanukiColors.text : TanukiColors.muted,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -3082,6 +3351,7 @@ class _AnimePanel extends StatelessWidget {
     required this.onRemoteCandidateSelected,
     required this.onPlayEpisode,
     required this.onPlayContinueWatchingQueue,
+    required this.homeContentFocusNode,
     required this.onOpenSeriesTrailer,
     required this.onPlayTrendingTrailers,
     required this.onLoadMoreAiring,
@@ -3115,6 +3385,7 @@ class _AnimePanel extends StatelessWidget {
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final VoidCallback onPlayContinueWatchingQueue;
+  final FocusNode homeContentFocusNode;
   final ValueChanged<SeriesItem> onOpenSeriesTrailer;
   final VoidCallback onPlayTrendingTrailers;
   final VoidCallback onLoadMoreAiring;
@@ -3142,6 +3413,7 @@ class _AnimePanel extends StatelessWidget {
     final latestMovies = movieCandidates.isNotEmpty
         ? movieCandidates
         : _latestMovieCandidates(trendingCandidates);
+    final focusContinueWatchingFirst = continueWatching.isNotEmpty;
     final seasonTitle = controller.currentSeasonFilter.summaryLabel.isEmpty
         ? 'Temporada actual'
         : controller.currentSeasonFilter.summaryLabel;
@@ -3178,6 +3450,7 @@ class _AnimePanel extends StatelessWidget {
         nextSectionTop,
         _ContinueWatchingShelf(
           entries: continueWatching,
+          firstFocusNode: homeContentFocusNode,
           onPlayEpisode: onPlayEpisode,
           onPlayQueue: onPlayContinueWatchingQueue,
           onStopWatchingSeries: onStopWatchingSeries,
@@ -3196,6 +3469,8 @@ class _AnimePanel extends StatelessWidget {
           title: seasonTitle,
           controller: controller,
           candidates: visibleSeason,
+          firstFocusNode:
+              focusContinueWatchingFirst ? null : homeContentFocusNode,
           loading: trendingLoading,
           onCandidateSelected: onRemoteCandidateSelected,
           onCandidateFocused: onPreviewRemoteCandidate,
@@ -4977,6 +5252,7 @@ class _TrendingPosterShelf extends StatelessWidget {
     required this.title,
     required this.controller,
     required this.candidates,
+    required this.firstFocusNode,
     required this.loading,
     required this.onCandidateSelected,
     required this.onCandidateFocused,
@@ -4987,6 +5263,7 @@ class _TrendingPosterShelf extends StatelessWidget {
   final String title;
   final AppController controller;
   final List<RemoteSearchCandidate> candidates;
+  final FocusNode? firstFocusNode;
   final bool loading;
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
   final ValueChanged<RemoteSearchCandidate> onCandidateFocused;
@@ -5045,6 +5322,7 @@ class _TrendingPosterShelf extends StatelessWidget {
                         width: posterWidth,
                         height: posterHeight,
                         candidate: candidate,
+                        focusNode: index == 0 ? firstFocusNode : null,
                         imported: controller.findRemoteSeriesForCandidate(
                               candidate,
                             ) !=
@@ -5072,6 +5350,7 @@ class _RemotePosterCard extends StatelessWidget {
     required this.imported,
     required this.onTap,
     required this.onFocused,
+    this.focusNode,
     this.showScheduleChip = true,
   });
 
@@ -5081,6 +5360,7 @@ class _RemotePosterCard extends StatelessWidget {
   final bool imported;
   final VoidCallback onTap;
   final VoidCallback onFocused;
+  final FocusNode? focusNode;
   final bool showScheduleChip;
 
   @override
@@ -5091,6 +5371,7 @@ class _RemotePosterCard extends StatelessWidget {
       child: _SearchResultPosterCard(
         candidate: candidate,
         imported: imported,
+        focusNode: focusNode,
         onTap: onTap,
         onFocused: onFocused,
         onLongPress: () => _showCardMenu(context),
@@ -5349,6 +5630,7 @@ class _SkeletonLine extends StatelessWidget {
 class _ContinueWatchingShelf extends StatelessWidget {
   const _ContinueWatchingShelf({
     required this.entries,
+    required this.firstFocusNode,
     required this.onPlayEpisode,
     required this.onPlayQueue,
     required this.onStopWatchingSeries,
@@ -5358,6 +5640,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
   });
 
   final List<_ContinueWatchingEntry> entries;
+  final FocusNode? firstFocusNode;
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final VoidCallback onPlayQueue;
   final ValueChanged<SeriesItem> onStopWatchingSeries;
@@ -5414,6 +5697,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
                   width: cardWidth,
                   height: cardHeight,
                   entry: entry,
+                  focusNode: index == 0 ? firstFocusNode : null,
                   onTap: entry.enabled
                       ? () => onPlayEpisode(entry.episode)
                       : () {},
@@ -5444,6 +5728,7 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
     required this.width,
     required this.height,
     required this.entry,
+    required this.focusNode,
     required this.onTap,
     required this.onGoToSeries,
     required this.onStopWatching,
@@ -5454,6 +5739,7 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
   final double width;
   final double height;
   final _ContinueWatchingEntry entry;
+  final FocusNode? focusNode;
   final VoidCallback onTap;
   final VoidCallback? onGoToSeries;
   final VoidCallback? onStopWatching;
@@ -5472,6 +5758,7 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
       width: width,
       height: height,
       child: _FocusablePosterSurface(
+        focusNode: focusNode,
         onTap: onTap,
         onFocused: onFocused,
         onLongPress:
@@ -6304,6 +6591,7 @@ class _SearchResultPosterCard extends StatelessWidget {
     required this.candidate,
     required this.imported,
     required this.onTap,
+    this.focusNode,
     this.onFocused,
     this.onLongPress,
     this.showScheduleChip = true,
@@ -6312,6 +6600,7 @@ class _SearchResultPosterCard extends StatelessWidget {
   final RemoteSearchCandidate candidate;
   final bool imported;
   final VoidCallback onTap;
+  final FocusNode? focusNode;
   final VoidCallback? onFocused;
   final VoidCallback? onLongPress;
   final bool showScheduleChip;
@@ -6320,6 +6609,7 @@ class _SearchResultPosterCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheduleLabel = _candidateScheduleChipLabel(candidate);
     return _FocusablePosterSurface(
+      focusNode: focusNode,
       onTap: onTap,
       onFocused: onFocused,
       onLongPress: onLongPress,
@@ -8386,6 +8676,7 @@ class _FocusablePosterSurface extends StatefulWidget {
   const _FocusablePosterSurface({
     required this.child,
     required this.onTap,
+    this.focusNode,
     this.onFocused,
     this.onLongPress,
     this.elevation = 6,
@@ -8393,6 +8684,7 @@ class _FocusablePosterSurface extends StatefulWidget {
 
   final Widget child;
   final VoidCallback onTap;
+  final FocusNode? focusNode;
   final VoidCallback? onFocused;
   final VoidCallback? onLongPress;
   final double elevation;
@@ -8405,13 +8697,14 @@ class _FocusablePosterSurface extends StatefulWidget {
 class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   bool _focused = false;
   bool _hovered = false;
-  final FocusNode _focusNode = FocusNode();
+  late final FocusNode _internalFocusNode = FocusNode();
   _HorizontalFocusShelfController? _horizontalShelf;
   Timer? _remoteLongPressTimer;
   bool _remoteLongPressTriggered = false;
   bool _remoteKeyDown = false;
 
   bool get _active => _focused || _hovered;
+  FocusNode get _focusNode => widget.focusNode ?? _internalFocusNode;
 
   @override
   void didChangeDependencies() {
@@ -8426,10 +8719,21 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   }
 
   @override
+  void didUpdateWidget(covariant _FocusablePosterSurface oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldFocusNode = oldWidget.focusNode ?? _internalFocusNode;
+    if (oldFocusNode == _focusNode) {
+      return;
+    }
+    _horizontalShelf?.unregister(oldFocusNode);
+    _horizontalShelf?.register(_focusNode, context);
+  }
+
+  @override
   void dispose() {
     _remoteLongPressTimer?.cancel();
     _horizontalShelf?.unregister(_focusNode);
-    _focusNode.dispose();
+    _internalFocusNode.dispose();
     super.dispose();
   }
 
