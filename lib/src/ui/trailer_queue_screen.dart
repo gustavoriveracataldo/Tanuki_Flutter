@@ -476,7 +476,10 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
           children: [
             if (_usingWebView && _webViewController != null)
               Positioned.fill(
-                  child: WebViewWidget(controller: _webViewController!)),
+                child: RepaintBoundary(
+                  child: WebViewWidget(controller: _webViewController!),
+                ),
+              ),
             if (!_openedInApp || _opening)
               const Positioned.fill(
                 child: ColoredBox(color: Colors.black),
@@ -557,83 +560,85 @@ class _TrailerQueueScreenState extends State<TrailerQueueScreen> {
               ),
             Align(
               alignment: Alignment.topCenter,
-              child: FocusTraversalGroup(
-                policy: OrderedTraversalPolicy(),
-                child: Container(
-                  color: const Color(0x96000000),
-                  padding: const EdgeInsets.all(12),
-                  child: Row(
-                    children: [
-                      FocusTraversalOrder(
-                        order: const NumericFocusOrder(1),
-                        child: _TrailerIconButton(
-                          icon: Icons.arrow_back,
-                          tooltip: 'Volver',
-                          focusNode: _trailerBackFocusNode,
-                          onPressed: () => unawaited(_closeTrailerQueue()),
+              child: RepaintBoundary(
+                child: FocusTraversalGroup(
+                  policy: OrderedTraversalPolicy(),
+                  child: Container(
+                    color: const Color(0x96000000),
+                    padding: const EdgeInsets.all(12),
+                    child: Row(
+                      children: [
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(1),
+                          child: _TrailerIconButton(
+                            icon: Icons.arrow_back,
+                            tooltip: 'Volver',
+                            focusNode: _trailerBackFocusNode,
+                            onPressed: () => unawaited(_closeTrailerQueue()),
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 10),
-                      FocusTraversalOrder(
-                        order: const NumericFocusOrder(2),
-                        child: _TrailerIconButton(
-                          icon: Icons.skip_previous,
-                          tooltip: 'Trailer anterior',
-                          onPressed: _index <= 0 ? null : () => _move(-1),
+                        const SizedBox(width: 10),
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(2),
+                          child: _TrailerIconButton(
+                            icon: Icons.skip_previous,
+                            tooltip: 'Trailer anterior',
+                            onPressed: _index <= 0 ? null : () => _move(-1),
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 10),
-                      FocusTraversalOrder(
-                        order: const NumericFocusOrder(3),
-                        child: _TrailerIconButton(
-                          icon: Icons.skip_next,
-                          tooltip: 'Trailer siguiente',
-                          onPressed: _index >= widget.entries.length - 1
-                              ? null
-                              : () => _move(1),
+                        const SizedBox(width: 10),
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(3),
+                          child: _TrailerIconButton(
+                            icon: Icons.skip_next,
+                            tooltip: 'Trailer siguiente',
+                            onPressed: _index >= widget.entries.length - 1
+                                ? null
+                                : () => _move(1),
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.titleMedium,
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              '${_index + 1}/${widget.entries.length} | $_status',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.bodyMedium,
-                            ),
-                          ],
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.titleMedium,
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '${_index + 1}/${widget.entries.length} | $_status',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      FocusTraversalOrder(
-                        order: const NumericFocusOrder(4),
-                        child: _TrailerIconButton(
-                          icon: Icons.refresh,
-                          tooltip: 'Reintentar en app',
-                          onPressed: _opening ? null : _openCurrentTrailer,
+                        const SizedBox(width: 12),
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(4),
+                          child: _TrailerIconButton(
+                            icon: Icons.refresh,
+                            tooltip: 'Reintentar en app',
+                            onPressed: _opening ? null : _openCurrentTrailer,
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 10),
-                      FocusTraversalOrder(
-                        order: const NumericFocusOrder(5),
-                        child: _TrailerIconButton(
-                          icon: Icons.info_outline,
-                          tooltip: 'Ver detalle',
-                          onPressed: () => unawaited(_openTrailerDetail()),
+                        const SizedBox(width: 10),
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(5),
+                          child: _TrailerIconButton(
+                            icon: Icons.info_outline,
+                            tooltip: 'Ver detalle',
+                            onPressed: () => unawaited(_openTrailerDetail()),
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),

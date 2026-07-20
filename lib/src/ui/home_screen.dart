@@ -44,6 +44,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final FocusNode _homeContentFocusNode = FocusNode(
     debugLabel: 'homeFirstContent',
   );
+  final FocusNode _detailContentFocusNode = FocusNode(
+    debugLabel: 'detailEpisodeContent',
+  );
   _Section _section = _Section.anime;
   SeriesItem? _selectedSeries;
   _Section? _detailReturnSection;
@@ -97,6 +100,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _searchController.dispose();
     _sideAnimeFocusNode.dispose();
     _homeContentFocusNode.dispose();
+    _detailContentFocusNode.dispose();
     super.dispose();
   }
 
@@ -182,7 +186,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                 activeSection: _section,
                                 profile: widget.controller.state.profile,
                                 animeFocusNode: _sideAnimeFocusNode,
-                                homeContentFocusNode: _homeContentFocusNode,
+                                homeContentFocusNode: _selectedSeries == null
+                                    ? _homeContentFocusNode
+                                    : _detailContentFocusNode,
                                 onSectionSelected: _selectSection,
                                 onProfilePressed: _showProfilePicker,
                               ),
@@ -316,6 +322,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onPlayEpisode: _playEpisode,
       onPlayContinueWatchingQueue: _playContinueWatchingRoundRobin,
       homeContentFocusNode: _homeContentFocusNode,
+      detailContentFocusNode: _detailContentFocusNode,
       onOpenSeriesTrailer: _openSeriesTrailer,
       onPlayTrendingTrailers: _playTrendingTrailerQueue,
       onLoadMoreAiring: _loadMoreHomeAiring,
@@ -3400,6 +3407,7 @@ class _AnimePanel extends StatelessWidget {
     required this.onPlayEpisode,
     required this.onPlayContinueWatchingQueue,
     required this.homeContentFocusNode,
+    required this.detailContentFocusNode,
     required this.onOpenSeriesTrailer,
     required this.onPlayTrendingTrailers,
     required this.onLoadMoreAiring,
@@ -3434,6 +3442,7 @@ class _AnimePanel extends StatelessWidget {
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final VoidCallback onPlayContinueWatchingQueue;
   final FocusNode homeContentFocusNode;
+  final FocusNode detailContentFocusNode;
   final ValueChanged<SeriesItem> onOpenSeriesTrailer;
   final VoidCallback onPlayTrendingTrailers;
   final VoidCallback onLoadMoreAiring;
@@ -3583,6 +3592,7 @@ class _AnimePanel extends StatelessWidget {
           similarStatus: detailSimilarStatus,
           similarLoading: detailSimilarLoading,
           detailsLoading: detailImporting,
+          detailContentFocusNode: detailContentFocusNode,
           onBack: onSeriesCleared,
           onRemoteCandidateSelected: onRemoteCandidateSelected,
           onPlayEpisode: onPlayEpisode,
@@ -4162,6 +4172,7 @@ class _SeriesDetailPanel extends StatelessWidget {
     required this.similarStatus,
     required this.similarLoading,
     required this.detailsLoading,
+    required this.detailContentFocusNode,
     required this.onBack,
     required this.onRemoteCandidateSelected,
     required this.onPlayEpisode,
@@ -4176,6 +4187,7 @@ class _SeriesDetailPanel extends StatelessWidget {
   final String similarStatus;
   final bool similarLoading;
   final bool detailsLoading;
+  final FocusNode detailContentFocusNode;
   final VoidCallback onBack;
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final ValueChanged<EpisodeItem> onPlayEpisode;
@@ -4216,6 +4228,7 @@ class _SeriesDetailPanel extends StatelessWidget {
         final episodes = _DetailEpisodesColumn(
           controller: controller,
           series: series,
+          initialFocusNode: detailContentFocusNode,
           onPlayEpisode: onPlayEpisode,
         );
         if (!wide) {
@@ -4774,16 +4787,95 @@ enum _DetailEpisodeAction {
   completeThrough,
 }
 
-class _DetailEpisodesColumn extends StatelessWidget {
+class _DetailEpisodesColumn extends StatefulWidget {
   const _DetailEpisodesColumn({
     required this.controller,
     required this.series,
+    required this.initialFocusNode,
     required this.onPlayEpisode,
   });
 
   final AppController controller;
   final SeriesItem series;
+  final FocusNode initialFocusNode;
   final ValueChanged<EpisodeItem> onPlayEpisode;
+
+  @override
+  State<_DetailEpisodesColumn> createState() => _DetailEpisodesColumnState();
+}
+
+class _DetailEpisodesColumnState extends State<_DetailEpisodesColumn> {
+  static const double _estimatedEpisodeRowExtent = 106;
+
+  late final ScrollController _scrollController = ScrollController(
+    initialScrollOffset: _initialScrollOffset(),
+  );
+  int _focusedEpisodeIndex = 0;
+  bool _requestedInitialFocus = false;
+
+  AppController get controller => widget.controller;
+  SeriesItem get series => widget.series;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusedEpisodeIndex = _detailInitialFocusIndex(controller, series);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _requestInitialEpisodeFocus();
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _DetailEpisodesColumn oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final nextIndex = _detailInitialFocusIndex(controller, series);
+    if (oldWidget.series.stableKey != series.stableKey ||
+        oldWidget.series.name != series.name ||
+        oldWidget.series.episodes.length != series.episodes.length ||
+        nextIndex != _focusedEpisodeIndex) {
+      _focusedEpisodeIndex = nextIndex;
+      _requestedInitialFocus = false;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _jumpNearFocusedEpisode();
+        _requestInitialEpisodeFocus();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  double _initialScrollOffset() {
+    final index = _detailInitialFocusIndex(widget.controller, widget.series);
+    if (index <= 0) {
+      return 0;
+    }
+    return index * _estimatedEpisodeRowExtent;
+  }
+
+  void _jumpNearFocusedEpisode() {
+    if (!_scrollController.hasClients || _focusedEpisodeIndex <= 0) {
+      return;
+    }
+    final target = (_focusedEpisodeIndex * _estimatedEpisodeRowExtent).clamp(
+      _scrollController.position.minScrollExtent,
+      _scrollController.position.maxScrollExtent,
+    );
+    _scrollController.jumpTo(target.toDouble());
+  }
+
+  void _requestInitialEpisodeFocus() {
+    if (!mounted || _requestedInitialFocus) {
+      return;
+    }
+    _requestedInitialFocus = true;
+    if (widget.initialFocusNode.canRequestFocus) {
+      widget.initialFocusNode.requestFocus();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -4804,16 +4896,13 @@ class _DetailEpisodesColumn extends StatelessWidget {
           const SizedBox(height: 8),
           Expanded(
             child: ListView.builder(
+              controller: _scrollController,
               clipBehavior: Clip.hardEdge,
               padding: const EdgeInsets.only(top: 4, bottom: 6),
               itemCount: series.episodes.length,
               itemBuilder: (context, index) {
                 final episode = series.episodes[index];
                 final future = _episodeAirsInFuture(episode.airDateIso);
-                final focusIndex = _detailInitialFocusIndex(
-                  controller,
-                  series,
-                );
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 6),
                   child: _DetailEpisodeRow(
@@ -4821,8 +4910,11 @@ class _DetailEpisodesColumn extends StatelessWidget {
                     series: series,
                     episode: episode,
                     enabled: !future,
-                    autofocus: index == focusIndex,
-                    onPlay: future ? null : () => onPlayEpisode(episode),
+                    autofocus: index == _focusedEpisodeIndex,
+                    focusNode: index == _focusedEpisodeIndex
+                        ? widget.initialFocusNode
+                        : null,
+                    onPlay: future ? null : () => widget.onPlayEpisode(episode),
                     onOptions: future
                         ? null
                         : () => _showEpisodeActions(context, episode),
@@ -4882,12 +4974,28 @@ class _DetailEpisodesColumn extends StatelessWidget {
 
   int _detailInitialFocusIndex(AppController controller, SeriesItem series) {
     final watched = controller.watchedCountFor(series);
+    for (var index = 0; index < series.episodes.length; index += 1) {
+      final episode = series.episodes[index];
+      if (_episodeAirsInFuture(episode.airDateIso)) {
+        continue;
+      }
+      final playback = controller.playbackForEpisode(episode);
+      final duration = playback?.durationMs ?? 0;
+      final position = playback?.positionMs ?? 0;
+      if (playback?.completed == true || duration <= 0 || position <= 0) {
+        continue;
+      }
+      final progress = position / duration;
+      if (progress > 0 && progress < 0.97) {
+        return index;
+      }
+    }
     for (var index = watched; index < series.episodes.length; index += 1) {
       if (!_episodeAirsInFuture(series.episodes[index].airDateIso)) {
         return index;
       }
     }
-    for (var index = 0; index < series.episodes.length; index += 1) {
+    for (var index = series.episodes.length - 1; index >= 0; index -= 1) {
       if (!_episodeAirsInFuture(series.episodes[index].airDateIso)) {
         return index;
       }
@@ -4903,6 +5011,7 @@ class _DetailEpisodeRow extends StatelessWidget {
     required this.episode,
     required this.enabled,
     required this.autofocus,
+    required this.focusNode,
     required this.onPlay,
     required this.onOptions,
   });
@@ -4912,6 +5021,7 @@ class _DetailEpisodeRow extends StatelessWidget {
   final EpisodeItem episode;
   final bool enabled;
   final bool autofocus;
+  final FocusNode? focusNode;
   final VoidCallback? onPlay;
   final VoidCallback? onOptions;
 
@@ -5048,6 +5158,7 @@ class _DetailEpisodeRow extends StatelessWidget {
     return _FocusableEpisodeSurface(
       enabled: enabled,
       autofocus: autofocus,
+      focusNode: focusNode,
       onTap: onPlay,
       onLongPress: onOptions,
       color: enabled ? const Color(0xFF11161D) : const Color(0xFF0B0F14),
@@ -8930,6 +9041,7 @@ class _FocusableEpisodeSurface extends StatefulWidget {
     required this.onTap,
     this.enabled = true,
     this.autofocus = false,
+    this.focusNode,
     this.onLongPress,
     this.color = const Color(0xFF11161D),
     this.elevation = 6,
@@ -8941,6 +9053,7 @@ class _FocusableEpisodeSurface extends StatefulWidget {
   final VoidCallback? onTap;
   final bool enabled;
   final bool autofocus;
+  final FocusNode? focusNode;
   final VoidCallback? onLongPress;
   final Color color;
   final double elevation;
@@ -8955,17 +9068,18 @@ class _FocusableEpisodeSurface extends StatefulWidget {
 class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
   bool _focused = false;
   bool _hovered = false;
-  final FocusNode _focusNode = FocusNode();
+  late final FocusNode _internalFocusNode = FocusNode();
   Timer? _remoteLongPressTimer;
   bool _remoteLongPressTriggered = false;
   bool _remoteKeyDown = false;
 
   bool get _active => _focused || _hovered;
+  FocusNode get _focusNode => widget.focusNode ?? _internalFocusNode;
 
   @override
   void dispose() {
     _remoteLongPressTimer?.cancel();
-    _focusNode.dispose();
+    _internalFocusNode.dispose();
     super.dispose();
   }
 

@@ -34,6 +34,7 @@ const _remoteOpeningRecoveryMaxAttempts = 1;
 const _desktopVlcAudioRecoveryMaxAttempts = 10;
 const _animeSkipPromptLead = Duration(seconds: 1);
 const _animeSkipSeekEndOffset = Duration(milliseconds: 500);
+const _playerPointerOverlayRefreshInterval = Duration(milliseconds: 250);
 const _mediaKitMaxVolume = 100.0;
 const _normalizedMaxVolume = 1.0;
 const _youtubeMaxVolume = 100;
@@ -157,6 +158,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   RemoteProvider? _serverFallbackProvider;
   DateTime _lastPlaybackSave = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastPositionChangeAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastPlayerOverlayPointerRefresh =
+      DateTime.fromMillisecondsSinceEpoch(0);
   Duration _lastPosition = Duration.zero;
   Duration _lastDuration = Duration.zero;
   int _lastPositionDebugBucket = -1;
@@ -3426,44 +3429,47 @@ class _PlayerScreenState extends State<PlayerScreen>
         onKeyEvent: _handlePlayerRootKey,
         child: Listener(
           onPointerDown: (_) => _showPlayerOverlays(),
-          onPointerMove: (_) => _showPlayerOverlays(),
-          onPointerHover: (_) => _showPlayerOverlays(),
+          onPointerMove: (_) => _showPlayerOverlays(throttled: true),
+          onPointerHover: (_) => _showPlayerOverlays(throttled: true),
           child: Stack(
             children: [
               Positioned.fill(
-                child: _openedMedia &&
-                        _androidExoController?.value.isInitialized == true
-                    ? _AndroidExoVideoSurface(
-                        controller: _androidExoController!,
-                        fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                        subtitlesEnabled: _subtitlesEnabled,
-                      )
-                    : _openedMedia && _youtubeWebController != null
-                        ? _YoutubeWebVideoSurface(
-                            controller: _youtubeWebController!,
-                          )
-                        : _openedMedia && _desktopVlcPlayer != null
-                            ? vlc.Video(
-                                player: _desktopVlcPlayer!,
-                                fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                                showControls: false,
-                              )
-                            : _openedMedia && _videoController != null
-                                ? _TanukiVideoTheme(
-                                    child: Video(
-                                      controller: _videoController!,
-                                      fit: _boxFitForVideoScaleMode(
-                                          _videoScaleMode),
-                                      subtitleViewConfiguration:
-                                          SubtitleViewConfiguration(
-                                        visible: _subtitlesEnabled,
+                child: RepaintBoundary(
+                  child: _openedMedia &&
+                          _androidExoController?.value.isInitialized == true
+                      ? _AndroidExoVideoSurface(
+                          controller: _androidExoController!,
+                          fit: _boxFitForVideoScaleMode(_videoScaleMode),
+                          subtitlesEnabled: _subtitlesEnabled,
+                        )
+                      : _openedMedia && _youtubeWebController != null
+                          ? _YoutubeWebVideoSurface(
+                              controller: _youtubeWebController!,
+                            )
+                          : _openedMedia && _desktopVlcPlayer != null
+                              ? vlc.Video(
+                                  player: _desktopVlcPlayer!,
+                                  fit:
+                                      _boxFitForVideoScaleMode(_videoScaleMode),
+                                  showControls: false,
+                                )
+                              : _openedMedia && _videoController != null
+                                  ? _TanukiVideoTheme(
+                                      child: Video(
+                                        controller: _videoController!,
+                                        fit: _boxFitForVideoScaleMode(
+                                            _videoScaleMode),
+                                        subtitleViewConfiguration:
+                                            SubtitleViewConfiguration(
+                                          visible: _subtitlesEnabled,
+                                        ),
                                       ),
+                                    )
+                                  : _PlayerFallback(
+                                      episode: episode,
+                                      error: _error,
                                     ),
-                                  )
-                                : _PlayerFallback(
-                                    episode: episode,
-                                    error: _error,
-                                  ),
+                ),
               ),
               if (_openedMedia &&
                   _desktopVlcPlayer != null &&
@@ -3546,32 +3552,38 @@ class _PlayerScreenState extends State<PlayerScreen>
                     child: AnimatedOpacity(
                       opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
                       duration: const Duration(milliseconds: 220),
-                      child: _PlayerTopBar(
-                        episode: episode,
-                        status: sourceStatus.label,
-                        statusIcon: sourceStatus.icon,
-                        statusColor: sourceStatus.color,
-                        onBack: _exitPlayer,
-                        onPrevious: _playPrevious,
-                        onNext: _playNext,
-                        onSettings: _showPlayerSettingsDialog,
-                        onEpisodes: () => unawaited(_showEpisodeListPanel()),
-                        onToggleVolume: _togglePlayerVolumeSlider,
-                        onVolumeChanged: _setPlayerVolume,
-                        onFullscreen: () => unawaited(_toggleFullscreenMode()),
-                        onControlFocusChanged: _setPlayerControlsFocused,
-                        showVolumeControl: _showsDesktopVolumeControl,
-                        showVolumeSlider: _playerVolumeSliderVisible,
-                        volume: _playerVolume,
-                        showFullscreenControl: _showsPlayerFullscreenControl,
-                        backButtonFocusNode: _playerBackButtonFocusNode,
-                        previousButtonFocusNode: _playerPreviousButtonFocusNode,
-                        nextButtonFocusNode: _playerNextButtonFocusNode,
-                        settingsButtonFocusNode: _playerSettingsButtonFocusNode,
-                        episodesButtonFocusNode: _playerEpisodesButtonFocusNode,
-                        volumeButtonFocusNode: _playerVolumeButtonFocusNode,
-                        fullscreenButtonFocusNode:
-                            _playerFullscreenButtonFocusNode,
+                      child: RepaintBoundary(
+                        child: _PlayerTopBar(
+                          episode: episode,
+                          status: sourceStatus.label,
+                          statusIcon: sourceStatus.icon,
+                          statusColor: sourceStatus.color,
+                          onBack: _exitPlayer,
+                          onPrevious: _playPrevious,
+                          onNext: _playNext,
+                          onSettings: _showPlayerSettingsDialog,
+                          onEpisodes: () => unawaited(_showEpisodeListPanel()),
+                          onToggleVolume: _togglePlayerVolumeSlider,
+                          onVolumeChanged: _setPlayerVolume,
+                          onFullscreen: () =>
+                              unawaited(_toggleFullscreenMode()),
+                          onControlFocusChanged: _setPlayerControlsFocused,
+                          showVolumeControl: _showsDesktopVolumeControl,
+                          showVolumeSlider: _playerVolumeSliderVisible,
+                          volume: _playerVolume,
+                          showFullscreenControl: _showsPlayerFullscreenControl,
+                          backButtonFocusNode: _playerBackButtonFocusNode,
+                          previousButtonFocusNode:
+                              _playerPreviousButtonFocusNode,
+                          nextButtonFocusNode: _playerNextButtonFocusNode,
+                          settingsButtonFocusNode:
+                              _playerSettingsButtonFocusNode,
+                          episodesButtonFocusNode:
+                              _playerEpisodesButtonFocusNode,
+                          volumeButtonFocusNode: _playerVolumeButtonFocusNode,
+                          fullscreenButtonFocusNode:
+                              _playerFullscreenButtonFocusNode,
+                        ),
                       ),
                     ),
                   ),
@@ -3619,14 +3631,16 @@ class _PlayerScreenState extends State<PlayerScreen>
                     child: AnimatedOpacity(
                       opacity: _playerOverlaysVisible ? 1 : 0,
                       duration: const Duration(milliseconds: 220),
-                      child: _AndroidExoControls(
-                        controller: _androidExoController!,
-                        onTogglePlayback: _toggleAndroidExoPlayback,
-                        onSeek: _seekAndroidExoPlayer,
-                        formatTime: _formatPlaybackTime,
-                        onFocusChanged: _setPlayerControlsFocused,
-                        playButtonFocusNode: _playerBottomPlayFocusNode,
-                        progressFocusNode: _playerBottomProgressFocusNode,
+                      child: RepaintBoundary(
+                        child: _AndroidExoControls(
+                          controller: _androidExoController!,
+                          onTogglePlayback: _toggleAndroidExoPlayback,
+                          onSeek: _seekAndroidExoPlayer,
+                          formatTime: _formatPlaybackTime,
+                          onFocusChanged: _setPlayerControlsFocused,
+                          playButtonFocusNode: _playerBottomPlayFocusNode,
+                          progressFocusNode: _playerBottomProgressFocusNode,
+                        ),
                       ),
                     ),
                   ),
@@ -3643,16 +3657,18 @@ class _PlayerScreenState extends State<PlayerScreen>
                     child: AnimatedOpacity(
                       opacity: _playerOverlaysVisible ? 1 : 0,
                       duration: const Duration(milliseconds: 220),
-                      child: _YoutubeWebControls(
-                        isPlaying: _youtubeWebPlaying,
-                        position: _youtubeWebPosition,
-                        duration: _youtubeWebDuration,
-                        onTogglePlayback: _toggleYoutubeWebPlayback,
-                        onSeek: _seekYoutubeWebPlayer,
-                        formatTime: _formatPlaybackTime,
-                        onFocusChanged: _setPlayerControlsFocused,
-                        playButtonFocusNode: _playerBottomPlayFocusNode,
-                        progressFocusNode: _playerBottomProgressFocusNode,
+                      child: RepaintBoundary(
+                        child: _YoutubeWebControls(
+                          isPlaying: _youtubeWebPlaying,
+                          position: _youtubeWebPosition,
+                          duration: _youtubeWebDuration,
+                          onTogglePlayback: _toggleYoutubeWebPlayback,
+                          onSeek: _seekYoutubeWebPlayer,
+                          formatTime: _formatPlaybackTime,
+                          onFocusChanged: _setPlayerControlsFocused,
+                          playButtonFocusNode: _playerBottomPlayFocusNode,
+                          progressFocusNode: _playerBottomProgressFocusNode,
+                        ),
                       ),
                     ),
                   ),
@@ -3667,14 +3683,16 @@ class _PlayerScreenState extends State<PlayerScreen>
                     child: AnimatedOpacity(
                       opacity: _playerOverlaysVisible ? 1 : 0,
                       duration: const Duration(milliseconds: 220),
-                      child: _DesktopVlcControls(
-                        player: _desktopVlcPlayer!,
-                        onTogglePlayback: _toggleDesktopVlcPlayback,
-                        onSeek: _seekDesktopVlcPlayer,
-                        formatTime: _formatPlaybackTime,
-                        onFocusChanged: _setPlayerControlsFocused,
-                        playButtonFocusNode: _playerBottomPlayFocusNode,
-                        progressFocusNode: _playerBottomProgressFocusNode,
+                      child: RepaintBoundary(
+                        child: _DesktopVlcControls(
+                          player: _desktopVlcPlayer!,
+                          onTogglePlayback: _toggleDesktopVlcPlayback,
+                          onSeek: _seekDesktopVlcPlayer,
+                          formatTime: _formatPlaybackTime,
+                          onFocusChanged: _setPlayerControlsFocused,
+                          playButtonFocusNode: _playerBottomPlayFocusNode,
+                          progressFocusNode: _playerBottomProgressFocusNode,
+                        ),
                       ),
                     ),
                   ),
@@ -3686,10 +3704,18 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
-  void _showPlayerOverlays() {
+  void _showPlayerOverlays({bool throttled = false}) {
     if (!mounted) {
       return;
     }
+    final now = DateTime.now();
+    if (throttled &&
+        _playerOverlaysVisible &&
+        now.difference(_lastPlayerOverlayPointerRefresh) <
+            _playerPointerOverlayRefreshInterval) {
+      return;
+    }
+    _lastPlayerOverlayPointerRefresh = now;
     if (!_playerOverlaysVisible) {
       setState(() {
         _playerOverlaysVisible = true;
@@ -6321,6 +6347,7 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
   double? _dragPositionMs;
   Timer? _keyboardSeekTimer;
   Duration? _pendingKeyboardSeek;
+  DateTime _lastUiRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
@@ -6386,9 +6413,15 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
 
   void _listenToPlayer() {
     _positionSubscription = widget.player.positionStream.listen((_) {
-      if (mounted && _dragPositionMs == null) {
-        setState(() {});
+      if (!mounted || _dragPositionMs != null) {
+        return;
       }
+      final now = DateTime.now();
+      if (now.difference(_lastUiRefresh) < const Duration(milliseconds: 250)) {
+        return;
+      }
+      _lastUiRefresh = now;
+      setState(() {});
     });
     _playbackSubscription = widget.player.playbackStream.listen((_) {
       if (mounted) {
@@ -6659,6 +6692,7 @@ class _PlayerEpisodeListDialog extends StatelessWidget {
                                 child: Image.network(
                                   episode.imageUrl,
                                   fit: BoxFit.cover,
+                                  cacheWidth: 320,
                                   frameBuilder:
                                       (context, child, frame, wasSync) {
                                     if (wasSync || frame != null) {
@@ -7588,16 +7622,19 @@ class _FadeInNetworkImage extends StatelessWidget {
   const _FadeInNetworkImage({
     required this.imageUrl,
     this.fit,
+    this.cacheWidth,
   });
 
   final String imageUrl;
   final BoxFit? fit;
+  final int? cacheWidth;
 
   @override
   Widget build(BuildContext context) {
     return Image.network(
       imageUrl,
       fit: fit,
+      cacheWidth: cacheWidth,
       frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
         if (wasSynchronouslyLoaded) {
           return child;
@@ -7635,99 +7672,107 @@ class _UpcomingCard extends StatelessWidget {
     return SizedBox(
       width: 300,
       height: 170,
-      child: DecoratedBox(
-        decoration: glassDecoration(color: const Color(0xD010161D), radius: 8),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              if (episode.imageUrl.isNotEmpty)
-                _FadeInNetworkImage(
-                  imageUrl: episode.imageUrl,
-                  fit: BoxFit.cover,
-                )
-              else
-                Image.asset(
-                  'assets/images/tanuki_tv_banner.png',
-                  fit: BoxFit.cover,
-                ),
-              const DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Color(0x33000000),
-                      Color(0x10000000),
-                      Color(0xE010161D),
-                    ],
+      child: RepaintBoundary(
+        child: DecoratedBox(
+          decoration:
+              glassDecoration(color: const Color(0xD010161D), radius: 8),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (episode.imageUrl.isNotEmpty)
+                  _FadeInNetworkImage(
+                    imageUrl: episode.imageUrl,
+                    fit: BoxFit.cover,
+                    cacheWidth: 640,
+                  )
+                else
+                  Image.asset(
+                    'assets/images/tanuki_tv_banner.png',
+                    fit: BoxFit.cover,
                   ),
-                ),
-              ),
-              Positioned(
-                top: 10,
-                left: 10,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                const DecoratedBox(
                   decoration: BoxDecoration(
-                    color: labelColor.withValues(alpha: 0.24),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(
-                      color: labelColor.withValues(alpha: 0.55),
-                    ),
-                  ),
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: labelColor,
-                      fontSize: 10,
-                      fontWeight: FontWeight.w900,
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Color(0x33000000),
+                        Color(0x10000000),
+                        Color(0xE010161D),
+                      ],
                     ),
                   ),
                 ),
-              ),
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 34, 12, 12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        episode.seriesName,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: TanukiColors.text,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w900,
-                          shadows: [Shadow(color: Colors.black, blurRadius: 4)],
-                        ),
+                Positioned(
+                  top: 10,
+                  left: 10,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: labelColor.withValues(alpha: 0.24),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: labelColor.withValues(alpha: 0.55),
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        episodeLabel,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFFCFD9E3),
-                          fontSize: 12,
-                          fontWeight: FontWeight.w800,
-                          shadows: [Shadow(color: Colors.black, blurRadius: 4)],
-                        ),
+                    ),
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: labelColor,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w900,
                       ),
-                    ],
+                    ),
                   ),
                 ),
-              ),
-            ],
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 34, 12, 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          episode.seriesName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: TanukiColors.text,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w900,
+                            shadows: [
+                              Shadow(color: Colors.black, blurRadius: 4)
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          episodeLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xFFCFD9E3),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w800,
+                            shadows: [
+                              Shadow(color: Colors.black, blurRadius: 4)
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
