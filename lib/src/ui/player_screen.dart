@@ -28,6 +28,8 @@ const _remoteVideoFrameWatchdogDelay = Duration(seconds: 45);
 const _remoteVideoFramePlaybackGrace = Duration(seconds: 35);
 const _animeAv1PlaybackErrorFallbackDelay = Duration(seconds: 45);
 const _playerOverlayAutoHideDelay = Duration(seconds: 5);
+const _playerRemoteBackHoldExitDelay = Duration(milliseconds: 700);
+const _playerDialogReopenSuppressDelay = Duration(milliseconds: 650);
 const _remoteSeekJumpThreshold = Duration(seconds: 45);
 const _remoteSeekStallDelay = Duration(seconds: 11);
 const _remoteOpeningRecoveryMaxAttempts = 1;
@@ -122,6 +124,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _playerBuffering = false;
   bool _playerFullscreen = false;
   bool _playerVolumeSliderVisible = false;
+  bool _suppressNextPlayerActivationKeyUp = false;
   double _playerVolume = 1.0;
   final FocusNode _playerControlsRootFocusNode =
       FocusNode(debugLabel: 'playerControlsRoot');
@@ -180,7 +183,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   Timer? _youtubeWebStateTimer;
   Timer? _upcomingCardStartTimer;
   Timer? _upcomingCardSequenceTimer;
-  DateTime? _lastPlayerBackKeyAt;
+  Timer? _playerRemoteBackHoldTimer;
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<Duration>? _durationSubscription;
   StreamSubscription<bool>? _completedSubscription;
@@ -201,8 +204,13 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _openedNativeYoutubePlayer = false;
   bool _youtubeWebPlaying = false;
   bool _youtubeWebEnded = false;
+  bool _playerDialogOpen = false;
+  bool _playerRemoteBackKeyDown = false;
+  bool _playerRemoteBackLongPressTriggered = false;
   Duration _youtubeWebPosition = Duration.zero;
   Duration _youtubeWebDuration = Duration.zero;
+  DateTime _suppressPlayerDialogOpenUntil =
+      DateTime.fromMillisecondsSinceEpoch(0);
   int? _remoteVideoWidth;
   int? _remoteVideoHeight;
   int _remoteOpeningRecoveryAttempts = 0;
@@ -265,6 +273,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _remoteOpeningRecoveryTimer?.cancel();
     _upcomingCardStartTimer?.cancel();
     _upcomingCardSequenceTimer?.cancel();
+    _playerRemoteBackHoldTimer?.cancel();
     _playerControlsRootFocusNode.dispose();
     _playerBackButtonFocusNode.dispose();
     _playerPreviousButtonFocusNode.dispose();
@@ -3759,35 +3768,47 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   KeyEventResult _handlePlayerRootKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) {
-      return KeyEventResult.ignored;
-    }
     final key = event.logicalKey;
-    if (_activeAnimeSkipInterval != null) {
-      if (key == LogicalKeyboardKey.goBack ||
-          key == LogicalKeyboardKey.browserBack ||
-          key == LogicalKeyboardKey.escape) {
-        _dismissActiveAnimeSkip();
+    if (event is KeyUpEvent && _isPlayerActivationKey(key)) {
+      if (_suppressNextPlayerActivationKeyUp) {
+        _suppressNextPlayerActivationKeyUp = false;
         return KeyEventResult.handled;
       }
-      if (_isPlayerActivationKey(key)) {
+      if (_activeAnimeSkipInterval != null) {
         unawaited(_skipActiveAnimeSegment());
         return KeyEventResult.handled;
       }
-    }
-    if (key == LogicalKeyboardKey.goBack ||
-        key == LogicalKeyboardKey.browserBack ||
-        key == LogicalKeyboardKey.escape) {
-      return _handlePlayerBackKey();
-    }
-    if (_isPlayerActivationKey(key) &&
-        (!_playerOverlaysVisible || !_playerControlsFocused)) {
+      if (_activateFocusedPlayerControl()) {
+        _showPlayerOverlays();
+        return KeyEventResult.handled;
+      }
       _showPlayerOverlays();
-      _requestPlayerControlFocus(preferBottom: true);
       return KeyEventResult.handled;
     }
-    if (_isPlayerActivationKey(key) && _activateFocusedPlayerControl()) {
+    if (_activeAnimeSkipInterval != null && _isPlayerBackKey(key)) {
+      if (event is KeyDownEvent) {
+        _dismissActiveAnimeSkip();
+      }
+      return KeyEventResult.handled;
+    }
+    if (_isPlayerBackKey(key)) {
+      return _handlePlayerBackKey(event);
+    }
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (_activeAnimeSkipInterval != null) {
+      if (_isPlayerActivationKey(key)) {
+        return KeyEventResult.handled;
+      }
+    }
+    if (_isPlayerActivationKey(key)) {
+      if (_hasFocusedPlayerControl) {
+        return KeyEventResult.handled;
+      }
       _showPlayerOverlays();
+      _requestPlayerControlFocus(preferBottom: true);
+      _suppressNextPlayerActivationKeyUp = true;
       return KeyEventResult.handled;
     }
     if (_playerControlsFocused && key == LogicalKeyboardKey.arrowDown) {
@@ -3822,54 +3843,101 @@ class _PlayerScreenState extends State<PlayerScreen>
     final isNavigationKey = key == LogicalKeyboardKey.arrowUp ||
         key == LogicalKeyboardKey.arrowDown ||
         key == LogicalKeyboardKey.arrowLeft ||
-        key == LogicalKeyboardKey.arrowRight ||
-        key == LogicalKeyboardKey.select ||
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.gameButtonA;
+        key == LogicalKeyboardKey.arrowRight;
     if (isNavigationKey) {
       _showPlayerOverlays();
-      if (key == LogicalKeyboardKey.arrowLeft ||
-          key == LogicalKeyboardKey.arrowRight) {
-        return KeyEventResult.ignored;
-      }
-      if (!_playerControlsFocused) {
+      if (!_hasFocusedPlayerControl) {
         _requestPlayerControlFocus(
           preferBottom: key == LogicalKeyboardKey.arrowDown,
         );
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.arrowLeft ||
+          key == LogicalKeyboardKey.arrowRight) {
         return KeyEventResult.handled;
       }
     }
     return KeyEventResult.ignored;
   }
 
-  KeyEventResult _handlePlayerBackKey() {
-    final now = DateTime.now();
-    final previous = _lastPlayerBackKeyAt;
-    _lastPlayerBackKeyAt = now;
-    if (previous != null &&
-        now.difference(previous) <= const Duration(milliseconds: 850)) {
-      _exitPlayer();
+  KeyEventResult _handlePlayerBackKey(KeyEvent event) {
+    if (event is KeyDownEvent) {
+      if (_playerRemoteBackKeyDown) {
+        return KeyEventResult.handled;
+      }
+      _playerRemoteBackKeyDown = true;
+      _playerRemoteBackLongPressTriggered = false;
+      _playerRemoteBackHoldTimer?.cancel();
+      _playerRemoteBackHoldTimer = Timer(
+        _playerRemoteBackHoldExitDelay,
+        _triggerPlayerRemoteBackLongPressExit,
+      );
       return KeyEventResult.handled;
     }
-    _playerControlsRootFocusNode.requestFocus();
+    if (event is KeyRepeatEvent) {
+      return KeyEventResult.handled;
+    }
+    if (event is! KeyUpEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    _playerRemoteBackKeyDown = false;
+    _playerRemoteBackHoldTimer?.cancel();
+    _playerRemoteBackHoldTimer = null;
+    if (_playerRemoteBackLongPressTriggered) {
+      _playerRemoteBackLongPressTriggered = false;
+      return KeyEventResult.handled;
+    }
+    final nextVisible = !_playerOverlaysVisible;
     if (mounted) {
       setState(() {
-        _playerControlsFocused = false;
-        _playerOverlaysVisible = !_playerOverlaysVisible;
+        _playerControlsFocused = nextVisible;
+        _playerOverlaysVisible = nextVisible;
       });
     }
-    if (_playerOverlaysVisible) {
+    if (nextVisible) {
+      _requestPlayerControlFocus();
       _schedulePlayerOverlayHide();
     } else {
+      _playerControlsRootFocusNode.requestFocus();
       _playerOverlayHideTimer?.cancel();
     }
     return KeyEventResult.handled;
+  }
+
+  void _triggerPlayerRemoteBackLongPressExit() {
+    if (!mounted || !_playerRemoteBackKeyDown || _leavingPlayer) {
+      return;
+    }
+    _playerRemoteBackLongPressTriggered = true;
+    _exitPlayer();
+  }
+
+  bool _isPlayerBackKey(LogicalKeyboardKey key) {
+    return key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.browserBack ||
+        key == LogicalKeyboardKey.escape;
   }
 
   bool _isPlayerActivationKey(LogicalKeyboardKey key) {
     return key == LogicalKeyboardKey.select ||
         key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.gameButtonA;
+  }
+
+  bool get _hasFocusedPlayerControl {
+    return _playerBackButtonFocusNode.hasFocus ||
+        _playerPreviousButtonFocusNode.hasFocus ||
+        _playerNextButtonFocusNode.hasFocus ||
+        _playerSubtitlesButtonFocusNode.hasFocus ||
+        _playerFitButtonFocusNode.hasFocus ||
+        _playerSettingsButtonFocusNode.hasFocus ||
+        _playerEpisodesButtonFocusNode.hasFocus ||
+        _playerVolumeButtonFocusNode.hasFocus ||
+        _playerFullscreenButtonFocusNode.hasFocus ||
+        _playerBottomPlayFocusNode.hasFocus ||
+        _playerBottomProgressFocusNode.hasFocus ||
+        _animeSkipButtonFocusNode.hasFocus;
   }
 
   bool _activateFocusedPlayerControl() {
@@ -3909,22 +3977,27 @@ class _PlayerScreenState extends State<PlayerScreen>
       unawaited(_toggleFullscreenMode());
       return true;
     }
-    if (_playerBottomPlayFocusNode.hasFocus) {
-      if (_usesAndroidExoPlayer) {
-        unawaited(_toggleAndroidExoPlayback());
-      } else if (_youtubeWebController != null) {
-        unawaited(_toggleYoutubeWebPlayback());
-      } else if (_usesDesktopVlcPlayer) {
-        unawaited(_toggleDesktopVlcPlayback());
-      } else {
-        final player = _player;
-        if (player != null) {
-          unawaited(player.playOrPause());
-        }
-      }
+    if (_playerBottomPlayFocusNode.hasFocus ||
+        _playerBottomProgressFocusNode.hasFocus) {
+      _toggleCurrentPlayback();
       return true;
     }
     return false;
+  }
+
+  void _toggleCurrentPlayback() {
+    if (_usesAndroidExoPlayer) {
+      unawaited(_toggleAndroidExoPlayback());
+    } else if (_youtubeWebController != null) {
+      unawaited(_toggleYoutubeWebPlayback());
+    } else if (_usesDesktopVlcPlayer) {
+      unawaited(_toggleDesktopVlcPlayback());
+    } else {
+      final player = _player;
+      if (player != null) {
+        unawaited(player.playOrPause());
+      }
+    }
   }
 
   void _exitPlayer() {
@@ -3938,7 +4011,13 @@ class _PlayerScreenState extends State<PlayerScreen>
     _cancelDeferredAnimeAv1PlaybackError();
     _playerOverlayHideTimer?.cancel();
     unawaited(_pauseSimklScrobble());
-    Navigator.of(context).maybePop();
+    FocusManager.instance.primaryFocus?.unfocus();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).maybePop();
+    });
   }
 
   void _requestPlayerControlFocus({bool preferBottom = false}) {
@@ -4506,27 +4585,55 @@ class _PlayerScreenState extends State<PlayerScreen>
     _showPlayerOverlays();
   }
 
+  bool get _canOpenPlayerDialog {
+    return !_playerDialogOpen &&
+        !_leavingPlayer &&
+        DateTime.now().isAfter(_suppressPlayerDialogOpenUntil);
+  }
+
+  void _suppressPlayerDialogReopen() {
+    if (!mounted) {
+      return;
+    }
+    _suppressPlayerDialogOpenUntil =
+        DateTime.now().add(_playerDialogReopenSuppressDelay);
+    _suppressNextPlayerActivationKeyUp = true;
+    _playerControlsRootFocusNode.requestFocus();
+  }
+
   Future<void> _showEpisodeListPanel() async {
+    if (!_canOpenPlayerDialog) {
+      return;
+    }
+    _playerDialogOpen = true;
     _showPlayerOverlays();
     final series = widget.controller.findSeriesForEpisode(widget.episode);
     if (series == null || series.episodes.isEmpty) {
+      _playerDialogOpen = false;
       return;
     }
-    final selected = await showDialog<EpisodeItem>(
-      context: context,
-      barrierColor: const Color(0xAA000000),
-      builder: (context) => _PlayerEpisodeListDialog(
-        series: series,
-        current: widget.episode,
-        controller: widget.controller,
-      ),
-    );
-    if (selected == null ||
+    EpisodeItem? selected;
+    try {
+      selected = await showDialog<EpisodeItem>(
+        context: context,
+        barrierColor: const Color(0xAA000000),
+        builder: (context) => _PlayerEpisodeListDialog(
+          series: series,
+          current: widget.episode,
+          controller: widget.controller,
+        ),
+      );
+    } finally {
+      _playerDialogOpen = false;
+      _suppressPlayerDialogReopen();
+    }
+    final selectedEpisode = selected;
+    if (selectedEpisode == null ||
         !mounted ||
-        _isSameEpisode(selected, widget.episode)) {
+        _isSameEpisode(selectedEpisode, widget.episode)) {
       return;
     }
-    await widget.controller.setCurrentEntry(selected);
+    await widget.controller.setCurrentEntry(selectedEpisode);
     if (!mounted) {
       return;
     }
@@ -4534,7 +4641,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       MaterialPageRoute(
         builder: (_) => PlayerScreen(
           controller: widget.controller,
-          episode: selected,
+          episode: selectedEpisode,
           launchMode: widget.launchMode,
         ),
       ),
@@ -4542,577 +4649,592 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _showPlayerSettingsDialog() async {
+    if (!_canOpenPlayerDialog) {
+      return;
+    }
+    _playerDialogOpen = true;
     _showPlayerOverlays();
     var preference =
         widget.controller.playbackPreferenceForEpisode(widget.episode);
-    await showDialog<void>(
-      context: context,
-      barrierColor: const Color(0xAA000000),
-      builder: (dialogContext) {
-        var tab = 0;
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            final selectedProvider =
-                widget.controller.playbackProviderForEpisode(widget.episode);
-            final activeProvider = selectedProvider ??
-                _currentResolvedStream?.provider ??
-                widget.episode.provider;
-            final animeAv1Mode =
-                animeAv1PlaybackModeFromId(preference.animeAv1Mode);
-            final jkAnimeServer = _currentResolvedStream?.provider ==
-                        RemoteProvider.jkAnime &&
-                    _currentResolvedStream?.server.trim().isNotEmpty == true
-                ? jkAnimeServerPreferenceFromId(_currentResolvedStream!.server)
-                : jkAnimeServerPreferenceFromId(preference.jkAnimeServer);
-            final latAnimeServer =
-                _currentResolvedStream?.provider == RemoteProvider.latAnime &&
-                        _currentResolvedStream?.server.trim().isNotEmpty == true
-                    ? latAnimeServerPreferenceFromId(
-                        _currentResolvedStream!.server,
-                      )
-                    : latAnimeServerPreferenceFromId(preference.latAnimeServer);
-            final justAnimeMode =
-                justAnimePlaybackModeFromId(preference.justAnimeMode);
-            final justAnimeServer = _currentResolvedStream?.provider ==
-                        RemoteProvider.justAnime &&
-                    _currentResolvedStream?.server.trim().isNotEmpty == true
-                ? justAnimeServerPreferenceFromId(
-                    _currentResolvedStream!.server)
-                : justAnimeServerPreferenceFromId(preference.justAnimeServer);
-            final aniPmMode = aniPmPlaybackModeFromId(preference.aniPmMode);
-            final aniPmServer =
-                _currentResolvedStream?.provider == RemoteProvider.aniPm &&
-                        _currentResolvedStream?.server.trim().isNotEmpty == true
-                    ? _currentResolvedStream!.server.trim().toLowerCase()
-                    : preference.aniPmServer.trim().toLowerCase();
-            final facebookMode =
-                facebookPlaybackModeFromId(preference.facebookMode);
-            final facebookOption =
-                facebookPlaybackOptionFromId(preference.facebookOption);
-            final youtubeMode =
-                youtubePlaybackModeFromId(preference.youtubeMode);
-            final youtubeOption =
-                youtubePlaybackOptionFromId(preference.youtubeOption);
+    try {
+      await showDialog<void>(
+        context: context,
+        barrierColor: const Color(0xAA000000),
+        builder: (dialogContext) {
+          var tab = 0;
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              final selectedProvider =
+                  widget.controller.playbackProviderForEpisode(widget.episode);
+              final activeProvider = selectedProvider ??
+                  _currentResolvedStream?.provider ??
+                  widget.episode.provider;
+              final animeAv1Mode =
+                  animeAv1PlaybackModeFromId(preference.animeAv1Mode);
+              final jkAnimeServer = _currentResolvedStream?.provider ==
+                          RemoteProvider.jkAnime &&
+                      _currentResolvedStream?.server.trim().isNotEmpty == true
+                  ? jkAnimeServerPreferenceFromId(
+                      _currentResolvedStream!.server)
+                  : jkAnimeServerPreferenceFromId(preference.jkAnimeServer);
+              final latAnimeServer = _currentResolvedStream?.provider ==
+                          RemoteProvider.latAnime &&
+                      _currentResolvedStream?.server.trim().isNotEmpty == true
+                  ? latAnimeServerPreferenceFromId(
+                      _currentResolvedStream!.server,
+                    )
+                  : latAnimeServerPreferenceFromId(preference.latAnimeServer);
+              final justAnimeMode =
+                  justAnimePlaybackModeFromId(preference.justAnimeMode);
+              final justAnimeServer = _currentResolvedStream?.provider ==
+                          RemoteProvider.justAnime &&
+                      _currentResolvedStream?.server.trim().isNotEmpty == true
+                  ? justAnimeServerPreferenceFromId(
+                      _currentResolvedStream!.server)
+                  : justAnimeServerPreferenceFromId(preference.justAnimeServer);
+              final aniPmMode = aniPmPlaybackModeFromId(preference.aniPmMode);
+              final aniPmServer = _currentResolvedStream?.provider ==
+                          RemoteProvider.aniPm &&
+                      _currentResolvedStream?.server.trim().isNotEmpty == true
+                  ? _currentResolvedStream!.server.trim().toLowerCase()
+                  : preference.aniPmServer.trim().toLowerCase();
+              final facebookMode =
+                  facebookPlaybackModeFromId(preference.facebookMode);
+              final facebookOption =
+                  facebookPlaybackOptionFromId(preference.facebookOption);
+              final youtubeMode =
+                  youtubePlaybackModeFromId(preference.youtubeMode);
+              final youtubeOption =
+                  youtubePlaybackOptionFromId(preference.youtubeOption);
 
-            Future<void> savePreference(Future<void> Function() save) async {
-              final wasBiliBili =
-                  _currentResolvedStream?.provider == RemoteProvider.bilibili;
-              await save();
-              if (!mounted || !dialogContext.mounted) {
-                return;
+              Future<void> savePreference(Future<void> Function() save) async {
+                final wasBiliBili =
+                    _currentResolvedStream?.provider == RemoteProvider.bilibili;
+                await save();
+                if (!mounted || !dialogContext.mounted) {
+                  return;
+                }
+                setDialogState(() {
+                  preference = widget.controller
+                      .playbackPreferenceForEpisode(widget.episode);
+                });
+                if (widget.episode.isRemote) {
+                  if (wasBiliBili) {
+                    await _disposeDesktopVlcPlayer(
+                      delayForBiliBili: true,
+                      treatAsBiliBili: true,
+                    );
+                  }
+                  await _reloadRemoteSource();
+                }
               }
-              setDialogState(() {
-                preference = widget.controller
-                    .playbackPreferenceForEpisode(widget.episode);
-              });
-              if (widget.episode.isRemote) {
-                if (wasBiliBili) {
-                  await _disposeDesktopVlcPlayer(
-                    delayForBiliBili: true,
-                    treatAsBiliBili: true,
+
+              Widget sourceOptions(RemoteProvider? provider) {
+                if (provider == RemoteProvider.animeAv1) {
+                  return Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final mode in AnimeAv1PlaybackMode.values)
+                        _PlayerDialogRadioButton(
+                          label: mode.dialogLabel,
+                          active: animeAv1Mode == mode,
+                          onPressed: () => unawaited(
+                            savePreference(
+                              () => widget.controller.setAnimeAv1ModeForEpisode(
+                                widget.episode,
+                                mode,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
                   );
                 }
-                await _reloadRemoteSource();
-              }
-            }
-
-            Widget sourceOptions(RemoteProvider? provider) {
-              if (provider == RemoteProvider.animeAv1) {
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    for (final mode in AnimeAv1PlaybackMode.values)
-                      _PlayerDialogRadioButton(
-                        label: mode.dialogLabel,
-                        active: animeAv1Mode == mode,
-                        onPressed: () => unawaited(
-                          savePreference(
-                            () => widget.controller.setAnimeAv1ModeForEpisode(
-                              widget.episode,
-                              mode,
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                );
-              }
-              if (provider == RemoteProvider.jkAnime) {
-                final availableServers = _availableJkAnimeServers();
-                return _PlayerDialogScrollableRadioColumn(
-                  children: [
-                    for (final server in availableServers)
-                      _PlayerDialogRadioButton(
-                        label: server.label,
-                        active: jkAnimeServer == server,
-                        onPressed: () => unawaited(
-                          savePreference(
-                            () => widget.controller.setJkAnimeServerForEpisode(
-                              widget.episode,
-                              server,
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                );
-              }
-              if (provider == RemoteProvider.latAnime) {
-                return _PlayerDialogScrollableRadioColumn(
-                  children: [
-                    for (final server in LatAnimeServerPreference.values)
-                      _PlayerDialogRadioButton(
-                        label: server.label,
-                        active: latAnimeServer == server,
-                        onPressed: () => unawaited(
-                          savePreference(
-                            () => widget.controller.setLatAnimeServerForEpisode(
-                              widget.episode,
-                              server,
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                );
-              }
-              if (provider == RemoteProvider.justAnime) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _PlayerDialogSectionTitle('Audio'),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final mode in JustAnimePlaybackMode.values)
-                          _PlayerDialogRadioButton(
-                            label: mode.buttonLabel,
-                            active: justAnimeMode == mode,
-                            onPressed: () => unawaited(savePreference(
-                              () => widget.controller
-                                  .setJustAnimeModeForEpisode(
-                                      widget.episode, mode),
-                            )),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    const _PlayerDialogSectionTitle('Servidor'),
-                    const SizedBox(height: 8),
-                    _PlayerDialogScrollableRadioColumn(
-                      children: [
-                        for (final server in JustAnimeServerPreference.values)
-                          _PlayerDialogRadioButton(
-                            label: server.label,
-                            active: justAnimeServer == server,
-                            onPressed: () => unawaited(savePreference(
-                              () => widget.controller
-                                  .setJustAnimeServerForEpisode(
+                if (provider == RemoteProvider.jkAnime) {
+                  final availableServers = _availableJkAnimeServers();
+                  return _PlayerDialogScrollableRadioColumn(
+                    children: [
+                      for (final server in availableServers)
+                        _PlayerDialogRadioButton(
+                          label: server.label,
+                          active: jkAnimeServer == server,
+                          onPressed: () => unawaited(
+                            savePreference(
+                              () =>
+                                  widget.controller.setJkAnimeServerForEpisode(
                                 widget.episode,
                                 server,
                               ),
-                            )),
+                            ),
                           ),
-                      ],
-                    ),
-                  ],
-                );
-              }
-              if (provider == RemoteProvider.aniPm) {
-                final resolvedServers = <String>[
-                  if (_currentResolvedStream?.provider == RemoteProvider.aniPm)
-                    ..._currentResolvedStream!.availableModes,
-                ];
-                resolvedServers.sort((left, right) => remoteServerLabel(left)
-                    .compareTo(remoteServerLabel(right)));
-                final servers = <String>{
-                  if (aniPmServer.isNotEmpty) aniPmServer,
-                  ...resolvedServers,
-                }.toList();
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _PlayerDialogSectionTitle('Audio'),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final mode in AniPmPlaybackMode.values)
-                          _PlayerDialogRadioButton(
-                            label: mode.buttonLabel,
-                            active: aniPmMode == mode,
-                            onPressed: () => unawaited(savePreference(
-                              () => widget.controller
-                                  .setAniPmModeForEpisode(widget.episode, mode),
-                            )),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    const _PlayerDialogSectionTitle('Servidor'),
-                    const SizedBox(height: 8),
-                    _PlayerDialogScrollableRadioColumn(
-                      children: [
-                        _PlayerDialogRadioButton(
-                          label: 'Automatico',
-                          active: aniPmServer.isEmpty,
-                          onPressed: () => unawaited(savePreference(
-                            () => widget.controller
-                                .setAniPmServerForEpisode(widget.episode, ''),
-                          )),
                         ),
-                        for (final server in servers)
-                          _PlayerDialogRadioButton(
-                            label: remoteServerLabel(server),
-                            active: aniPmServer == server,
-                            onPressed: () => unawaited(savePreference(
-                              () => widget.controller.setAniPmServerForEpisode(
-                                  widget.episode, server),
-                            )),
+                    ],
+                  );
+                }
+                if (provider == RemoteProvider.latAnime) {
+                  return _PlayerDialogScrollableRadioColumn(
+                    children: [
+                      for (final server in LatAnimeServerPreference.values)
+                        _PlayerDialogRadioButton(
+                          label: server.label,
+                          active: latAnimeServer == server,
+                          onPressed: () => unawaited(
+                            savePreference(
+                              () =>
+                                  widget.controller.setLatAnimeServerForEpisode(
+                                widget.episode,
+                                server,
+                              ),
+                            ),
                           ),
-                      ],
-                    ),
-                    if (resolvedServers.isEmpty) ...[
+                        ),
+                    ],
+                  );
+                }
+                if (provider == RemoteProvider.justAnime) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const _PlayerDialogSectionTitle('Audio'),
                       const SizedBox(height: 8),
-                      const Text(
-                        'Los servidores disponibles apareceran al resolver el episodio.',
-                        style: TextStyle(color: TanukiColors.muted),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final mode in JustAnimePlaybackMode.values)
+                            _PlayerDialogRadioButton(
+                              label: mode.buttonLabel,
+                              active: justAnimeMode == mode,
+                              onPressed: () => unawaited(savePreference(
+                                () => widget.controller
+                                    .setJustAnimeModeForEpisode(
+                                        widget.episode, mode),
+                              )),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      const _PlayerDialogSectionTitle('Servidor'),
+                      const SizedBox(height: 8),
+                      _PlayerDialogScrollableRadioColumn(
+                        children: [
+                          for (final server in JustAnimeServerPreference.values)
+                            _PlayerDialogRadioButton(
+                              label: server.label,
+                              active: justAnimeServer == server,
+                              onPressed: () => unawaited(savePreference(
+                                () => widget.controller
+                                    .setJustAnimeServerForEpisode(
+                                  widget.episode,
+                                  server,
+                                ),
+                              )),
+                            ),
+                        ],
                       ),
                     ],
-                  ],
-                );
-              }
-              if (provider == RemoteProvider.facebook) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final mode in FacebookPlaybackMode.values)
-                          _PlayerDialogRadioButton(
-                            label: mode.dialogLabel,
-                            active: facebookMode == mode,
-                            onPressed: () => unawaited(
-                              savePreference(
-                                () =>
-                                    widget.controller.setFacebookModeForEpisode(
-                                  widget.episode,
-                                  mode,
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final option in FacebookPlaybackOption.values)
-                          _PlayerDialogRadioButton(
-                            label: option.label,
-                            active: facebookOption == option,
-                            onPressed: () => unawaited(
-                              savePreference(
-                                () => widget.controller
-                                    .setFacebookOptionForEpisode(
-                                  widget.episode,
-                                  option,
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ],
-                );
-              }
-              if (provider == RemoteProvider.bilibili) {
-                return const Text(
-                  'BiliBili usa las opciones encontradas automaticamente.',
-                  style: TextStyle(color: TanukiColors.muted),
-                );
-              }
-              if (provider == RemoteProvider.internetArchive) {
-                return const Text(
-                  'Internet Archive usa el archivo de video encontrado automaticamente.',
-                  style: TextStyle(color: TanukiColors.muted),
-                );
-              }
-              if (provider == RemoteProvider.youtube) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final mode in YoutubePlaybackMode.values)
-                          _PlayerDialogRadioButton(
-                            label: mode.buttonLabel,
-                            active: youtubeMode == mode,
-                            onPressed: () => unawaited(
-                              savePreference(
-                                () =>
-                                    widget.controller.setYoutubeModeForEpisode(
-                                  widget.episode,
-                                  mode,
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final option in YoutubePlaybackOption.values)
-                          _PlayerDialogRadioButton(
-                            label: option.label,
-                            active: youtubeOption == option,
-                            onPressed: () => unawaited(
-                              savePreference(
-                                () => widget.controller
-                                    .setYoutubeOptionForEpisode(
-                                  widget.episode,
-                                  option,
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ],
-                );
-              }
-              return const Text(
-                'Esta fuente no tiene opciones adicionales.',
-                style: TextStyle(color: TanukiColors.muted),
-              );
-            }
-
-            final providers = [
-              RemoteProvider.animeAv1,
-              RemoteProvider.jkAnime,
-              RemoteProvider.latAnime,
-              RemoteProvider.justAnime,
-              RemoteProvider.aniPm,
-              RemoteProvider.internetArchive,
-              RemoteProvider.bilibili,
-              RemoteProvider.youtube,
-              if (widget.controller.canUsePlaybackProviderForEpisode(
-                widget.episode,
-                RemoteProvider.facebook,
-              ))
-                RemoteProvider.facebook,
-            ];
-
-            return Dialog(
-              alignment: Alignment.centerRight,
-              insetPadding: const EdgeInsets.only(right: 28),
-              backgroundColor: const Color(0xF2131518),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-                side: const BorderSide(color: Color(0x44F28C28)),
-              ),
-              child: SizedBox(
-                width: 430,
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                  );
+                }
+                if (provider == RemoteProvider.aniPm) {
+                  final resolvedServers = <String>[
+                    if (_currentResolvedStream?.provider ==
+                        RemoteProvider.aniPm)
+                      ..._currentResolvedStream!.availableModes,
+                  ];
+                  resolvedServers.sort((left, right) => remoteServerLabel(left)
+                      .compareTo(remoteServerLabel(right)));
+                  final servers = <String>{
+                    if (aniPmServer.isNotEmpty) aniPmServer,
+                    ...resolvedServers,
+                  }.toList();
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
+                      const _PlayerDialogSectionTitle('Audio'),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
                         children: [
-                          const Icon(Icons.tune, color: TanukiColors.orange),
-                          const SizedBox(width: 10),
-                          const Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Player Settings',
-                                  style: TextStyle(
-                                    color: TanukiColors.text,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                ),
-                                Text(
-                                  'Ajusta player y fuentes',
-                                  style: TextStyle(
-                                    color: TanukiColors.muted,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              ],
+                          for (final mode in AniPmPlaybackMode.values)
+                            _PlayerDialogRadioButton(
+                              label: mode.buttonLabel,
+                              active: aniPmMode == mode,
+                              onPressed: () => unawaited(savePreference(
+                                () => widget.controller.setAniPmModeForEpisode(
+                                    widget.episode, mode),
+                              )),
                             ),
-                          ),
-                          IconButton(
-                            onPressed: () => Navigator.of(context).pop(),
-                            icon: const Icon(Icons.close),
-                          ),
                         ],
                       ),
-                      const Divider(color: Color(0x22FFFFFF)),
-                      Row(
+                      const SizedBox(height: 12),
+                      const _PlayerDialogSectionTitle('Servidor'),
+                      const SizedBox(height: 8),
+                      _PlayerDialogScrollableRadioColumn(
                         children: [
-                          Expanded(
-                            child: _PlayerSettingsTabButton(
-                              icon: Icons.aspect_ratio,
-                              label: 'Player',
-                              active: tab == 0,
-                              onPressed: () => setDialogState(() => tab = 0),
-                            ),
+                          _PlayerDialogRadioButton(
+                            label: 'Automatico',
+                            active: aniPmServer.isEmpty,
+                            onPressed: () => unawaited(savePreference(
+                              () => widget.controller
+                                  .setAniPmServerForEpisode(widget.episode, ''),
+                            )),
                           ),
-                          Expanded(
-                            child: _PlayerSettingsTabButton(
-                              icon: Icons.cloud,
-                              label: 'Fuentes',
-                              active: tab == 1,
-                              onPressed: () => setDialogState(() => tab = 1),
+                          for (final server in servers)
+                            _PlayerDialogRadioButton(
+                              label: remoteServerLabel(server),
+                              active: aniPmServer == server,
+                              onPressed: () => unawaited(savePreference(
+                                () => widget.controller
+                                    .setAniPmServerForEpisode(
+                                        widget.episode, server),
+                              )),
                             ),
-                          ),
                         ],
                       ),
-                      const SizedBox(height: 14),
-                      if (tab == 0)
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const _PlayerDialogSectionTitle('Pantalla'),
-                            const SizedBox(height: 8),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                _PlayerDialogRadioButton(
-                                  label: 'Fit',
-                                  active: _videoScaleMode == VideoScaleMode.fit,
-                                  onPressed: () => unawaited(
-                                    _setVideoScaleMode(VideoScaleMode.fit)
-                                        .then((_) {
-                                      if (dialogContext.mounted) {
-                                        setDialogState(() {});
-                                      }
-                                    }),
-                                  ),
-                                ),
-                                _PlayerDialogRadioButton(
-                                  label: 'Stretch',
-                                  active:
-                                      _videoScaleMode == VideoScaleMode.stretch,
-                                  onPressed: () => unawaited(
-                                    _setVideoScaleMode(
-                                      VideoScaleMode.stretch,
-                                    ).then((_) {
-                                      if (dialogContext.mounted) {
-                                        setDialogState(() {});
-                                      }
-                                    }),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 18),
-                            const _PlayerDialogSectionTitle('Subtitulos'),
-                            const SizedBox(height: 8),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                _PlayerDialogRadioButton(
-                                  label: 'Desactivados',
-                                  active: !_subtitlesEnabled,
-                                  onPressed: () {
-                                    setState(() {
-                                      _subtitlesEnabled = false;
-                                      _status = 'Subtitulos desactivados';
-                                    });
-                                    unawaited(
-                                      _applyRemoteSubtitleTrackIfReady(),
-                                    );
-                                    setDialogState(() {});
-                                  },
-                                ),
-                                _PlayerDialogRadioButton(
-                                  label: _subtitlesEnabled
-                                      ? 'Activados'
-                                      : 'Activar',
-                                  active: _subtitlesEnabled,
-                                  onPressed: () {
-                                    Navigator.of(dialogContext).pop();
-                                    Future<void>.delayed(
-                                      const Duration(milliseconds: 120),
-                                      _showSubtitleTrackDialog,
-                                    );
-                                  },
-                                ),
-                              ],
-                            ),
-                          ],
-                        )
-                      else
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            _PlayerDialogButton(
-                              label: 'Automatico',
-                              active: selectedProvider == null,
+                      if (resolvedServers.isEmpty) ...[
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Los servidores disponibles apareceran al resolver el episodio.',
+                          style: TextStyle(color: TanukiColors.muted),
+                        ),
+                      ],
+                    ],
+                  );
+                }
+                if (provider == RemoteProvider.facebook) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final mode in FacebookPlaybackMode.values)
+                            _PlayerDialogRadioButton(
+                              label: mode.dialogLabel,
+                              active: facebookMode == mode,
                               onPressed: () => unawaited(
                                 savePreference(
                                   () => widget.controller
-                                      .setPlaybackProviderForEpisode(
+                                      .setFacebookModeForEpisode(
                                     widget.episode,
-                                    null,
+                                    mode,
                                   ),
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 8),
-                            for (final provider in providers) ...[
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final option in FacebookPlaybackOption.values)
+                            _PlayerDialogRadioButton(
+                              label: option.label,
+                              active: facebookOption == option,
+                              onPressed: () => unawaited(
+                                savePreference(
+                                  () => widget.controller
+                                      .setFacebookOptionForEpisode(
+                                    widget.episode,
+                                    option,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                  );
+                }
+                if (provider == RemoteProvider.bilibili) {
+                  return const Text(
+                    'BiliBili usa las opciones encontradas automaticamente.',
+                    style: TextStyle(color: TanukiColors.muted),
+                  );
+                }
+                if (provider == RemoteProvider.internetArchive) {
+                  return const Text(
+                    'Internet Archive usa el archivo de video encontrado automaticamente.',
+                    style: TextStyle(color: TanukiColors.muted),
+                  );
+                }
+                if (provider == RemoteProvider.youtube) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final mode in YoutubePlaybackMode.values)
+                            _PlayerDialogRadioButton(
+                              label: mode.buttonLabel,
+                              active: youtubeMode == mode,
+                              onPressed: () => unawaited(
+                                savePreference(
+                                  () => widget.controller
+                                      .setYoutubeModeForEpisode(
+                                    widget.episode,
+                                    mode,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final option in YoutubePlaybackOption.values)
+                            _PlayerDialogRadioButton(
+                              label: option.label,
+                              active: youtubeOption == option,
+                              onPressed: () => unawaited(
+                                savePreference(
+                                  () => widget.controller
+                                      .setYoutubeOptionForEpisode(
+                                    widget.episode,
+                                    option,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                  );
+                }
+                return const Text(
+                  'Esta fuente no tiene opciones adicionales.',
+                  style: TextStyle(color: TanukiColors.muted),
+                );
+              }
+
+              final providers = [
+                RemoteProvider.animeAv1,
+                RemoteProvider.jkAnime,
+                RemoteProvider.latAnime,
+                RemoteProvider.justAnime,
+                RemoteProvider.aniPm,
+                RemoteProvider.internetArchive,
+                RemoteProvider.bilibili,
+                RemoteProvider.youtube,
+                if (widget.controller.canUsePlaybackProviderForEpisode(
+                  widget.episode,
+                  RemoteProvider.facebook,
+                ))
+                  RemoteProvider.facebook,
+              ];
+
+              return Dialog(
+                alignment: Alignment.centerRight,
+                insetPadding: const EdgeInsets.only(right: 28),
+                backgroundColor: const Color(0xF2131518),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: const BorderSide(color: Color(0x44F28C28)),
+                ),
+                child: SizedBox(
+                  width: 430,
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.tune, color: TanukiColors.orange),
+                            const SizedBox(width: 10),
+                            const Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Player Settings',
+                                    style: TextStyle(
+                                      color: TanukiColors.text,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                  Text(
+                                    'Ajusta player y fuentes',
+                                    style: TextStyle(
+                                      color: TanukiColors.muted,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: () => Navigator.of(context).pop(),
+                              icon: const Icon(Icons.close),
+                            ),
+                          ],
+                        ),
+                        const Divider(color: Color(0x22FFFFFF)),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _PlayerSettingsTabButton(
+                                icon: Icons.aspect_ratio,
+                                label: 'Player',
+                                active: tab == 0,
+                                onPressed: () => setDialogState(() => tab = 0),
+                              ),
+                            ),
+                            Expanded(
+                              child: _PlayerSettingsTabButton(
+                                icon: Icons.cloud,
+                                label: 'Fuentes',
+                                active: tab == 1,
+                                onPressed: () => setDialogState(() => tab = 1),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 14),
+                        if (tab == 0)
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const _PlayerDialogSectionTitle('Pantalla'),
+                              const SizedBox(height: 8),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _PlayerDialogRadioButton(
+                                    label: 'Fit',
+                                    active:
+                                        _videoScaleMode == VideoScaleMode.fit,
+                                    onPressed: () => unawaited(
+                                      _setVideoScaleMode(VideoScaleMode.fit)
+                                          .then((_) {
+                                        if (dialogContext.mounted) {
+                                          setDialogState(() {});
+                                        }
+                                      }),
+                                    ),
+                                  ),
+                                  _PlayerDialogRadioButton(
+                                    label: 'Stretch',
+                                    active: _videoScaleMode ==
+                                        VideoScaleMode.stretch,
+                                    onPressed: () => unawaited(
+                                      _setVideoScaleMode(
+                                        VideoScaleMode.stretch,
+                                      ).then((_) {
+                                        if (dialogContext.mounted) {
+                                          setDialogState(() {});
+                                        }
+                                      }),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 18),
+                              const _PlayerDialogSectionTitle('Subtitulos'),
+                              const SizedBox(height: 8),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _PlayerDialogRadioButton(
+                                    label: 'Desactivados',
+                                    active: !_subtitlesEnabled,
+                                    onPressed: () {
+                                      setState(() {
+                                        _subtitlesEnabled = false;
+                                        _status = 'Subtitulos desactivados';
+                                      });
+                                      unawaited(
+                                        _applyRemoteSubtitleTrackIfReady(),
+                                      );
+                                      setDialogState(() {});
+                                    },
+                                  ),
+                                  _PlayerDialogRadioButton(
+                                    label: _subtitlesEnabled
+                                        ? 'Activados'
+                                        : 'Activar',
+                                    active: _subtitlesEnabled,
+                                    onPressed: () {
+                                      Navigator.of(dialogContext).pop();
+                                      Future<void>.delayed(
+                                        const Duration(milliseconds: 120),
+                                        _showSubtitleTrackDialog,
+                                      );
+                                    },
+                                  ),
+                                ],
+                              ),
+                            ],
+                          )
+                        else
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
                               _PlayerDialogButton(
-                                label: provider.label,
-                                active: selectedProvider == provider,
+                                label: 'Automatico',
+                                active: selectedProvider == null,
                                 onPressed: () => unawaited(
                                   savePreference(
                                     () => widget.controller
                                         .setPlaybackProviderForEpisode(
                                       widget.episode,
-                                      provider,
+                                      null,
                                     ),
                                   ),
                                 ),
                               ),
-                              if (activeProvider == provider) ...[
-                                const SizedBox(height: 8),
-                                Padding(
-                                  padding: const EdgeInsets.only(left: 10),
-                                  child: sourceOptions(provider),
-                                ),
-                              ],
                               const SizedBox(height: 8),
+                              for (final provider in providers) ...[
+                                _PlayerDialogButton(
+                                  label: provider.label,
+                                  active: selectedProvider == provider,
+                                  onPressed: () => unawaited(
+                                    savePreference(
+                                      () => widget.controller
+                                          .setPlaybackProviderForEpisode(
+                                        widget.episode,
+                                        provider,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                if (activeProvider == provider) ...[
+                                  const SizedBox(height: 8),
+                                  Padding(
+                                    padding: const EdgeInsets.only(left: 10),
+                                    child: sourceOptions(provider),
+                                  ),
+                                ],
+                                const SizedBox(height: 8),
+                              ],
                             ],
-                          ],
-                        ),
-                    ],
+                          ),
+                      ],
+                    ),
                   ),
                 ),
-              ),
-            );
-          },
-        );
-      },
-    );
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      _playerDialogOpen = false;
+      _suppressPlayerDialogReopen();
+    }
   }
 
   List<JkAnimeServerPreference> _availableJkAnimeServers() {
@@ -5271,11 +5393,20 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (series == null) {
       return null;
     }
-    final index = widget.episode.episodeIndex + offset;
-    if (index < 0 || index >= series.episodes.length) {
+    final episodes = [...series.episodes]..sort(
+        (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
+      );
+    final currentIndex = episodes.indexWhere(
+      (entry) => _isSameEpisode(entry, widget.episode),
+    );
+    if (currentIndex < 0) {
       return null;
     }
-    return series.episodes[index];
+    final index = currentIndex + offset;
+    if (index < 0 || index >= episodes.length) {
+      return null;
+    }
+    return episodes[index];
   }
 
   bool _looksLikeDirectVideo(String value) {
@@ -5877,19 +6008,17 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
       child: Focus(
         onFocusChange: widget.onFocusChanged,
         child: SizedBox(
-          height: 48,
+          height: 56,
           child: Row(
             children: [
               FocusTraversalOrder(
                 order: const NumericFocusOrder(1),
-                child: IconButton(
+                child: _PlayerIconButton(
+                  icon: widget.isPlaying ? Icons.pause : Icons.play_arrow,
                   focusNode: widget.playButtonFocusNode,
                   tooltip: widget.isPlaying ? 'Pausar' : 'Reproducir',
                   onPressed: () => unawaited(widget.onTogglePlayback()),
-                  icon: Icon(
-                    widget.isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: Colors.white,
-                  ),
+                  onFocusChanged: widget.onFocusChanged,
                 ),
               ),
               SizedBox(
@@ -5908,20 +6037,29 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
               Expanded(
                 child: FocusTraversalOrder(
                   order: const NumericFocusOrder(2),
-                  child: Focus(
+                  child: _PlayerProgressFocusFrame(
                     focusNode: widget.progressFocusNode,
+                    onFocusChanged: widget.onFocusChanged,
                     onKeyEvent: (node, event) => _handleProgressKey(
                       Duration(milliseconds: currentMs.round()),
                       widget.duration,
                       node,
                       event,
                     ),
-                    child: SliderTheme(
+                    builder: (progressFocused) => SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         activeTrackColor: TanukiColors.orange,
                         inactiveTrackColor: const Color(0x668A939E),
                         thumbColor: Colors.white,
-                        overlayColor: const Color(0x33F0B760),
+                        overlayColor: progressFocused
+                            ? const Color(0x55F0B760)
+                            : const Color(0x33F0B760),
+                        thumbShape: RoundSliderThumbShape(
+                          enabledThumbRadius: progressFocused ? 14 : 6,
+                        ),
+                        overlayShape: RoundSliderOverlayShape(
+                          overlayRadius: progressFocused ? 26 : 13,
+                        ),
                         trackHeight: 2,
                       ),
                       child: Slider(
@@ -6227,19 +6365,17 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
       child: Focus(
         onFocusChange: widget.onFocusChanged,
         child: SizedBox(
-          height: 48,
+          height: 56,
           child: Row(
             children: [
               FocusTraversalOrder(
                 order: const NumericFocusOrder(1),
-                child: IconButton(
+                child: _PlayerIconButton(
+                  icon: value.isPlaying ? Icons.pause : Icons.play_arrow,
                   focusNode: widget.playButtonFocusNode,
                   tooltip: value.isPlaying ? 'Pausar' : 'Reproducir',
                   onPressed: () => unawaited(widget.onTogglePlayback()),
-                  icon: Icon(
-                    value.isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: Colors.white,
-                  ),
+                  onFocusChanged: widget.onFocusChanged,
                 ),
               ),
               SizedBox(
@@ -6258,20 +6394,29 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
               Expanded(
                 child: FocusTraversalOrder(
                   order: const NumericFocusOrder(2),
-                  child: Focus(
+                  child: _PlayerProgressFocusFrame(
                     focusNode: widget.progressFocusNode,
+                    onFocusChanged: widget.onFocusChanged,
                     onKeyEvent: (node, event) => _handleProgressKey(
                       Duration(milliseconds: currentMs.round()),
                       value.duration,
                       node,
                       event,
                     ),
-                    child: SliderTheme(
+                    builder: (progressFocused) => SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         activeTrackColor: TanukiColors.orange,
                         inactiveTrackColor: const Color(0x668A939E),
                         thumbColor: Colors.white,
-                        overlayColor: const Color(0x33F0B760),
+                        overlayColor: progressFocused
+                            ? const Color(0x55F0B760)
+                            : const Color(0x33F0B760),
+                        thumbShape: RoundSliderThumbShape(
+                          enabledThumbRadius: progressFocused ? 14 : 6,
+                        ),
+                        overlayShape: RoundSliderOverlayShape(
+                          overlayRadius: progressFocused ? 26 : 13,
+                        ),
                         trackHeight: 2,
                       ),
                       child: Slider(
@@ -6451,19 +6596,17 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
       child: Focus(
         onFocusChange: widget.onFocusChanged,
         child: SizedBox(
-          height: 48,
+          height: 56,
           child: Row(
             children: [
               FocusTraversalOrder(
                 order: const NumericFocusOrder(1),
-                child: IconButton(
+                child: _PlayerIconButton(
+                  icon: isPlaying ? Icons.pause : Icons.play_arrow,
                   focusNode: widget.playButtonFocusNode,
                   tooltip: isPlaying ? 'Pausar' : 'Reproducir',
                   onPressed: () => unawaited(widget.onTogglePlayback()),
-                  icon: Icon(
-                    isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: Colors.white,
-                  ),
+                  onFocusChanged: widget.onFocusChanged,
                 ),
               ),
               SizedBox(
@@ -6482,20 +6625,29 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
               Expanded(
                 child: FocusTraversalOrder(
                   order: const NumericFocusOrder(2),
-                  child: Focus(
+                  child: _PlayerProgressFocusFrame(
                     focusNode: widget.progressFocusNode,
+                    onFocusChanged: widget.onFocusChanged,
                     onKeyEvent: (node, event) => _handleProgressKey(
                       Duration(milliseconds: currentMs.round()),
                       duration,
                       node,
                       event,
                     ),
-                    child: SliderTheme(
+                    builder: (progressFocused) => SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         activeTrackColor: TanukiColors.orange,
                         inactiveTrackColor: const Color(0x668A939E),
                         thumbColor: Colors.white,
-                        overlayColor: const Color(0x33F0B760),
+                        overlayColor: progressFocused
+                            ? const Color(0x55F0B760)
+                            : const Color(0x33F0B760),
+                        thumbShape: RoundSliderThumbShape(
+                          enabledThumbRadius: progressFocused ? 14 : 6,
+                        ),
+                        overlayShape: RoundSliderOverlayShape(
+                          overlayRadius: progressFocused ? 26 : 13,
+                        ),
                         trackHeight: 2,
                       ),
                       child: Slider(
@@ -6662,106 +6814,20 @@ class _PlayerEpisodeListDialog extends StatelessWidget {
                   final progress = playback == null || playback.durationMs <= 0
                       ? 0.0
                       : playback.positionMs / playback.durationMs;
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 9),
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(8),
-                      onTap: () => Navigator.of(context).pop(episode),
-                      child: Container(
-                        height: 76,
-                        decoration: BoxDecoration(
-                          color: active
-                              ? const Color(0x552A170B)
-                              : const Color(0x331C2229),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
-                            color: active
-                                ? TanukiColors.orange
-                                : const Color(0x22FFFFFF),
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            ClipRRect(
-                              borderRadius: const BorderRadius.horizontal(
-                                left: Radius.circular(8),
-                              ),
-                              child: SizedBox(
-                                width: 112,
-                                height: 76,
-                                child: Image.network(
-                                  episode.imageUrl,
-                                  fit: BoxFit.cover,
-                                  cacheWidth: 320,
-                                  frameBuilder:
-                                      (context, child, frame, wasSync) {
-                                    if (wasSync || frame != null) {
-                                      return child;
-                                    }
-                                    return AnimatedOpacity(
-                                      opacity: frame == null ? 0 : 1,
-                                      duration:
-                                          const Duration(milliseconds: 220),
-                                      child: child,
-                                    );
-                                  },
-                                  errorBuilder: (_, __, ___) => Container(
-                                    color: TanukiColors.backgroundAlt,
-                                    alignment: Alignment.center,
-                                    child: Text(
-                                      '${episode.episodeNumber}',
-                                      style: const TextStyle(
-                                        color: TanukiColors.muted,
-                                        fontWeight: FontWeight.w900,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              child: Padding(
-                                padding:
-                                    const EdgeInsets.symmetric(horizontal: 10),
-                                child: Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      '${episode.episodeNumber}. ${episode.displayName}',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: TanukiColors.text,
-                                        fontWeight: FontWeight.w900,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 5),
-                                    LinearProgressIndicator(
-                                      minHeight: 3,
-                                      value: progress.clamp(0, 1),
-                                      backgroundColor: const Color(0x334A5663),
-                                      valueColor:
-                                          const AlwaysStoppedAnimation<Color>(
-                                        TanukiColors.orange,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                            if (active)
-                              const Padding(
-                                padding: EdgeInsets.only(right: 10),
-                                child: Icon(
-                                  Icons.play_arrow,
-                                  color: TanukiColors.orange,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ),
+                  final futureEpisode =
+                      _episodeAirsInFuture(episode.airDateIso);
+                  final enabled =
+                      !futureEpisode && _dialogEpisodeHasPlaybackRoute(episode);
+                  return _PlayerEpisodeListCard(
+                    episode: episode,
+                    active: active,
+                    enabled: enabled,
+                    progress: progress,
+                    scheduleLabel:
+                        futureEpisode ? _episodeScheduleLabel(episode) : '',
+                    onTap: enabled
+                        ? () => Navigator.of(context).pop(episode)
+                        : null,
                   );
                 },
               ),
@@ -6769,6 +6835,322 @@ class _PlayerEpisodeListDialog extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _PlayerEpisodeListCard extends StatelessWidget {
+  const _PlayerEpisodeListCard({
+    required this.episode,
+    required this.active,
+    required this.enabled,
+    required this.progress,
+    required this.scheduleLabel,
+    required this.onTap,
+  });
+
+  final EpisodeItem episode;
+  final bool active;
+  final bool enabled;
+  final double progress;
+  final String scheduleLabel;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final episodeTitle = episode.displayName.trim();
+    final title = episodeTitle.isEmpty
+        ? 'Episodio ${episode.episodeNumber}'
+        : '${episode.episodeNumber}. $episodeTitle';
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Opacity(
+          opacity: enabled ? 1 : 0.48,
+          child: Container(
+            height: 108,
+            decoration: BoxDecoration(
+              color: active ? const Color(0x552A170B) : const Color(0x331C2229),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: active ? TanukiColors.orange : const Color(0x22FFFFFF),
+              ),
+            ),
+            child: Row(
+              children: [
+                ClipRRect(
+                  borderRadius: const BorderRadius.horizontal(
+                    left: Radius.circular(8),
+                  ),
+                  child: SizedBox(
+                    width: 192,
+                    height: 108,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        if (episode.imageUrl.isNotEmpty)
+                          Image.network(
+                            episode.imageUrl,
+                            fit: BoxFit.cover,
+                            cacheWidth: 520,
+                            frameBuilder: (context, child, frame, wasSync) {
+                              if (wasSync || frame != null) {
+                                return child;
+                              }
+                              return AnimatedOpacity(
+                                opacity: frame == null ? 0 : 1,
+                                duration: const Duration(milliseconds: 220),
+                                child: child,
+                              );
+                            },
+                            errorBuilder: (_, __, ___) =>
+                                _PlayerEpisodeImageFallback(
+                              episodeNumber: episode.episodeNumber,
+                            ),
+                          )
+                        else
+                          _PlayerEpisodeImageFallback(
+                            episodeNumber: episode.episodeNumber,
+                          ),
+                        if (active)
+                          const Positioned(
+                            left: 8,
+                            top: 8,
+                            child: Icon(
+                              Icons.play_circle_fill,
+                              color: TanukiColors.orange,
+                              size: 24,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                'Episodio ${episode.episodeNumber}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: TanukiColors.orange,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ),
+                            if (scheduleLabel.isNotEmpty) ...[
+                              const SizedBox(width: 6),
+                              _PlayerEpisodeScheduleChip(text: scheduleLabel),
+                            ],
+                          ],
+                        ),
+                        const SizedBox(height: 5),
+                        SizedBox(
+                          height: 34,
+                          child: _AutoScrollingSingleLineText(
+                            text: title,
+                            style: const TextStyle(
+                              color: TanukiColors.text,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ),
+                        const Spacer(),
+                        LinearProgressIndicator(
+                          minHeight: 3,
+                          value: progress.clamp(0, 1),
+                          backgroundColor: const Color(0x334A5663),
+                          valueColor: const AlwaysStoppedAnimation<Color>(
+                            TanukiColors.orange,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlayerEpisodeScheduleChip extends StatelessWidget {
+  const _PlayerEpisodeScheduleChip({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0x332A170B),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: const Color(0x88F28C28)),
+      ),
+      child: Text(
+        text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: TanukiColors.orange,
+          fontSize: 9,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
+    );
+  }
+}
+
+class _PlayerEpisodeImageFallback extends StatelessWidget {
+  const _PlayerEpisodeImageFallback({required this.episodeNumber});
+
+  final int episodeNumber;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: TanukiColors.backgroundAlt,
+      alignment: Alignment.center,
+      child: Text(
+        '$episodeNumber',
+        style: const TextStyle(
+          color: TanukiColors.muted,
+          fontSize: 24,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
+    );
+  }
+}
+
+class _AutoScrollingSingleLineText extends StatefulWidget {
+  const _AutoScrollingSingleLineText({
+    required this.text,
+    required this.style,
+  });
+
+  final String text;
+  final TextStyle style;
+
+  @override
+  State<_AutoScrollingSingleLineText> createState() =>
+      _AutoScrollingSingleLineTextState();
+}
+
+class _AutoScrollingSingleLineTextState
+    extends State<_AutoScrollingSingleLineText> {
+  final ScrollController _controller = ScrollController();
+  int _scrollRun = 0;
+  double _lastWidth = -1;
+
+  @override
+  void didUpdateWidget(covariant _AutoScrollingSingleLineText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text || oldWidget.style != widget.style) {
+      _scrollRun += 1;
+      _lastWidth = -1;
+      if (_controller.hasClients) {
+        _controller.jumpTo(0);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _scrollRun += 1;
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _maybeStartAutoScroll(double maxWidth) {
+    if ((_lastWidth - maxWidth).abs() < 1) {
+      return;
+    }
+    _lastWidth = maxWidth;
+    final textDirection = Directionality.of(context);
+    final painter = TextPainter(
+      text: TextSpan(text: widget.text, style: widget.style),
+      maxLines: 1,
+      textDirection: textDirection,
+    )..layout();
+    final overflow = painter.width - maxWidth;
+    _scrollRun += 1;
+    final run = _scrollRun;
+    if (overflow <= 2) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _controller.hasClients) {
+          _controller.jumpTo(0);
+        }
+      });
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _runAutoScroll(run);
+    });
+  }
+
+  Future<void> _runAutoScroll(int run) async {
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    while (mounted && run == _scrollRun && _controller.hasClients) {
+      final maxExtent = _controller.position.maxScrollExtent;
+      if (maxExtent <= 1) {
+        return;
+      }
+      final durationMs = (maxExtent * 42).clamp(1800, 7000).round();
+      await _controller.animateTo(
+        maxExtent,
+        duration: Duration(milliseconds: durationMs),
+        curve: Curves.linear,
+      );
+      if (!mounted || run != _scrollRun || !_controller.hasClients) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      if (!mounted || run != _scrollRun || !_controller.hasClients) {
+        return;
+      }
+      _controller.jumpTo(0);
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _maybeStartAutoScroll(constraints.maxWidth);
+        return ClipRect(
+          child: SingleChildScrollView(
+            controller: _controller,
+            scrollDirection: Axis.horizontal,
+            physics: const NeverScrollableScrollPhysics(),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                widget.text,
+                maxLines: 1,
+                softWrap: false,
+                style: widget.style,
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -7145,7 +7527,77 @@ class _PlayerSourceStatus {
   final String label;
 }
 
-class _PlayerIconButton extends StatelessWidget {
+class _PlayerProgressFocusFrame extends StatefulWidget {
+  const _PlayerProgressFocusFrame({
+    required this.focusNode,
+    required this.onFocusChanged,
+    required this.onKeyEvent,
+    required this.builder,
+  });
+
+  final FocusNode? focusNode;
+  final ValueChanged<bool> onFocusChanged;
+  final FocusOnKeyEventCallback onKeyEvent;
+  final Widget Function(bool focused) builder;
+
+  @override
+  State<_PlayerProgressFocusFrame> createState() =>
+      _PlayerProgressFocusFrameState();
+}
+
+class _PlayerProgressFocusFrameState extends State<_PlayerProgressFocusFrame> {
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.focusNode?.addListener(_handleFocusNodeChanged);
+    _focused = widget.focusNode?.hasFocus ?? false;
+  }
+
+  @override
+  void didUpdateWidget(_PlayerProgressFocusFrame oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.focusNode != widget.focusNode) {
+      oldWidget.focusNode?.removeListener(_handleFocusNodeChanged);
+      widget.focusNode?.addListener(_handleFocusNodeChanged);
+      _focused = widget.focusNode?.hasFocus ?? false;
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.focusNode?.removeListener(_handleFocusNodeChanged);
+    super.dispose();
+  }
+
+  void _handleFocusNodeChanged() {
+    final focused = widget.focusNode?.hasFocus ?? false;
+    if (_focused == focused) {
+      return;
+    }
+    setState(() => _focused = focused);
+    widget.onFocusChanged(focused);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      focusNode: widget.focusNode,
+      onFocusChange: (focused) {
+        if (widget.focusNode != null || _focused == focused) {
+          return;
+        }
+        setState(() => _focused = focused);
+        widget.onFocusChanged(focused);
+      },
+      onKeyEvent: widget.onKeyEvent,
+      child: widget.builder(_focused),
+    );
+  }
+}
+
+class _PlayerIconButton extends StatefulWidget {
   const _PlayerIconButton({
     required this.icon,
     required this.tooltip,
@@ -7161,27 +7613,101 @@ class _PlayerIconButton extends StatelessWidget {
   final FocusNode? focusNode;
 
   @override
+  State<_PlayerIconButton> createState() => _PlayerIconButtonState();
+}
+
+class _PlayerIconButtonState extends State<_PlayerIconButton> {
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.focusNode?.addListener(_handleFocusNodeChanged);
+    _focused = widget.focusNode?.hasFocus ?? false;
+  }
+
+  @override
+  void didUpdateWidget(_PlayerIconButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.focusNode != widget.focusNode) {
+      oldWidget.focusNode?.removeListener(_handleFocusNodeChanged);
+      widget.focusNode?.addListener(_handleFocusNodeChanged);
+      _focused = widget.focusNode?.hasFocus ?? false;
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.focusNode?.removeListener(_handleFocusNodeChanged);
+    super.dispose();
+  }
+
+  void _handleFocusNodeChanged() {
+    final focused = widget.focusNode?.hasFocus ?? false;
+    if (_focused == focused) {
+      return;
+    }
+    setState(() => _focused = focused);
+    widget.onFocusChanged(focused);
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: tooltip,
+      message: widget.tooltip,
       child: Focus(
-        onFocusChange: onFocusChanged,
-        child: IconButton(
-          focusNode: focusNode,
-          onPressed: onPressed,
-          icon: Icon(icon),
-          style: ButtonStyle(
-            fixedSize: WidgetStateProperty.all(const Size(44, 44)),
-            backgroundColor: WidgetStateProperty.resolveWith((states) {
-              if (states.contains(WidgetState.focused)) {
-                return const Color(0x3324384C);
-              }
-              return Colors.transparent;
-            }),
-            foregroundColor: WidgetStateProperty.all(Colors.white),
-            side: WidgetStateProperty.all(BorderSide.none),
-            shape: WidgetStateProperty.all(
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        onFocusChange: (focused) {
+          if (widget.focusNode != null || _focused == focused) {
+            return;
+          }
+          setState(() => _focused = focused);
+          widget.onFocusChanged(focused);
+        },
+        child: SizedBox(
+          width: 50,
+          height: 50,
+          child: Center(
+            child: AnimatedScale(
+              scale: _focused ? 1.14 : 1,
+              duration: const Duration(milliseconds: 130),
+              curve: Curves.easeOutCubic,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 130),
+                curve: Curves.easeOutCubic,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  boxShadow: _focused
+                      ? const [
+                          BoxShadow(
+                            color: Color(0x5524384C),
+                            blurRadius: 14,
+                            spreadRadius: 1,
+                          ),
+                        ]
+                      : const [],
+                ),
+                child: IconButton(
+                  focusNode: widget.focusNode,
+                  onPressed: widget.onPressed,
+                  icon: Icon(widget.icon),
+                  style: ButtonStyle(
+                    fixedSize: WidgetStateProperty.all(const Size(44, 44)),
+                    backgroundColor: WidgetStateProperty.resolveWith((states) {
+                      if (_focused || states.contains(WidgetState.focused)) {
+                        return const Color(0x4424384C);
+                      }
+                      return Colors.transparent;
+                    }),
+                    foregroundColor: WidgetStateProperty.all(Colors.white),
+                    side: WidgetStateProperty.all(BorderSide.none),
+                    shape: WidgetStateProperty.all(
+                      RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
             ),
           ),
         ),
@@ -7788,18 +8314,85 @@ String _seriesKeyFor(EpisodeItem episode) {
 }
 
 bool _episodeAirsInFuture(String airDateIso) {
+  final airDate = _parseEpisodeAirDate(airDateIso);
+  if (airDate == null) {
+    return false;
+  }
+  return airDate.isAfter(_todayDate());
+}
+
+bool _dialogEpisodeHasPlaybackRoute(EpisodeItem episode) {
+  if (episode.filePath.trim().isNotEmpty) {
+    return true;
+  }
+  if (!episode.isRemote) {
+    return false;
+  }
+  return episode.watchUrl.trim().isNotEmpty ||
+      episode.slug.trim().isNotEmpty ||
+      episode.provider != null;
+}
+
+String _episodeScheduleLabel(EpisodeItem episode) {
+  final airDate = _parseEpisodeAirDate(episode.airDateIso);
+  if (airDate == null) {
+    return '';
+  }
+  final today = _todayDate();
+  final daysUntil = airDate.difference(today).inDays;
+  final label = switch (daysUntil) {
+    0 => 'Hoy',
+    1 => 'Manana',
+    >= 2 && <= 7 => _weekdayLabel(airDate.weekday),
+    _ => '${airDate.day} ${_monthLabel(airDate.month)}',
+  };
+  return 'Estreno $label';
+}
+
+DateTime? _parseEpisodeAirDate(String airDateIso) {
   final normalized = airDateIso.trim();
   if (normalized.isEmpty) {
-    return false;
+    return null;
   }
   final source =
       normalized.length >= 10 ? normalized.substring(0, 10) : normalized;
   final parsed = DateTime.tryParse(source);
   if (parsed == null) {
-    return false;
+    return null;
   }
-  final airDate = DateTime(parsed.year, parsed.month, parsed.day);
+  return DateTime(parsed.year, parsed.month, parsed.day);
+}
+
+DateTime _todayDate() {
   final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  return airDate.isAfter(today);
+  return DateTime(now.year, now.month, now.day);
+}
+
+String _weekdayLabel(int weekday) {
+  return switch (weekday) {
+    DateTime.monday => 'Lunes',
+    DateTime.tuesday => 'Martes',
+    DateTime.wednesday => 'Miercoles',
+    DateTime.thursday => 'Jueves',
+    DateTime.friday => 'Viernes',
+    DateTime.saturday => 'Sabado',
+    _ => 'Domingo',
+  };
+}
+
+String _monthLabel(int month) {
+  return switch (month) {
+    DateTime.january => 'Ene',
+    DateTime.february => 'Feb',
+    DateTime.march => 'Mar',
+    DateTime.april => 'Abr',
+    DateTime.may => 'May',
+    DateTime.june => 'Jun',
+    DateTime.july => 'Jul',
+    DateTime.august => 'Ago',
+    DateTime.september => 'Sep',
+    DateTime.october => 'Oct',
+    DateTime.november => 'Nov',
+    _ => 'Dic',
+  };
 }

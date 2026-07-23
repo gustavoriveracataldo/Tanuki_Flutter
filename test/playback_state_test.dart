@@ -33,12 +33,14 @@ void main() {
     const state = AppState(
       overscanHorizontal: 32,
       overscanTop: 20,
+      overscanBottom: 28,
     );
 
     final restored = AppState.fromJson(state.toJson());
 
     expect(restored.overscanHorizontal, 32);
     expect(restored.overscanTop, 20);
+    expect(restored.overscanBottom, 28);
   });
 
   test('serializes AniSkip segment settings disabled by default', () {

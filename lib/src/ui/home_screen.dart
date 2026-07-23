@@ -41,12 +41,15 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _sideAnimeFocusNode = FocusNode(debugLabel: 'sideAnime');
+  final FocusNode _searchFieldFocusNode = FocusNode(debugLabel: 'searchField');
   final FocusNode _homeContentFocusNode = FocusNode(
     debugLabel: 'homeFirstContent',
   );
   final FocusNode _detailContentFocusNode = FocusNode(
     debugLabel: 'detailEpisodeContent',
   );
+  final _DetailActionFocusNodes _detailActionFocusNodes =
+      _DetailActionFocusNodes();
   _Section _section = _Section.anime;
   SeriesItem? _selectedSeries;
   _Section? _detailReturnSection;
@@ -77,6 +80,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String _detailSimilarStatus = '';
   bool _profilePickerVisible = false;
   bool _handlingTrailerDetailRequest = false;
+  bool _playerRouteActive = false;
+  DateTime _lastPlayerReturnAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _suppressEpisodeLaunchUntil = DateTime.fromMillisecondsSinceEpoch(0);
   final Set<String> _continueWatchingVisualHydrationKeys = {};
   final Map<String, DateTime> _continueWatchingVisualHydrationAttempts = {};
 
@@ -99,8 +105,10 @@ class _HomeScreenState extends State<HomeScreen> {
     widget.controller.removeListener(_handlePendingTrailerDetailRequest);
     _searchController.dispose();
     _sideAnimeFocusNode.dispose();
+    _searchFieldFocusNode.dispose();
     _homeContentFocusNode.dispose();
     _detailContentFocusNode.dispose();
+    _detailActionFocusNodes.dispose();
     super.dispose();
   }
 
@@ -130,6 +138,7 @@ class _HomeScreenState extends State<HomeScreen> {
             final overscanHorizontal =
                 widget.controller.state.overscanHorizontal;
             final overscanTop = widget.controller.state.overscanTop;
+            final overscanBottom = widget.controller.state.overscanBottom;
             return Scaffold(
               backgroundColor: Colors.black,
               body: Padding(
@@ -137,6 +146,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   left: overscanHorizontal,
                   right: overscanHorizontal,
                   top: overscanTop,
+                  bottom: overscanBottom,
                 ),
                 child: LayoutBuilder(
                   builder: (context, constraints) {
@@ -144,6 +154,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         constraints.maxHeight > constraints.maxWidth;
                     return _HomeFocusTargets(
                       sideAnimeFocusNode: _sideAnimeFocusNode,
+                      searchFieldFocusNode: _searchFieldFocusNode,
                       child: Stack(
                         children: [
                           Positioned.fill(
@@ -186,9 +197,10 @@ class _HomeScreenState extends State<HomeScreen> {
                                 activeSection: _section,
                                 profile: widget.controller.state.profile,
                                 animeFocusNode: _sideAnimeFocusNode,
+                                searchFocusNode: _searchFieldFocusNode,
                                 homeContentFocusNode: _selectedSeries == null
                                     ? _homeContentFocusNode
-                                    : _detailContentFocusNode,
+                                    : _detailActionFocusNodes.favorite,
                                 onSectionSelected: _selectSection,
                                 onProfilePressed: _showProfilePicker,
                               ),
@@ -245,6 +257,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _detailImporting = false;
         _section =
             returnSection == _Section.search ? _Section.search : _Section.anime;
+        if (_section == _Section.anime) {
+          _resetAnimePanelOpacity();
+        }
       });
       return;
     }
@@ -254,6 +269,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _detailReturnSection = null;
       _detailImporting = false;
       _section = _Section.anime;
+      _resetAnimePanelOpacity();
     });
   }
 
@@ -262,6 +278,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _section = _Section.random;
         _selectedSeries = null;
+        _resetAnimePanelOpacity();
         _randomLoading = true;
       });
       unawaited(_openRandomSeries());
@@ -269,6 +286,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     setState(() {
       _section = section;
+      _resetAnimePanelOpacity();
       if (section == _Section.anime) {
         _selectedSeries = null;
       }
@@ -323,6 +341,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onPlayContinueWatchingQueue: _playContinueWatchingRoundRobin,
       homeContentFocusNode: _homeContentFocusNode,
       detailContentFocusNode: _detailContentFocusNode,
+      detailActionFocusNodes: _detailActionFocusNodes,
       onOpenSeriesTrailer: _openSeriesTrailer,
       onPlayTrendingTrailers: _playTrendingTrailerQueue,
       onLoadMoreAiring: _loadMoreHomeAiring,
@@ -330,6 +349,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onStopWatchingSeries: widget.controller.stopWatchingSeries,
       onAbandonSeries: (series) =>
           unawaited(widget.controller.setSpaceStatus(series, 'abandoned')),
+      onContinueWatchingGoToSeries: _openContinueWatchingSeriesDetail,
       onSeriesSelected: _selectSeries,
       onPreviewSeries: _previewSeries,
       onPreviewRemoteCandidate: _previewRemoteCandidate,
@@ -347,6 +367,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _Section.search => _SearchPanel(
           controller: controller,
           searchController: _searchController,
+          searchFieldFocusNode: _searchFieldFocusNode,
           onRemoteCandidateSelected: (candidate) {
             _openRemoteCandidate(candidate);
           },
@@ -385,6 +406,7 @@ class _HomeScreenState extends State<HomeScreen> {
           origin == _Section.anime || origin == _Section.random ? null : origin;
       _heroPreviewSeries = series;
       _section = _Section.anime;
+      _resetAnimePanelOpacity();
       _detailImporting = importing;
       if (!loadSimilar) {
         _detailSimilarResults = const [];
@@ -398,6 +420,13 @@ class _HomeScreenState extends State<HomeScreen> {
     if (loadSimilar) {
       unawaited(_loadDetailSimilar(series));
     }
+  }
+
+  void _openContinueWatchingSeriesDetail(SeriesItem series) {
+    _suppressEpisodeLaunchUntil =
+        DateTime.now().add(const Duration(milliseconds: 850));
+    FocusManager.instance.primaryFocus?.unfocus();
+    _selectSeries(series);
   }
 
   void _previewSeries(SeriesItem series) {
@@ -484,6 +513,10 @@ class _HomeScreenState extends State<HomeScreen> {
         _animePanelScrollOffset = steppedOffset;
       });
     }
+  }
+
+  void _resetAnimePanelOpacity() {
+    _animePanelScrollOffset = 0;
   }
 
   Future<void> _refreshSelectedSeriesVisuals(SeriesItem series) async {
@@ -586,6 +619,9 @@ class _HomeScreenState extends State<HomeScreen> {
       if (returnSection != null) {
         _section = returnSection;
       }
+      if (_section == _Section.anime) {
+        _resetAnimePanelOpacity();
+      }
     });
   }
 
@@ -615,6 +651,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _selectedSeries = null;
       _section = _Section.anime;
+      _resetAnimePanelOpacity();
       _profilePickerVisible = false;
     });
   }
@@ -627,6 +664,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _selectedSeries = null;
       _section = _Section.anime;
+      _resetAnimePanelOpacity();
     });
   }
 
@@ -664,6 +702,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _selectedSeries = null;
       _section = _Section.anime;
+      _resetAnimePanelOpacity();
     });
   }
 
@@ -1032,6 +1071,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _randomLoading = false;
           _section = _Section.anime;
+          _resetAnimePanelOpacity();
         });
       }
       return;
@@ -1075,6 +1115,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _playEpisode(EpisodeItem episode) async {
+    if (DateTime.now().isBefore(_suppressEpisodeLaunchUntil)) {
+      return;
+    }
     final series = widget.controller.findSeriesForEpisode(episode);
     final launchMode = _selectedSeries != null &&
             series?.stableKey == _selectedSeries!.stableKey
@@ -1087,19 +1130,37 @@ class _HomeScreenState extends State<HomeScreen> {
                         .contains(series.stableKey)
                 ? PlayerLaunchMode.continueWatching
                 : PlayerLaunchMode.normal;
-    await widget.controller.setCurrentEntry(episode);
-    if (!mounted) {
+    await _openPlayerRoute(episode: episode, launchMode: launchMode);
+  }
+
+  Future<void> _openPlayerRoute({
+    required EpisodeItem episode,
+    required PlayerLaunchMode launchMode,
+  }) async {
+    if (_playerRouteActive ||
+        DateTime.now().difference(_lastPlayerReturnAt) <
+            const Duration(milliseconds: 650)) {
       return;
     }
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => PlayerScreen(
-          controller: widget.controller,
-          episode: episode,
-          launchMode: launchMode,
+    _playerRouteActive = true;
+    try {
+      await widget.controller.setCurrentEntry(episode);
+      if (!mounted) {
+        return;
+      }
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => PlayerScreen(
+            controller: widget.controller,
+            episode: episode,
+            launchMode: launchMode,
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      _playerRouteActive = false;
+      _lastPlayerReturnAt = DateTime.now();
+    }
   }
 
   Future<void> _playContinueWatchingRoundRobin() async {
@@ -1117,18 +1178,9 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final selected = entry;
-    await widget.controller.setCurrentEntry(selected.episode);
-    if (!mounted) {
-      return;
-    }
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => PlayerScreen(
-          controller: widget.controller,
-          episode: selected.episode,
-          launchMode: PlayerLaunchMode.continueWatchingRoundRobin,
-        ),
-      ),
+    await _openPlayerRoute(
+      episode: selected.episode,
+      launchMode: PlayerLaunchMode.continueWatchingRoundRobin,
     );
   }
 
@@ -1232,6 +1284,7 @@ class _SideRail extends StatefulWidget {
     required this.activeSection,
     required this.profile,
     required this.animeFocusNode,
+    required this.searchFocusNode,
     required this.homeContentFocusNode,
     required this.onSectionSelected,
     required this.onProfilePressed,
@@ -1240,6 +1293,7 @@ class _SideRail extends StatefulWidget {
   final _Section activeSection;
   final UserProfileState profile;
   final FocusNode animeFocusNode;
+  final FocusNode searchFocusNode;
   final FocusNode homeContentFocusNode;
   final ValueChanged<_Section> onSectionSelected;
   final VoidCallback onProfilePressed;
@@ -1291,6 +1345,13 @@ class _SideRailState extends State<_SideRail> {
   }
 
   KeyEventResult _focusHomeContent() {
+    if (widget.activeSection == _Section.search) {
+      if (widget.searchFocusNode.canRequestFocus) {
+        widget.searchFocusNode.requestFocus();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
     if (widget.activeSection != _Section.anime) {
       return KeyEventResult.ignored;
     }
@@ -1755,10 +1816,12 @@ enum _ProfileOverlayMode {
 class _HomeFocusTargets extends InheritedWidget {
   const _HomeFocusTargets({
     required this.sideAnimeFocusNode,
+    required this.searchFieldFocusNode,
     required super.child,
   });
 
   final FocusNode sideAnimeFocusNode;
+  final FocusNode searchFieldFocusNode;
 
   static _HomeFocusTargets? maybeOf(BuildContext context) {
     return context.dependOnInheritedWidgetOfExactType<_HomeFocusTargets>();
@@ -1766,7 +1829,8 @@ class _HomeFocusTargets extends InheritedWidget {
 
   @override
   bool updateShouldNotify(_HomeFocusTargets oldWidget) {
-    return sideAnimeFocusNode != oldWidget.sideAnimeFocusNode;
+    return sideAnimeFocusNode != oldWidget.sideAnimeFocusNode ||
+        searchFieldFocusNode != oldWidget.searchFieldFocusNode;
   }
 }
 
@@ -2101,36 +2165,45 @@ class _ProfilePickerOverlayState extends State<_ProfilePickerOverlay> {
 
   Widget _buildAvatarGrid({required bool compact}) {
     final profile = _selectedProfile;
+    final tileHeight = compact ? 118.0 : 140.0;
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: compact ? 520 : 760),
-      child: Wrap(
-        alignment: WrapAlignment.center,
-        spacing: compact ? 20 : 28,
-        runSpacing: compact ? 18 : 26,
-        children: [
-          for (var index = 0; index < _profileAvatarPresets.length; index++)
-            _AvatarPresetButton(
-              preset: _profileAvatarPresets[index],
-              label: 'Avatar ${index + 1}',
-              initial: _profileInitial(profile),
-              selected:
-                  profile.avatarPresetId == _profileAvatarPresets[index].id,
-              compact: compact,
-              autofocus: profile.avatarPresetId.trim().isEmpty
-                  ? index == 0
-                  : profile.avatarPresetId == _profileAvatarPresets[index].id,
-              onTap: () async {
-                await widget.onChangeProfileAvatar(
-                  profile.id,
-                  _profileAvatarPresets[index].id,
-                );
-                if (!mounted) {
-                  return;
-                }
-                _setMode(_ProfileOverlayMode.actions);
-              },
-            ),
-        ],
+      constraints: BoxConstraints(
+        maxWidth: compact ? 500 : 620,
+        maxHeight: tileHeight * 3 + (compact ? 36 : 52),
+      ),
+      child: GridView.builder(
+        shrinkWrap: true,
+        clipBehavior: Clip.none,
+        padding: EdgeInsets.zero,
+        itemCount: _profileAvatarPresets.length,
+        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 4,
+          mainAxisExtent: tileHeight,
+          crossAxisSpacing: compact ? 14 : 22,
+          mainAxisSpacing: compact ? 18 : 26,
+        ),
+        itemBuilder: (context, index) {
+          return _AvatarPresetButton(
+            preset: _profileAvatarPresets[index],
+            label: 'Avatar ${index + 1}',
+            initial: _profileInitial(profile),
+            selected: profile.avatarPresetId == _profileAvatarPresets[index].id,
+            compact: compact,
+            autofocus: profile.avatarPresetId.trim().isEmpty
+                ? index == 0
+                : profile.avatarPresetId == _profileAvatarPresets[index].id,
+            onTap: () async {
+              await widget.onChangeProfileAvatar(
+                profile.id,
+                _profileAvatarPresets[index].id,
+              );
+              if (!mounted) {
+                return;
+              }
+              _setMode(_ProfileOverlayMode.actions);
+            },
+          );
+        },
       ),
     );
   }
@@ -3408,12 +3481,14 @@ class _AnimePanel extends StatelessWidget {
     required this.onPlayContinueWatchingQueue,
     required this.homeContentFocusNode,
     required this.detailContentFocusNode,
+    required this.detailActionFocusNodes,
     required this.onOpenSeriesTrailer,
     required this.onPlayTrendingTrailers,
     required this.onLoadMoreAiring,
     required this.onLoadMoreMovies,
     required this.onStopWatchingSeries,
     required this.onAbandonSeries,
+    required this.onContinueWatchingGoToSeries,
     required this.onSeriesSelected,
     required this.onPreviewSeries,
     required this.onPreviewRemoteCandidate,
@@ -3443,12 +3518,14 @@ class _AnimePanel extends StatelessWidget {
   final VoidCallback onPlayContinueWatchingQueue;
   final FocusNode homeContentFocusNode;
   final FocusNode detailContentFocusNode;
+  final _DetailActionFocusNodes detailActionFocusNodes;
   final ValueChanged<SeriesItem> onOpenSeriesTrailer;
   final VoidCallback onPlayTrendingTrailers;
   final VoidCallback onLoadMoreAiring;
   final VoidCallback onLoadMoreMovies;
   final ValueChanged<SeriesItem> onStopWatchingSeries;
   final ValueChanged<SeriesItem> onAbandonSeries;
+  final ValueChanged<SeriesItem> onContinueWatchingGoToSeries;
   final ValueChanged<SeriesItem> onSeriesSelected;
   final ValueChanged<SeriesItem> onPreviewSeries;
   final ValueChanged<RemoteSearchCandidate> onPreviewRemoteCandidate;
@@ -3512,7 +3589,7 @@ class _AnimePanel extends StatelessWidget {
           onPlayQueue: onPlayContinueWatchingQueue,
           onStopWatchingSeries: onStopWatchingSeries,
           onAbandonSeries: onAbandonSeries,
-          onGoToSeries: onSeriesSelected,
+          onGoToSeries: onContinueWatchingGoToSeries,
           onEntryFocused: onPreviewSeries,
         ),
       ));
@@ -3593,6 +3670,7 @@ class _AnimePanel extends StatelessWidget {
           similarLoading: detailSimilarLoading,
           detailsLoading: detailImporting,
           detailContentFocusNode: detailContentFocusNode,
+          detailActionFocusNodes: detailActionFocusNodes,
           onBack: onSeriesCleared,
           onRemoteCandidateSelected: onRemoteCandidateSelected,
           onPlayEpisode: onPlayEpisode,
@@ -4127,7 +4205,7 @@ class _HeroTitleFallback extends StatelessWidget {
   }
 }
 
-class _HeroIconButton extends StatelessWidget {
+class _HeroIconButton extends StatefulWidget {
   const _HeroIconButton({
     required this.icon,
     required this.tooltip,
@@ -4141,25 +4219,94 @@ class _HeroIconButton extends StatelessWidget {
   final bool primary;
 
   @override
+  State<_HeroIconButton> createState() => _HeroIconButtonState();
+}
+
+class _HeroIconButtonState extends State<_HeroIconButton> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'homeHeroAction');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final buttonSide = _heroButtonSide(context);
+    final focusBoxSide = buttonSide + 14;
     return Tooltip(
-      message: tooltip,
-      child: IconButton(
-        onPressed: onPressed,
-        icon: Icon(icon),
-        iconSize: _heroIconSize(context),
-        style: IconButton.styleFrom(
-          fixedSize: Size(buttonSide, buttonSide),
-          backgroundColor: primary ? Colors.white : const Color(0x554A5E72),
-          foregroundColor: primary ? TanukiColors.background : Colors.white,
-          disabledForegroundColor: TanukiColors.subtle,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(buttonSide / 2),
+      message: widget.tooltip,
+      child: SizedBox(
+        width: focusBoxSide,
+        height: focusBoxSide,
+        child: Center(
+          child: AnimatedScale(
+            scale: _focused ? 1.16 : 1,
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOutCubic,
+            child: IconButton(
+              focusNode: _focusNode,
+              onPressed: widget.onPressed,
+              icon: Icon(widget.icon),
+              iconSize: _heroIconSize(context),
+              style: IconButton.styleFrom(
+                fixedSize: Size(buttonSide, buttonSide),
+                backgroundColor:
+                    widget.primary ? Colors.white : const Color(0x554A5E72),
+                foregroundColor:
+                    widget.primary ? TanukiColors.background : Colors.white,
+                disabledForegroundColor: TanukiColors.subtle,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(buttonSide / 2),
+                ),
+              ),
+            ),
           ),
         ),
       ),
     );
+  }
+}
+
+class _DetailActionFocusNodes {
+  final FocusNode favorite = FocusNode(debugLabel: 'detailFavoriteAction');
+  final FocusNode playlist = FocusNode(debugLabel: 'detailPlaylistAction');
+  final FocusNode space = FocusNode(debugLabel: 'detailSpaceAction');
+  final FocusNode art = FocusNode(debugLabel: 'detailArtAction');
+  final FocusNode trailer = FocusNode(debugLabel: 'detailTrailerAction');
+
+  FocusNode lastFor(SeriesItem series) {
+    if (series.trailerUrl.trim().isNotEmpty) {
+      return trailer;
+    }
+    if (series.isRemote) {
+      return art;
+    }
+    return space;
+  }
+
+  void dispose() {
+    favorite.dispose();
+    playlist.dispose();
+    space.dispose();
+    art.dispose();
+    trailer.dispose();
   }
 }
 
@@ -4173,6 +4320,7 @@ class _SeriesDetailPanel extends StatelessWidget {
     required this.similarLoading,
     required this.detailsLoading,
     required this.detailContentFocusNode,
+    required this.detailActionFocusNodes,
     required this.onBack,
     required this.onRemoteCandidateSelected,
     required this.onPlayEpisode,
@@ -4188,6 +4336,7 @@ class _SeriesDetailPanel extends StatelessWidget {
   final bool similarLoading;
   final bool detailsLoading;
   final FocusNode detailContentFocusNode;
+  final _DetailActionFocusNodes detailActionFocusNodes;
   final VoidCallback onBack;
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final ValueChanged<EpisodeItem> onPlayEpisode;
@@ -4214,6 +4363,7 @@ class _SeriesDetailPanel extends StatelessWidget {
           description: description,
           backLabel: backLabel,
           detailsLoading: detailsLoading,
+          actionFocusNodes: detailActionFocusNodes,
           onBack: onBack,
           onOpenTrailer: onOpenTrailer,
           onResetVisuals: onResetVisuals,
@@ -4223,12 +4373,14 @@ class _SeriesDetailPanel extends StatelessWidget {
           candidates: similarCandidates,
           status: similarStatus,
           loading: similarLoading,
+          episodeListFocusNode: detailContentFocusNode,
           onCandidateSelected: onRemoteCandidateSelected,
         );
         final episodes = _DetailEpisodesColumn(
           controller: controller,
           series: series,
           initialFocusNode: detailContentFocusNode,
+          actionFocusNodes: detailActionFocusNodes,
           onPlayEpisode: onPlayEpisode,
         );
         if (!wide) {
@@ -4298,6 +4450,7 @@ class _SeriesDetailInfo extends StatelessWidget {
     required this.description,
     required this.backLabel,
     required this.detailsLoading,
+    required this.actionFocusNodes,
     required this.onBack,
     required this.onOpenTrailer,
     required this.onResetVisuals,
@@ -4309,6 +4462,7 @@ class _SeriesDetailInfo extends StatelessWidget {
   final String description;
   final String backLabel;
   final bool detailsLoading;
+  final _DetailActionFocusNodes actionFocusNodes;
   final VoidCallback onBack;
   final ValueChanged<SeriesItem> onOpenTrailer;
   final ValueChanged<SeriesItem> onResetVisuals;
@@ -4368,6 +4522,7 @@ class _SeriesDetailInfo extends StatelessWidget {
                     : Icons.favorite_border,
                 tooltip: 'Favorito',
                 active: controller.isFavorite(series),
+                focusNode: actionFocusNodes.favorite,
                 onPressed: () => controller.toggleFavorite(series),
               ),
               _DetailIconButton(
@@ -4376,10 +4531,12 @@ class _SeriesDetailInfo extends StatelessWidget {
                     : Icons.playlist_add,
                 tooltip: 'Playlist',
                 active: controller.isSelected(series),
+                focusNode: actionFocusNodes.playlist,
                 onPressed: () => controller.toggleSeriesSelection(series),
               ),
               _DetailSpaceButton(
                 value: status,
+                focusNode: actionFocusNodes.space,
                 onChanged: (value) => controller.setSpaceStatus(series, value),
               ),
               if (series.isRemote)
@@ -4387,6 +4544,7 @@ class _SeriesDetailInfo extends StatelessWidget {
                   icon: Icons.manage_search,
                   tooltip: 'Reasociar arte',
                   active: detailsLoading,
+                  focusNode: actionFocusNodes.art,
                   onPressed:
                       detailsLoading ? null : () => onResetVisuals(series),
                 ),
@@ -4394,7 +4552,8 @@ class _SeriesDetailInfo extends StatelessWidget {
                 _DetailIconButton(
                   icon: Icons.movie_filter,
                   tooltip: 'Trailer',
-                  active: true,
+                  active: false,
+                  focusNode: actionFocusNodes.trailer,
                   onPressed: () => onOpenTrailer(series),
                 ),
             ],
@@ -4429,11 +4588,7 @@ class _SeriesDetailInfo extends StatelessWidget {
         children: [
           Align(
             alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: onBack,
-              icon: const Icon(Icons.arrow_back),
-              label: Text(backLabel),
-            ),
+            child: _DetailBackButton(label: backLabel, onPressed: onBack),
           ),
           const SizedBox(height: 6),
           if (detailsLoading) ...[
@@ -4519,6 +4674,68 @@ class _SeriesDetailInfo extends StatelessWidget {
             },
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _DetailBackButton extends StatefulWidget {
+  const _DetailBackButton({
+    required this.label,
+    required this.onPressed,
+  });
+
+  final String label;
+  final VoidCallback onPressed;
+
+  @override
+  State<_DetailBackButton> createState() => _DetailBackButtonState();
+}
+
+class _DetailBackButtonState extends State<_DetailBackButton> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'detailBackButton');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedScale(
+      scale: _focused ? 1.04 : 1,
+      alignment: Alignment.centerLeft,
+      duration: const Duration(milliseconds: 120),
+      curve: Curves.easeOutCubic,
+      child: TextButton.icon(
+        focusNode: _focusNode,
+        onPressed: widget.onPressed,
+        icon: const Icon(Icons.arrow_back),
+        label: Text(widget.label),
+        style: TextButton.styleFrom(
+          backgroundColor:
+              _focused ? TanukiColors.orangeHot : Colors.transparent,
+          foregroundColor: _focused ? Colors.black : TanukiColors.orange,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          textStyle: const TextStyle(fontWeight: FontWeight.w900),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
       ),
     );
   }
@@ -4614,6 +4831,7 @@ class _DetailSimilarCarousel extends StatelessWidget {
     required this.candidates,
     required this.status,
     required this.loading,
+    required this.episodeListFocusNode,
     required this.onCandidateSelected,
   });
 
@@ -4621,6 +4839,7 @@ class _DetailSimilarCarousel extends StatelessWidget {
   final List<RemoteSearchCandidate> candidates;
   final String status;
   final bool loading;
+  final FocusNode episodeListFocusNode;
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
 
   @override
@@ -4672,6 +4891,13 @@ class _DetailSimilarCarousel extends StatelessWidget {
                                   ) !=
                                   null,
                               onTap: () => onCandidateSelected(candidate),
+                              onArrowRightEdge: () {
+                                if (!episodeListFocusNode.canRequestFocus) {
+                                  return KeyEventResult.ignored;
+                                }
+                                episodeListFocusNode.requestFocus();
+                                return KeyEventResult.handled;
+                              },
                             ),
                           );
                         },
@@ -4792,12 +5018,14 @@ class _DetailEpisodesColumn extends StatefulWidget {
     required this.controller,
     required this.series,
     required this.initialFocusNode,
+    required this.actionFocusNodes,
     required this.onPlayEpisode,
   });
 
   final AppController controller;
   final SeriesItem series;
   final FocusNode initialFocusNode;
+  final _DetailActionFocusNodes actionFocusNodes;
   final ValueChanged<EpisodeItem> onPlayEpisode;
 
   @override
@@ -4915,6 +5143,14 @@ class _DetailEpisodesColumnState extends State<_DetailEpisodesColumn> {
                         ? widget.initialFocusNode
                         : null,
                     onPlay: future ? null : () => widget.onPlayEpisode(episode),
+                    onArrowLeft: () {
+                      final target = widget.actionFocusNodes.lastFor(series);
+                      if (!target.canRequestFocus) {
+                        return KeyEventResult.ignored;
+                      }
+                      target.requestFocus();
+                      return KeyEventResult.handled;
+                    },
                     onOptions: future
                         ? null
                         : () => _showEpisodeActions(context, episode),
@@ -5013,6 +5249,7 @@ class _DetailEpisodeRow extends StatelessWidget {
     required this.autofocus,
     required this.focusNode,
     required this.onPlay,
+    required this.onArrowLeft,
     required this.onOptions,
   });
 
@@ -5023,6 +5260,7 @@ class _DetailEpisodeRow extends StatelessWidget {
   final bool autofocus;
   final FocusNode? focusNode;
   final VoidCallback? onPlay;
+  final KeyEventResult Function() onArrowLeft;
   final VoidCallback? onOptions;
 
   @override
@@ -5160,6 +5398,7 @@ class _DetailEpisodeRow extends StatelessWidget {
       autofocus: autofocus,
       focusNode: focusNode,
       onTap: onPlay,
+      onArrowLeft: onArrowLeft,
       onLongPress: onOptions,
       color: enabled ? const Color(0xFF11161D) : const Color(0xFF0B0F14),
       elevation: enabled ? 6 : 1,
@@ -5210,64 +5449,184 @@ class _DetailEpisodeRow extends StatelessWidget {
   }
 }
 
-class _DetailIconButton extends StatelessWidget {
+class _DetailIconButton extends StatefulWidget {
   const _DetailIconButton({
     required this.icon,
     required this.tooltip,
     required this.active,
     required this.onPressed,
+    this.focusNode,
   });
 
   final IconData icon;
   final String tooltip;
   final bool active;
   final VoidCallback? onPressed;
+  final FocusNode? focusNode;
+
+  @override
+  State<_DetailIconButton> createState() => _DetailIconButtonState();
+}
+
+class _DetailIconButtonState extends State<_DetailIconButton> {
+  late final FocusNode _internalFocusNode = FocusNode();
+  bool _focused = false;
+
+  FocusNode get _focusNode => widget.focusNode ?? _internalFocusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _DetailIconButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldFocusNode = oldWidget.focusNode ?? _internalFocusNode;
+    if (oldFocusNode == _focusNode) {
+      return;
+    }
+    oldFocusNode.removeListener(_handleFocusChanged);
+    _focusNode.addListener(_handleFocusChanged);
+    _focused = _focusNode.hasFocus;
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _internalFocusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: tooltip,
-      child: IconButton(
-        onPressed: onPressed,
-        icon: Icon(icon),
-        style: IconButton.styleFrom(
-          fixedSize: const Size(42, 42),
-          backgroundColor:
-              active ? TanukiColors.orangeHot : const Color(0xFF223041),
-          foregroundColor: active ? Colors.black : TanukiColors.text,
-          disabledForegroundColor: TanukiColors.subtle,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(21)),
+      message: widget.tooltip,
+      child: SizedBox(
+        width: 48,
+        height: 48,
+        child: Center(
+          child: AnimatedScale(
+            scale: _focused ? 1.12 : 1,
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOutCubic,
+            child: IconButton(
+              focusNode: _focusNode,
+              onPressed: widget.onPressed,
+              icon: Icon(widget.icon),
+              style: IconButton.styleFrom(
+                fixedSize: const Size(42, 42),
+                backgroundColor: widget.active
+                    ? TanukiColors.orangeHot
+                    : _focused
+                        ? const Color(0xFF2E4055)
+                        : const Color(0xFF223041),
+                foregroundColor:
+                    widget.active ? Colors.black : TanukiColors.text,
+                disabledForegroundColor: TanukiColors.subtle,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(21),
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
   }
 }
 
-class _DetailSpaceButton extends StatelessWidget {
+class _DetailSpaceButton extends StatefulWidget {
   const _DetailSpaceButton({
     required this.value,
     required this.onChanged,
+    this.focusNode,
   });
 
   final String value;
   final ValueChanged<String> onChanged;
+  final FocusNode? focusNode;
+
+  @override
+  State<_DetailSpaceButton> createState() => _DetailSpaceButtonState();
+}
+
+class _DetailSpaceButtonState extends State<_DetailSpaceButton> {
+  late final FocusNode _internalFocusNode = FocusNode();
+  bool _focused = false;
+
+  FocusNode get _focusNode => widget.focusNode ?? _internalFocusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _DetailSpaceButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldFocusNode = oldWidget.focusNode ?? _internalFocusNode;
+    if (oldFocusNode == _focusNode) {
+      return;
+    }
+    oldFocusNode.removeListener(_handleFocusChanged);
+    _focusNode.addListener(_handleFocusChanged);
+    _focused = _focusNode.hasFocus;
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _internalFocusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final normalized = value.trim();
+    final normalized = widget.value.trim();
     final colors = _spaceStatusColors(normalized);
     return Tooltip(
       message: _spaceStatusTooltip(normalized),
-      child: IconButton(
-        onPressed: () => _showSpaceDialog(context),
-        icon: Icon(_spaceStatusIcon(normalized)),
-        style: IconButton.styleFrom(
-          fixedSize: const Size(42, 42),
-          backgroundColor: colors.background,
-          foregroundColor: colors.foreground,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(21)),
+      child: SizedBox(
+        width: 48,
+        height: 48,
+        child: Center(
+          child: AnimatedScale(
+            scale: _focused ? 1.12 : 1,
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOutCubic,
+            child: IconButton(
+              focusNode: _focusNode,
+              onPressed: () => _showSpaceDialog(context),
+              icon: Icon(_spaceStatusIcon(normalized)),
+              style: IconButton.styleFrom(
+                fixedSize: const Size(42, 42),
+                backgroundColor: normalized.isEmpty && _focused
+                    ? const Color(0xFF2E4055)
+                    : colors.background,
+                foregroundColor: colors.foreground,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(21),
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -5314,7 +5673,7 @@ class _DetailSpaceButton extends StatelessWidget {
                 color: const Color(0xFF72E0A0),
                 onTap: () => Navigator.of(context).pop('completed'),
               ),
-              if (value.trim().isNotEmpty)
+              if (widget.value.trim().isNotEmpty)
                 _SpaceDialogOption(
                   label: 'Quitar de Mi espacio',
                   icon: Icons.remove_circle_outline,
@@ -5327,7 +5686,7 @@ class _DetailSpaceButton extends StatelessWidget {
       },
     );
     if (selected != null) {
-      onChanged(selected);
+      widget.onChanged(selected);
     }
   }
 
@@ -5370,7 +5729,7 @@ class _DetailSpaceButton extends StatelessWidget {
           foreground: const Color(0xFF72E0A0),
         ),
       _ => (
-          background: const Color(0xFF151A21),
+          background: const Color(0xFF223041),
           foreground: TanukiColors.text,
         ),
     };
@@ -5453,14 +5812,14 @@ class _TrendingPosterShelf extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            IconButton(
+            _ShelfActionButton(
               onPressed: visibleCandidates.any(
                         (candidate) => candidate.trailerUrl.isNotEmpty,
                       ) &&
                       !loading
                   ? onPlayTrailers
                   : null,
-              icon: const Icon(Icons.movie_filter),
+              icon: Icons.movie_filter,
               tooltip: 'Reproducir trailers',
             ),
           ],
@@ -5834,10 +6193,10 @@ class _ContinueWatchingShelf extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            IconButton(
+            _ShelfActionButton(
               onPressed:
                   entries.any((entry) => entry.enabled) ? onPlayQueue : null,
-              icon: const Icon(Icons.queue_play_next),
+              icon: Icons.queue_play_next,
               tooltip: 'Reproducir una por serie',
             ),
           ],
@@ -6040,21 +6399,21 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
               if (onStopWatching != null)
                 ListTile(
                   leading: const Icon(
-                    Icons.visibility_off,
+                    Icons.remove_circle_outline,
                     color: TanukiColors.orange,
                   ),
                   title: const Text(
-                    'Dejar de ver',
+                    'Quitar de Continuar viendo',
                     style: TextStyle(
                       color: TanukiColors.text,
                       fontWeight: FontWeight.w800,
                     ),
                   ),
-                  subtitle: Text(
-                    entry.seriesName,
+                  subtitle: const Text(
+                    'Borra el progreso local sin marcarla abandonada',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: TanukiColors.muted),
+                    style: TextStyle(color: TanukiColors.muted),
                   ),
                   onTap: () => Navigator.of(context)
                       .pop(_ContinueWatchingAction.stopWatching),
@@ -6066,7 +6425,7 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
                     color: TanukiColors.danger,
                   ),
                   title: const Text(
-                    'Abandonar',
+                    'Marcar como abandonada',
                     style: TextStyle(
                       color: TanukiColors.text,
                       fontWeight: FontWeight.w800,
@@ -6477,12 +6836,14 @@ class _SearchPanel extends StatefulWidget {
   const _SearchPanel({
     required this.controller,
     required this.searchController,
+    required this.searchFieldFocusNode,
     required this.onRemoteCandidateSelected,
     required this.onPlaySearchTrailers,
   });
 
   final AppController controller;
   final TextEditingController searchController;
+  final FocusNode searchFieldFocusNode;
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
   final VoidCallback onPlaySearchTrailers;
 
@@ -6491,13 +6852,11 @@ class _SearchPanel extends StatefulWidget {
 }
 
 class _SearchPanelState extends State<_SearchPanel> {
-  final FocusNode _searchFieldFocusNode = FocusNode(debugLabel: 'searchField');
   final FocusNode _firstFilterFocusNode =
       FocusNode(debugLabel: 'searchFirstFilter');
 
   @override
   void dispose() {
-    _searchFieldFocusNode.dispose();
     _firstFilterFocusNode.dispose();
     super.dispose();
   }
@@ -6511,13 +6870,35 @@ class _SearchPanelState extends State<_SearchPanel> {
         key != LogicalKeyboardKey.arrowDown) {
       return KeyEventResult.ignored;
     }
-    _searchFieldFocusNode.unfocus();
+    widget.searchFieldFocusNode.unfocus();
     final scope = FocusScope.of(context);
     if (key == LogicalKeyboardKey.arrowDown) {
       _firstFilterFocusNode.requestFocus();
     } else {
       scope.previousFocus();
     }
+    return KeyEventResult.handled;
+  }
+
+  KeyEventResult _handleSearchFilterKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey != LogicalKeyboardKey.arrowUp) {
+      return KeyEventResult.ignored;
+    }
+    widget.searchFieldFocusNode.requestFocus();
+    return KeyEventResult.handled;
+  }
+
+  KeyEventResult _handleFirstResultRowKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey != LogicalKeyboardKey.arrowUp) {
+      return KeyEventResult.ignored;
+    }
+    _firstFilterFocusNode.requestFocus();
     return KeyEventResult.handled;
   }
 
@@ -6559,14 +6940,14 @@ class _SearchPanelState extends State<_SearchPanel> {
                   tooltip: 'Buscar',
                 ),
                 const SizedBox(width: 8),
-                IconButton(
+                _ShelfActionButton(
                   onPressed: controller.remoteResults.any(
                             (candidate) => candidate.trailerUrl.isNotEmpty,
                           ) &&
                           !controller.isSearching
                       ? widget.onPlaySearchTrailers
                       : null,
-                  icon: const Icon(Icons.movie_filter),
+                  icon: Icons.movie_filter,
                   tooltip: 'Reproducir trailers',
                 ),
               ],
@@ -6580,7 +6961,7 @@ class _SearchPanelState extends State<_SearchPanel> {
             Focus(
               onKeyEvent: _handleSearchFieldKey,
               child: TextField(
-                focusNode: _searchFieldFocusNode,
+                focusNode: widget.searchFieldFocusNode,
                 controller: searchController,
                 textInputAction: TextInputAction.search,
                 onSubmitted: controller.searchRemote,
@@ -6597,6 +6978,7 @@ class _SearchPanelState extends State<_SearchPanel> {
                 children: [
                   _SearchFilterButton(
                     focusNode: _firstFilterFocusNode,
+                    onKeyEvent: _handleSearchFilterKey,
                     label: controller.searchFormatFilter.label,
                     active:
                         controller.searchFormatFilter != SearchFormatFilter.all,
@@ -6605,6 +6987,7 @@ class _SearchPanelState extends State<_SearchPanel> {
                   ),
                   const SizedBox(width: 10),
                   _SearchFilterButton(
+                    onKeyEvent: _handleSearchFilterKey,
                     label: controller.searchSeasonFilter.label,
                     active: !controller.searchSeasonFilter.isAll,
                     onPressed: () => controller
@@ -6612,6 +6995,7 @@ class _SearchPanelState extends State<_SearchPanel> {
                   ),
                   const SizedBox(width: 10),
                   _SearchFilterButton(
+                    onKeyEvent: _handleSearchFilterKey,
                     label: controller.searchYearFilter.label,
                     active: controller.searchYearFilter != SearchYearFilter.all,
                     onPressed: () =>
@@ -6619,6 +7003,7 @@ class _SearchPanelState extends State<_SearchPanel> {
                   ),
                   const SizedBox(width: 10),
                   _SearchFilterButton(
+                    onKeyEvent: _handleSearchFilterKey,
                     label: 'Limpiar filtros',
                     active: controller.hasActiveSearchFilters,
                     onPressed: () {
@@ -6668,17 +7053,21 @@ class _SearchPanelState extends State<_SearchPanel> {
                     spacing: spacing,
                     runSpacing: spacing,
                     children: [
-                      for (final candidate in controller.remoteResults)
+                      for (final entry
+                          in controller.remoteResults.asMap().entries)
                         SizedBox(
                           width: cardWidth,
                           height: 208,
                           child: _SearchResultPosterCard(
-                            candidate: candidate,
-                            imported: controller
-                                    .findRemoteSeriesForCandidate(candidate) !=
+                            candidate: entry.value,
+                            imported: controller.findRemoteSeriesForCandidate(
+                                    entry.value) !=
                                 null,
                             onTap: () =>
-                                widget.onRemoteCandidateSelected(candidate),
+                                widget.onRemoteCandidateSelected(entry.value),
+                            onArrowUp: entry.key < columns
+                                ? _handleFirstResultRowKey
+                                : null,
                           ),
                         ),
                     ],
@@ -6717,29 +7106,35 @@ class _SearchFilterButton extends StatelessWidget {
     required this.onPressed,
     this.active = false,
     this.focusNode,
+    this.onKeyEvent,
   });
 
   final String label;
   final VoidCallback onPressed;
   final bool active;
   final FocusNode? focusNode;
+  final FocusOnKeyEventCallback? onKeyEvent;
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      height: 38,
-      child: OutlinedButton(
-        focusNode: focusNode,
-        onPressed: onPressed,
-        style: OutlinedButton.styleFrom(
-          backgroundColor: active ? const Color(0x33F47521) : null,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          side: BorderSide(
-            color: active ? TanukiColors.orange : TanukiColors.panelStroke,
+    return Focus(
+      onKeyEvent: onKeyEvent,
+      child: SizedBox(
+        height: 38,
+        child: OutlinedButton(
+          focusNode: focusNode,
+          onPressed: onPressed,
+          style: OutlinedButton.styleFrom(
+            backgroundColor: active ? const Color(0x33F47521) : null,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            side: BorderSide(
+              color: active ? TanukiColors.orange : TanukiColors.panelStroke,
+            ),
+            textStyle:
+                const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
           ),
-          textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
+          child: Text(label),
         ),
-        child: Text(label),
       ),
     );
   }
@@ -6753,6 +7148,8 @@ class _SearchResultPosterCard extends StatelessWidget {
     this.focusNode,
     this.onFocused,
     this.onLongPress,
+    this.onArrowUp,
+    this.onArrowRightEdge,
     this.showScheduleChip = true,
   });
 
@@ -6762,6 +7159,8 @@ class _SearchResultPosterCard extends StatelessWidget {
   final FocusNode? focusNode;
   final VoidCallback? onFocused;
   final VoidCallback? onLongPress;
+  final FocusOnKeyEventCallback? onArrowUp;
+  final KeyEventResult Function()? onArrowRightEdge;
   final bool showScheduleChip;
 
   @override
@@ -6772,6 +7171,8 @@ class _SearchResultPosterCard extends StatelessWidget {
       onTap: onTap,
       onFocused: onFocused,
       onLongPress: onLongPress,
+      onArrowUp: onArrowUp,
+      onArrowRightEdge: onArrowRightEdge,
       elevation: 8,
       child: Stack(
         fit: StackFit.expand,
@@ -7336,6 +7737,13 @@ class _SettingsPanel extends StatelessWidget {
               max: 96,
               onChanged: (value) => controller.setOverscanPadding(top: value),
             ),
+            _SettingsSlider(
+              value: controller.state.overscanBottom,
+              label: 'Borde inferior',
+              max: 96,
+              onChanged: (value) =>
+                  controller.setOverscanPadding(bottom: value),
+            ),
             const _SettingsSectionTitle('Tarjetas Luego y Mas tarde'),
             _SettingsCheckBox(
               value: controller.state.showSeriesUpcomingCards,
@@ -7616,7 +8024,7 @@ class _SettingsIconButton extends StatelessWidget {
   }
 }
 
-class _SettingsCheckBox extends StatelessWidget {
+class _SettingsCheckBox extends StatefulWidget {
   const _SettingsCheckBox({
     required this.value,
     required this.label,
@@ -7628,18 +8036,69 @@ class _SettingsCheckBox extends StatelessWidget {
   final ValueChanged<bool> onChanged;
 
   @override
+  State<_SettingsCheckBox> createState() => _SettingsCheckBoxState();
+}
+
+class _SettingsCheckBoxState extends State<_SettingsCheckBox> {
+  final FocusNode _focusNode = FocusNode();
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return CheckboxListTile(
-      value: value,
-      onChanged: (value) => onChanged(value ?? false),
-      dense: true,
-      contentPadding: EdgeInsets.zero,
-      controlAffinity: ListTileControlAffinity.leading,
-      activeColor: TanukiColors.orange,
-      checkColor: Colors.black,
-      title: Text(
-        label,
-        style: const TextStyle(color: Color(0xFFD8E1EB), fontSize: 14),
+    return AnimatedScale(
+      scale: _focused ? 1.015 : 1,
+      alignment: Alignment.centerLeft,
+      duration: const Duration(milliseconds: 120),
+      curve: Curves.easeOutCubic,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOutCubic,
+        decoration: BoxDecoration(
+          color: _focused ? const Color(0x3324384C) : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: _focused ? TanukiColors.orange : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: CheckboxListTile(
+          focusNode: _focusNode,
+          value: widget.value,
+          onChanged: (value) => widget.onChanged(value ?? false),
+          dense: true,
+          contentPadding: const EdgeInsets.only(left: 4, right: 8),
+          controlAffinity: ListTileControlAffinity.leading,
+          activeColor: TanukiColors.orange,
+          checkColor: Colors.black,
+          title: Text(
+            widget.label,
+            style: TextStyle(
+              color: _focused ? TanukiColors.text : const Color(0xFFD8E1EB),
+              fontSize: 14,
+              fontWeight: _focused ? FontWeight.w800 : FontWeight.w400,
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -7846,14 +8305,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
     final episodeAvailable =
         !futureEpisode && _episodeHasPlaybackRoute(episode);
     final playback = controller.playbackForEpisode(episode);
-    final playbackProgress = _playbackProgress(playback);
-    final seriesProgress =
-        total > 0 ? (watched / total).clamp(0, 1).toDouble() : 0.0;
-    final progress = futureEpisode
-        ? 0.0
-        : playbackProgress > 0
-            ? playbackProgress
-            : seriesProgress;
+    final progress = futureEpisode ? 0.0 : _playbackProgress(playback);
     entries.add(
       _ContinueWatchingEntry(
         series: series,
@@ -8838,6 +9290,8 @@ class _FocusablePosterSurface extends StatefulWidget {
     this.focusNode,
     this.onFocused,
     this.onLongPress,
+    this.onArrowUp,
+    this.onArrowRightEdge,
     this.elevation = 6,
   });
 
@@ -8846,6 +9300,8 @@ class _FocusablePosterSurface extends StatefulWidget {
   final FocusNode? focusNode;
   final VoidCallback? onFocused;
   final VoidCallback? onLongPress;
+  final FocusOnKeyEventCallback? onArrowUp;
+  final KeyEventResult Function()? onArrowRightEdge;
   final double elevation;
 
   @override
@@ -8904,6 +9360,10 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
     }
 
     if (event is KeyDownEvent || event is KeyRepeatEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.arrowUp &&
+          widget.onArrowUp != null) {
+        return widget.onArrowUp!(node, event);
+      }
       if (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
           event.logicalKey == LogicalKeyboardKey.arrowRight) {
         final forward = event.logicalKey == LogicalKeyboardKey.arrowRight;
@@ -8927,6 +9387,9 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
               return KeyEventResult.handled;
             }
             return KeyEventResult.ignored;
+          }
+          if (widget.onArrowRightEdge != null) {
+            return widget.onArrowRightEdge!();
           }
           return KeyEventResult.handled;
         }
@@ -9043,6 +9506,7 @@ class _FocusableEpisodeSurface extends StatefulWidget {
     this.autofocus = false,
     this.focusNode,
     this.onLongPress,
+    this.onArrowLeft,
     this.color = const Color(0xFF11161D),
     this.elevation = 6,
     this.activeElevation = 9,
@@ -9055,6 +9519,7 @@ class _FocusableEpisodeSurface extends StatefulWidget {
   final bool autofocus;
   final FocusNode? focusNode;
   final VoidCallback? onLongPress;
+  final KeyEventResult Function()? onArrowLeft;
   final Color color;
   final double elevation;
   final double activeElevation;
@@ -9088,6 +9553,12 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
         event is! KeyRepeatEvent &&
         event is! KeyUpEvent) {
       return KeyEventResult.ignored;
+    }
+
+    if ((event is KeyDownEvent || event is KeyRepeatEvent) &&
+        event.logicalKey == LogicalKeyboardKey.arrowLeft &&
+        widget.onArrowLeft != null) {
+      return widget.onArrowLeft!();
     }
 
     if (!_isRemoteActivateKey(event.logicalKey)) {
@@ -9560,6 +10031,79 @@ class _SectionHeader extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+class _ShelfActionButton extends StatefulWidget {
+  const _ShelfActionButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onPressed;
+
+  @override
+  State<_ShelfActionButton> createState() => _ShelfActionButtonState();
+}
+
+class _ShelfActionButtonState extends State<_ShelfActionButton> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'shelfActionButton');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: widget.tooltip,
+      child: SizedBox.square(
+        dimension: 44,
+        child: Center(
+          child: AnimatedScale(
+            scale: _focused ? 1.24 : 1,
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOutCubic,
+            child: IconButton(
+              focusNode: _focusNode,
+              onPressed: widget.onPressed,
+              icon: Icon(widget.icon),
+              iconSize: 22,
+              style: IconButton.styleFrom(
+                fixedSize: const Size(34, 34),
+                backgroundColor:
+                    _focused ? const Color(0x664A5E72) : Colors.transparent,
+                foregroundColor: Colors.white,
+                disabledForegroundColor: const Color(0x66FFFFFF),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(17),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

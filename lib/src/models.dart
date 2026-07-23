@@ -1646,6 +1646,7 @@ class AppState {
     this.skipRecapSegments = false,
     this.overscanHorizontal = 0,
     this.overscanTop = 0,
+    this.overscanBottom = 0,
     this.fillerCache = const {},
     this.visualCache = const {},
     this.myAnimeListClientId = '',
@@ -1669,6 +1670,7 @@ class AppState {
   final bool skipRecapSegments;
   final double overscanHorizontal;
   final double overscanTop;
+  final double overscanBottom;
   final Map<String, FillerMetadataRecord> fillerCache;
   final Map<String, CandidateVisualCacheEntry> visualCache;
   final String myAnimeListClientId;
@@ -1720,6 +1722,7 @@ class AppState {
       skipRecapSegments: _readBool(json['skipRecapSegments']),
       overscanHorizontal: _readDouble(json['overscanHorizontal']),
       overscanTop: _readDouble(json['overscanTop']),
+      overscanBottom: _readDouble(json['overscanBottom']),
       fillerCache: _readFillerCache(json['fillerCache']),
       visualCache: _readCandidateVisualCache(json['visualCache']),
       myAnimeListClientId: _readString(json['myAnimeListClientId']),
@@ -1767,6 +1770,7 @@ class AppState {
     bool? skipRecapSegments,
     double? overscanHorizontal,
     double? overscanTop,
+    double? overscanBottom,
     Map<String, FillerMetadataRecord>? fillerCache,
     Map<String, CandidateVisualCacheEntry>? visualCache,
     String? myAnimeListClientId,
@@ -1803,6 +1807,7 @@ class AppState {
       skipRecapSegments: skipRecapSegments ?? this.skipRecapSegments,
       overscanHorizontal: overscanHorizontal ?? this.overscanHorizontal,
       overscanTop: overscanTop ?? this.overscanTop,
+      overscanBottom: overscanBottom ?? this.overscanBottom,
       fillerCache: fillerCache ?? this.fillerCache,
       visualCache: visualCache ?? this.visualCache,
       myAnimeListClientId: myAnimeListClientId ?? this.myAnimeListClientId,
@@ -1835,6 +1840,7 @@ class AppState {
       'skipRecapSegments': skipRecapSegments,
       'overscanHorizontal': overscanHorizontal,
       'overscanTop': overscanTop,
+      'overscanBottom': overscanBottom,
       'fillerCache': fillerCache.map(
         (key, value) => MapEntry(key, value.toJson()),
       ),

@@ -3816,10 +3816,12 @@ class AppController extends ChangeNotifier {
   Future<void> setOverscanPadding({
     double? horizontal,
     double? top,
+    double? bottom,
   }) async {
     _state = _state.copyWith(
       overscanHorizontal: horizontal?.clamp(0, 96).toDouble(),
       overscanTop: top?.clamp(0, 96).toDouble(),
+      overscanBottom: bottom?.clamp(0, 96).toDouble(),
     );
     await _save();
     notifyListeners();
