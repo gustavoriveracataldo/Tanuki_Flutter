@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app_controller.dart';
+import '../services/window_fullscreen_controller.dart';
 import 'home_screen.dart';
 import 'toonami_theme.dart';
 
@@ -50,9 +53,18 @@ class _ToonamiAppState extends State<ToonamiApp> with WidgetsBindingObserver {
       debugShowCheckedModeBanner: false,
       theme: tanukiTheme,
       scrollBehavior: const _TanukiScrollBehavior(),
-      builder: (context, child) => _TanukiDisplayScaler(child: child),
+      builder: (context, child) => CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.f11): _toggleAppFullscreen,
+        },
+        child: _TanukiDisplayScaler(child: child),
+      ),
       home: HomeScreen(controller: widget.controller),
     );
+  }
+
+  void _toggleAppFullscreen() {
+    unawaited(WindowFullscreenController.toggle());
   }
 }
 

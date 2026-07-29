@@ -1,6 +1,7 @@
 #include "flutter_window.h"
 
 #include <optional>
+#include <variant>
 
 #include "flutter/generated_plugin_registrant.h"
 
@@ -26,6 +27,22 @@ bool FlutterWindow::OnCreate() {
   }
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  window_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "tanuki/window",
+          &flutter::StandardMethodCodec::GetInstance());
+  window_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        if (call.method_name() == "setFullscreen") {
+          const auto* enabled = std::get_if<bool>(call.arguments());
+          SetFullscreen(enabled != nullptr && *enabled);
+          result->Success();
+          return;
+        }
+        result->NotImplemented();
+      });
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -40,6 +57,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  window_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -68,4 +86,39 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+}
+
+void FlutterWindow::SetFullscreen(bool enabled) {
+  HWND hwnd = GetHandle();
+  if (hwnd == nullptr || fullscreen_ == enabled) {
+    return;
+  }
+
+  if (enabled) {
+    restore_style_ = GetWindowLongPtr(hwnd, GWL_STYLE);
+    GetWindowRect(hwnd, &restore_bounds_);
+
+    MONITORINFO monitor_info = {};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                       &monitor_info)) {
+      SetWindowLongPtr(hwnd, GWL_STYLE,
+                       restore_style_ &
+                           ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
+      SetWindowPos(hwnd, HWND_TOP, monitor_info.rcMonitor.left,
+                   monitor_info.rcMonitor.top,
+                   monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                   monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+                   SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+      fullscreen_ = true;
+    }
+    return;
+  }
+
+  SetWindowLongPtr(hwnd, GWL_STYLE, restore_style_);
+  SetWindowPos(hwnd, nullptr, restore_bounds_.left, restore_bounds_.top,
+               restore_bounds_.right - restore_bounds_.left,
+               restore_bounds_.bottom - restore_bounds_.top,
+               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+  fullscreen_ = false;
 }

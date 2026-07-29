@@ -19,6 +19,7 @@ import '../app_controller.dart';
 import '../models.dart';
 import '../services/aniskip_service.dart';
 import '../services/playback_backend.dart';
+import '../services/window_fullscreen_controller.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
@@ -122,10 +123,10 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _playerOverlaysVisible = true;
   bool _playerControlsFocused = false;
   bool _playerBuffering = false;
-  bool _playerFullscreen = false;
   bool _playerVolumeSliderVisible = false;
   bool _suppressNextPlayerActivationKeyUp = false;
   double _playerVolume = 1.0;
+  double _playerVolumeBeforeMute = 1.0;
   final FocusNode _playerControlsRootFocusNode =
       FocusNode(debugLabel: 'playerControlsRoot');
   final FocusNode _playerBackButtonFocusNode =
@@ -1455,22 +1456,43 @@ class _PlayerScreenState extends State<PlayerScreen>
     _showPlayerOverlays();
   }
 
-  void _togglePlayerVolumeSlider() {
+  void _setPlayerVolumeSliderVisible(bool visible) {
     if (!_showsDesktopVolumeControl) {
       return;
     }
+    if (_playerVolumeSliderVisible == visible) {
+      return;
+    }
     setState(() {
-      _playerVolumeSliderVisible = !_playerVolumeSliderVisible;
+      _playerVolumeSliderVisible = visible;
       _playerOverlaysVisible = true;
     });
-    _playerVolumeButtonFocusNode.requestFocus();
     _schedulePlayerOverlayHide();
+  }
+
+  void _togglePlayerMute() {
+    if (!_showsDesktopVolumeControl) {
+      return;
+    }
+    _playerVolumeButtonFocusNode.requestFocus();
+    if (_playerVolume > 0.01) {
+      _playerVolumeBeforeMute = _playerVolume;
+      _setPlayerVolume(0);
+    } else {
+      final restored = _playerVolumeBeforeMute > 0.01
+          ? _playerVolumeBeforeMute
+          : _normalizedMaxVolume;
+      _setPlayerVolume(restored);
+    }
   }
 
   void _setPlayerVolume(double value) {
     final next = value.clamp(0.0, 1.0).toDouble();
     if ((_playerVolume - next).abs() < 0.001) {
       return;
+    }
+    if (next > 0.01) {
+      _playerVolumeBeforeMute = next;
     }
     setState(() {
       _playerVolume = next;
@@ -3572,7 +3594,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                           onNext: _playNext,
                           onSettings: _showPlayerSettingsDialog,
                           onEpisodes: () => unawaited(_showEpisodeListPanel()),
-                          onToggleVolume: _togglePlayerVolumeSlider,
+                          onToggleVolume: _togglePlayerMute,
+                          onVolumeHoverChanged: _setPlayerVolumeSliderVisible,
                           onVolumeChanged: _setPlayerVolume,
                           onFullscreen: () =>
                               unawaited(_toggleFullscreenMode()),
@@ -3970,7 +3993,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       return true;
     }
     if (_playerVolumeButtonFocusNode.hasFocus) {
-      _togglePlayerVolumeSlider();
+      _togglePlayerMute();
       return true;
     }
     if (_playerFullscreenButtonFocusNode.hasFocus) {
@@ -4574,14 +4597,22 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _toggleFullscreenMode() async {
-    final next = !_playerFullscreen;
+    final next = !WindowFullscreenController.isFullscreen;
+    try {
+      _debugPlayerEvent('desktop fullscreen request enabled=$next');
+      await WindowFullscreenController.setFullscreen(next);
+      _debugPlayerEvent('desktop fullscreen request accepted enabled=$next');
+    } catch (error) {
+      _debugPlayerEvent('desktop fullscreen ignored error: $error');
+      setState(() {
+        _status = 'No se pudo cambiar pantalla completa';
+      });
+      _showPlayerOverlays();
+      return;
+    }
     setState(() {
-      _playerFullscreen = next;
       _status = next ? 'Pantalla completa' : 'Pantalla normal';
     });
-    await SystemChrome.setEnabledSystemUIMode(
-      next ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
-    );
     _showPlayerOverlays();
   }
 
@@ -5820,6 +5851,13 @@ String _youtubeSeriesWebPlayerHtml({
       document.getElementById('play').addEventListener('click', tanukiToggle);
       progress.addEventListener('input', function() {
         tanukiSeekTo(Number(progress.value) || 0);
+      });
+      document.addEventListener('keydown', function(event) {
+        if (event.key === 'F11') {
+          event.preventDefault();
+          event.stopPropagation();
+          postCommand('fullscreen');
+        }
       });
     }
     bindControls();
@@ -7305,6 +7343,7 @@ class _PlayerTopBar extends StatelessWidget {
     required this.onSettings,
     required this.onEpisodes,
     required this.onToggleVolume,
+    required this.onVolumeHoverChanged,
     required this.onVolumeChanged,
     required this.onFullscreen,
     required this.onControlFocusChanged,
@@ -7338,6 +7377,7 @@ class _PlayerTopBar extends StatelessWidget {
   final VoidCallback onSettings;
   final VoidCallback onEpisodes;
   final VoidCallback onToggleVolume;
+  final ValueChanged<bool> onVolumeHoverChanged;
   final ValueChanged<double> onVolumeChanged;
   final VoidCallback onFullscreen;
   final ValueChanged<bool> onControlFocusChanged;
@@ -7452,47 +7492,61 @@ class _PlayerTopBar extends StatelessWidget {
               const SizedBox(width: 10),
               FocusTraversalOrder(
                 order: const NumericFocusOrder(6),
-                child: _PlayerIconButton(
-                  icon: volumeIcon,
-                  tooltip: 'Volumen',
-                  focusNode: volumeButtonFocusNode,
-                  onPressed: onToggleVolume,
-                  onFocusChanged: onControlFocusChanged,
+                child: MouseRegion(
+                  onEnter: (_) => onVolumeHoverChanged(true),
+                  onExit: (_) => onVolumeHoverChanged(false),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _PlayerIconButton(
+                        icon: volumeIcon,
+                        tooltip: volume <= 0.01 ? 'Desmutear' : 'Mutear',
+                        focusNode: volumeButtonFocusNode,
+                        onPressed: onToggleVolume,
+                        onFocusChanged: (focused) {
+                          onControlFocusChanged(focused);
+                          if (focused) {
+                            onVolumeHoverChanged(true);
+                          }
+                        },
+                      ),
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 160),
+                        curve: Curves.easeOutCubic,
+                        width: showVolumeSlider ? 152 : 0,
+                        height: 44,
+                        clipBehavior: Clip.hardEdge,
+                        decoration: const BoxDecoration(),
+                        child: showVolumeSlider
+                            ? Focus(
+                                canRequestFocus: false,
+                                descendantsAreFocusable: false,
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 3,
+                                    thumbShape: const RoundSliderThumbShape(
+                                      enabledThumbRadius: 7,
+                                    ),
+                                    overlayShape: const RoundSliderOverlayShape(
+                                      overlayRadius: 13,
+                                    ),
+                                    activeTrackColor: TanukiColors.orange,
+                                    inactiveTrackColor: Colors.white24,
+                                    thumbColor: Colors.white,
+                                  ),
+                                  child: Slider(
+                                    min: 0,
+                                    max: 1,
+                                    value: volume.clamp(0.0, 1.0).toDouble(),
+                                    onChanged: onVolumeChanged,
+                                  ),
+                                ),
+                              )
+                            : const SizedBox.shrink(),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 160),
-                curve: Curves.easeOutCubic,
-                width: showVolumeSlider ? 152 : 0,
-                height: 44,
-                clipBehavior: Clip.hardEdge,
-                decoration: const BoxDecoration(),
-                child: showVolumeSlider
-                    ? Focus(
-                        canRequestFocus: false,
-                        descendantsAreFocusable: false,
-                        child: SliderTheme(
-                          data: SliderTheme.of(context).copyWith(
-                            trackHeight: 3,
-                            thumbShape: const RoundSliderThumbShape(
-                              enabledThumbRadius: 7,
-                            ),
-                            overlayShape: const RoundSliderOverlayShape(
-                              overlayRadius: 13,
-                            ),
-                            activeTrackColor: TanukiColors.orange,
-                            inactiveTrackColor: Colors.white24,
-                            thumbColor: Colors.white,
-                          ),
-                          child: Slider(
-                            min: 0,
-                            max: 1,
-                            value: volume.clamp(0.0, 1.0).toDouble(),
-                            onChanged: onVolumeChanged,
-                          ),
-                        ),
-                      )
-                    : const SizedBox.shrink(),
               ),
             ],
             if (showFullscreenControl) ...[

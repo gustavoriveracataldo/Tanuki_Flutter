@@ -14,9 +14,109 @@ struct _MyApplication {
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 
+struct TanukiWindowState {
+  GtkWindow* window;
+  GtkWidget* title_bar;
+  gboolean fullscreen;
+};
+
+static void tanuki_window_state_free(gpointer data) {
+  TanukiWindowState* state = static_cast<TanukiWindowState*>(data);
+  if (state->title_bar != nullptr) {
+    g_object_unref(state->title_bar);
+  }
+  g_free(state);
+}
+
+static void log_window_state(const gchar* label, GtkWindow* window) {
+  GdkWindow* gdk_window = gtk_widget_get_window(GTK_WIDGET(window));
+  GdkWindowState state =
+      gdk_window == nullptr ? static_cast<GdkWindowState>(0)
+                            : gdk_window_get_state(gdk_window);
+  gint width = 0;
+  gint height = 0;
+  gtk_window_get_size(window, &width, &height);
+  g_print(
+      "TanukiFullscreen: %s size=%dx%d fullscreen=%d maximized=%d decorated=%d "
+      "visible=%d\n",
+      label, width, height, (state & GDK_WINDOW_STATE_FULLSCREEN) != 0,
+      (state & GDK_WINDOW_STATE_MAXIMIZED) != 0,
+      gtk_window_get_decorated(window),
+      gtk_widget_get_visible(GTK_WIDGET(window)));
+}
+
+static gboolean log_window_state_after_fullscreen(gpointer user_data) {
+  TanukiWindowState* state = static_cast<TanukiWindowState*>(user_data);
+  if (state != nullptr && state->window != nullptr) {
+    log_window_state("after-timeout", state->window);
+  }
+  return G_SOURCE_REMOVE;
+}
+
 // Called when first Flutter frame received.
 static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
+}
+
+static void set_real_fullscreen(TanukiWindowState* state, gboolean enabled) {
+  if (state == nullptr || state->window == nullptr ||
+      state->fullscreen == enabled) {
+    if (state != nullptr && state->window != nullptr) {
+      log_window_state("skip-same-state", state->window);
+    }
+    return;
+  }
+
+  log_window_state(enabled ? "before-enter" : "before-exit", state->window);
+  if (enabled) {
+    state->fullscreen = TRUE;
+    if (state->title_bar != nullptr) {
+      gtk_widget_hide(state->title_bar);
+    }
+    gtk_window_unmaximize(state->window);
+    gtk_window_set_decorated(state->window, FALSE);
+    gtk_window_set_keep_above(state->window, TRUE);
+    gtk_window_fullscreen(state->window);
+    log_window_state("after-enter-request", state->window);
+    g_timeout_add(500, log_window_state_after_fullscreen, state);
+    return;
+  }
+
+  state->fullscreen = FALSE;
+  gtk_window_unfullscreen(state->window);
+  gtk_window_set_keep_above(state->window, FALSE);
+  gtk_window_set_decorated(state->window, TRUE);
+  if (state->title_bar != nullptr) {
+    gtk_widget_show(state->title_bar);
+  }
+  gtk_window_maximize(state->window);
+  log_window_state("after-exit-request", state->window);
+  g_timeout_add(500, log_window_state_after_fullscreen, state);
+}
+
+static void window_method_call_cb(FlMethodChannel* channel,
+                                  FlMethodCall* method_call,
+                                  gpointer user_data) {
+  (void)channel;
+  const gchar* method = fl_method_call_get_name(method_call);
+  TanukiWindowState* state = static_cast<TanukiWindowState*>(user_data);
+
+  if (g_strcmp0(method, "setFullscreen") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    gboolean enabled =
+        args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL &&
+        fl_value_get_bool(args);
+    g_print("TanukiFullscreen: method setFullscreen enabled=%d\n", enabled);
+    set_real_fullscreen(state, enabled);
+    g_autoptr(FlMethodResponse) response =
+        FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  g_autoptr(FlMethodResponse) response =
+      FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  fl_method_call_respond(method_call, response, nullptr);
 }
 
 static bool can_create_opengl_context() {
@@ -68,6 +168,7 @@ static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
+  GtkWidget* title_bar = nullptr;
 
   // Use a header bar when running in GNOME as this is the common style used
   // by applications and is the setup most users will be using (e.g. Ubuntu
@@ -91,7 +192,8 @@ static void my_application_activate(GApplication* application) {
     gtk_widget_show(GTK_WIDGET(header_bar));
     gtk_header_bar_set_title(header_bar, "Tanuki");
     gtk_header_bar_set_show_close_button(header_bar, TRUE);
-    gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
+    title_bar = GTK_WIDGET(header_bar);
+    gtk_window_set_titlebar(window, title_bar);
   } else {
     gtk_window_set_title(window, "Tanuki");
   }
@@ -126,6 +228,22 @@ static void my_application_activate(GApplication* application) {
   gtk_widget_realize(GTK_WIDGET(view));
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
+  TanukiWindowState* window_state =
+      static_cast<TanukiWindowState*>(g_malloc0(sizeof(TanukiWindowState)));
+  window_state->window = window;
+  window_state->title_bar =
+      title_bar == nullptr ? nullptr : GTK_WIDGET(g_object_ref(title_bar));
+  window_state->fullscreen = FALSE;
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  FlMethodChannel* window_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(fl_view_get_engine(view)),
+      "tanuki/window", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(
+      window_channel, window_method_call_cb, window_state, nullptr);
+  g_object_set_data_full(G_OBJECT(window), "tanuki-window-channel",
+                         window_channel, g_object_unref);
+  g_object_set_data_full(G_OBJECT(window), "tanuki-window-state", window_state,
+                         tanuki_window_state_free);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }

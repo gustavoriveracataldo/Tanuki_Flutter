@@ -14,7 +14,7 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
-const _appVersionLabel = '0.9.5';
+const _appVersionLabel = '1.6.55';
 
 enum _Section {
   anime,
@@ -2717,8 +2717,8 @@ class _AvatarPresetButton extends StatelessWidget {
                     shape: BoxShape.circle,
                     border: Border.all(
                       color: highlighted || selected
-                          ? TanukiColors.orange
-                          : preset.accentColor,
+                          ? const Color(0xFF94A5B7)
+                          : const Color(0x55334A62),
                       width: highlighted || selected ? 3 : 1,
                     ),
                   ),
@@ -2772,8 +2772,15 @@ class _RemoteFocusButton extends StatefulWidget {
 }
 
 class _RemoteFocusButtonState extends State<_RemoteFocusButton> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'remoteFocusButton');
   bool _focused = false;
   bool _hovered = false;
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (!_isRemoteActivateKey(event.logicalKey)) {
@@ -2788,6 +2795,7 @@ class _RemoteFocusButtonState extends State<_RemoteFocusButton> {
   @override
   Widget build(BuildContext context) {
     return Focus(
+      focusNode: _focusNode,
       autofocus: widget.autofocus,
       onKeyEvent: _handleKey,
       onFocusChange: (value) {
@@ -2799,6 +2807,9 @@ class _RemoteFocusButtonState extends State<_RemoteFocusButton> {
         canRequestFocus: false,
         onTap: widget.onPressed,
         onHover: (value) {
+          if (value && _focusNode.canRequestFocus) {
+            _focusNode.requestFocus();
+          }
           if (_hovered != value) {
             setState(() => _hovered = value);
           }

@@ -61,7 +61,7 @@ pkg_check_modules(MEDIA_KIT_LINUX_EPOXY QUIET epoxy)
 # alias to the runtime library that Tanuki actually needs.
 find_file(VLC_RUNTIME_LIBRARY
   NAMES libvlc.so.5
-  PATHS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
+  PATHS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64
 )
 if(VLC_RUNTIME_LIBRARY)
   set(VLC_RUNTIME_LINK_DIR "${CMAKE_BINARY_DIR}/vlc-runtime")
