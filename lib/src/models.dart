@@ -720,6 +720,7 @@ class RemoteSearchCandidate {
     this.catalogId = 0,
     this.cast = const [],
     this.episodeDetails = const [],
+    this.relationLabel = '',
   });
 
   final RemoteProvider provider;
@@ -742,6 +743,7 @@ class RemoteSearchCandidate {
   final int catalogId;
   final List<String> cast;
   final List<SeriesEpisodeMetadata> episodeDetails;
+  final String relationLabel;
 
   SeriesItem toSeries({required Iterable<String> existingNames}) {
     final name = uniqueSeriesName(title, existingNames, provider.label);

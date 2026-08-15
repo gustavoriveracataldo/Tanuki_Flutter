@@ -8849,11 +8849,7 @@ vp.VideoViewType androidVideoViewTypeForCapabilities(
   if (mode == AndroidVideoViewMode.surface) {
     return vp.VideoViewType.platformView;
   }
-  if (capabilities != null &&
-      (capabilities.isTelevision || capabilities.isFireTv)) {
-    return vp.VideoViewType.platformView;
-  }
-  return vp.VideoViewType.textureView;
+  return vp.VideoViewType.platformView;
 }
 
 bool shouldUseAndroidPhoneUi(AndroidMediaCapabilities? capabilities) {

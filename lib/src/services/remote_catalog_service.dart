@@ -331,6 +331,127 @@ class RemoteCatalogService {
     return candidates;
   }
 
+  Future<List<RemoteSearchCandidate>> fetchAnimeAv1RelationsForSeries(
+    SeriesItem series, {
+    int limit = 15,
+  }) async {
+    var seriesUrl = _animeAv1SeriesUrlFromSeries(series);
+    if (seriesUrl.isEmpty) {
+      seriesUrl = await _resolveAnimeAv1SeriesUrlForRelations(series);
+    }
+    if (seriesUrl.isEmpty) {
+      return const [];
+    }
+    final response = await _get(Uri.parse(seriesUrl));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw RemoteCatalogException(
+        'AnimeAV1 relacionados respondio ${response.statusCode}',
+      );
+    }
+    return _parseAnimeAv1Relations(response.body)
+        .take(limit.clamp(1, 25).toInt())
+        .toList(growable: false);
+  }
+
+  Future<String> _resolveAnimeAv1SeriesUrlForRelations(
+      SeriesItem series) async {
+    final queries = <String>{
+      series.name,
+      series.japaneseTitle,
+      ...series.aliases,
+    }.map(_cleanRemoteText).where((entry) => entry.isNotEmpty);
+    RemoteSearchCandidate? best;
+    var bestScore = 0;
+    for (final query in queries) {
+      try {
+        final matches =
+            await searchAnimeAv1(query, releaseYear: series.releaseYear);
+        for (final candidate in matches) {
+          final score = _scoreProviderCandidate(series, candidate);
+          if (score > bestScore) {
+            best = candidate;
+            bestScore = score;
+          }
+        }
+      } catch (_) {
+        // AnimeAV1 relations are an enhancement; keep similar loading alive.
+      }
+    }
+    if (best == null || bestScore < 520) {
+      return '';
+    }
+    final resolved = best;
+    return _normalizeAnimeAv1SeriesUrl(
+      resolved.seriesUrl.isNotEmpty ? resolved.seriesUrl : resolved.slug,
+    );
+  }
+
+  Future<List<RemoteSearchCandidate>> fetchAniListRelationsForSeries(
+    SeriesItem series, {
+    int limit = 15,
+  }) async {
+    final anilistId = _anilistIdFromSeries(series);
+    final decoded = await _postAniList({
+      'query': anilistId > 0
+          ? r'''query Relations($id: Int) {
+              Media(id: $id, type: ANIME) {
+                relations {
+                  edges { relationType(version: 2) node { ...RelatedMedia } }
+                }
+              }
+            }
+            fragment RelatedMedia on Media {
+              id idMal type title { romaji english native } synonyms
+              coverImage { extraLarge large } bannerImage description
+              averageScore episodes format startDate { year month day }
+            }'''
+          : r'''query Relations($search: String, $year: Int) {
+              Media(search: $search, seasonYear: $year, type: ANIME) {
+                relations {
+                  edges { relationType(version: 2) node { ...RelatedMedia } }
+                }
+              }
+            }
+            fragment RelatedMedia on Media {
+              id idMal type title { romaji english native } synonyms
+              coverImage { extraLarge large } bannerImage description
+              averageScore episodes format startDate { year month day }
+            }''',
+      'variables': {
+        if (anilistId > 0) 'id': anilistId else 'search': series.name,
+        if (anilistId <= 0 && series.releaseYear > 0)
+          'year': series.releaseYear,
+      },
+    });
+    final data = decoded['data'];
+    final media = data is Map ? data['Media'] : null;
+    final relations = media is Map ? media['relations'] : null;
+    final edges = relations is Map ? relations['edges'] : null;
+    if (edges is! List) {
+      return const [];
+    }
+    return edges
+        .whereType<Map>()
+        .map((edge) {
+          final node = edge['node'];
+          if (node is! Map ||
+              _readString(node['type']).toUpperCase() != 'ANIME') {
+            return null;
+          }
+          final relationLabel = _anilistRelationLabel(
+            _readString(edge['relationType']),
+          );
+          return _copyCandidate(
+            _candidateFromAniList(Map<String, dynamic>.from(node)),
+            relationLabel: relationLabel,
+          );
+        })
+        .whereType<RemoteSearchCandidate>()
+        .where((candidate) => candidate.title.isNotEmpty)
+        .take(limit.clamp(1, 25).toInt())
+        .toList(growable: false);
+  }
+
   Future<List<RemoteSearchCandidate>> fetchAniListRecommendationsForSeries(
     SeriesItem series, {
     int limit = 15,
@@ -6034,6 +6155,26 @@ $airingScheduleFields
     };
   }
 
+  String _anilistRelationLabel(String value) {
+    final normalized = value.trim().toUpperCase();
+    return switch (normalized) {
+      'ADAPTATION' => 'Adaptacion',
+      'PREQUEL' => 'Precuela',
+      'SEQUEL' => 'Secuela',
+      'PARENT' => 'Historia Principal',
+      'SIDE_STORY' => 'Historia Lateral',
+      'CHARACTER' => 'Personaje',
+      'SUMMARY' => 'Resumen',
+      'ALTERNATIVE' => 'Version Alternativa',
+      'SPIN_OFF' => 'Spin-off',
+      'OTHER' => 'Otro',
+      'SOURCE' => 'Fuente',
+      'COMPILATION' => 'Compilacion',
+      'CONTAINS' => 'Contiene',
+      _ => value,
+    };
+  }
+
   String _anilistDateIso(Map<String, dynamic> date) {
     final year = _readInt(date['year']);
     final month = _readInt(date['month']);
@@ -10282,6 +10423,112 @@ $airingScheduleFields
     return results;
   }
 
+  String _animeAv1SeriesUrlFromSeries(SeriesItem series) {
+    if (series.provider == RemoteProvider.animeAv1 && series.slug.isNotEmpty) {
+      final seriesUrl = _normalizeAnimeAv1SeriesUrl(series.slug);
+      if (seriesUrl.isNotEmpty) {
+        return seriesUrl;
+      }
+    }
+    final urls = <String>[
+      series.watchUrl,
+      ...series.episodes.map((episode) => episode.watchUrl),
+    ];
+    for (final url in urls) {
+      if (!url.contains('animeav1.com')) {
+        continue;
+      }
+      final normalized = _normalizeAnimeAv1SeriesUrl(url);
+      if (normalized.isNotEmpty) {
+        return normalized;
+      }
+    }
+    return '';
+  }
+
+  List<RemoteSearchCandidate> _parseAnimeAv1Relations(String html) {
+    final decodedHtml = _decodeHtml(html).replaceAll(r'\/', '/');
+    final startMatch = RegExp(
+      r'>\s*Relacionados\s*<',
+      caseSensitive: false,
+    ).firstMatch(decodedHtml);
+    if (startMatch == null) {
+      return const [];
+    }
+    final start = startMatch.start;
+    final endMatch = RegExp(
+      r'>\s*Episodios\s*<',
+      caseSensitive: false,
+    ).firstMatch(decodedHtml.substring(start));
+    final end = endMatch == null ? -1 : start + endMatch.start;
+    final section =
+        end > start ? decodedHtml.substring(start, end) : decodedHtml;
+    final itemMatches = RegExp(
+      r'<div\s+class="[^"]*group/item[^"]*"[^>]*>',
+      caseSensitive: false,
+    ).allMatches(section).toList(growable: false);
+    final seen = <String>{};
+    final results = <RemoteSearchCandidate>[];
+    for (var index = 0; index < itemMatches.length; index += 1) {
+      final start = itemMatches[index].start;
+      final end = index + 1 < itemMatches.length
+          ? itemMatches[index + 1].start
+          : section.length;
+      final block = section.substring(start, end);
+      final year = int.tryParse(
+            RegExp(r'>(\d{4})<').firstMatch(block)?.group(1) ?? '',
+          ) ??
+          0;
+      final imageUrl = _normalizeUrl(
+        _cleanRemoteUrl(
+          RegExp(
+                r'<img[^>]+src="([^"]+)"',
+                caseSensitive: false,
+              ).firstMatch(block)?.group(1) ??
+              '',
+        ),
+        _animeAv1BaseUrl,
+      );
+      final title = _cleanRemoteText(
+        RegExp(
+              r'<h3[^>]*>([\s\S]*?)</h3>',
+              caseSensitive: false,
+            ).firstMatch(block)?.group(1) ??
+            '',
+      );
+      final relationLabel = _cleanRemoteText(
+        RegExp(
+              r'</h3>\s*<span[^>]*>([\s\S]*?)</span>',
+              caseSensitive: false,
+            ).firstMatch(block)?.group(1) ??
+            '',
+      );
+      final seriesPath = (RegExp(
+                r'<a[^>]+href="(/media/[^"]+)"',
+                caseSensitive: false,
+              ).firstMatch(block)?.group(1) ??
+              '')
+          .trim();
+      final slug = _extractAnimeAv1Slug(seriesPath);
+      if (slug.isEmpty || title.isEmpty || !seen.add(slug)) {
+        continue;
+      }
+      results.add(
+        RemoteSearchCandidate(
+          provider: RemoteProvider.animeAv1,
+          slug: slug,
+          title: title,
+          seriesUrl: _normalizeUrl(seriesPath, _animeAv1BaseUrl),
+          imageUrl: imageUrl,
+          releaseYear: year,
+          airDateIso: year > 0 ? '$year-01-01' : '',
+          relationLabel: relationLabel,
+        ),
+      );
+    }
+    return results;
+  }
+
   List<RemoteSearchCandidate> _parseJkAnimeResults(
       String html, int fallbackReleaseYear) {
     final directory = _parseJkAnimeDirectoryResults(html, fallbackReleaseYear);
@@ -10495,6 +10742,7 @@ $airingScheduleFields
     int? catalogId,
     List<String>? cast,
     List<SeriesEpisodeMetadata>? episodeDetails,
+    String? relationLabel,
   }) {
     return RemoteSearchCandidate(
       provider: candidate.provider,
@@ -10517,6 +10765,7 @@ $airingScheduleFields
       catalogId: catalogId ?? candidate.catalogId,
       cast: cast ?? candidate.cast,
       episodeDetails: episodeDetails ?? candidate.episodeDetails,
+      relationLabel: relationLabel ?? candidate.relationLabel,
     );
   }
 

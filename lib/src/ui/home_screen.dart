@@ -14,7 +14,7 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
-const _appVersionLabel = '1.7.4';
+const _appVersionLabel = '1.7.5';
 String? _lastFocusedHomeShelfId;
 DateTime _suppressHomeActivationUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -1126,17 +1126,19 @@ class _HomeScreenState extends State<HomeScreen> {
       _detailSimilarStatus = 'Buscando similares...';
       _detailSimilarResults = const [];
     });
-    final result = await widget.controller.loadSimilarCandidates(series);
-    if (!mounted ||
-        request != _detailSimilarRequest ||
-        _selectedSeries?.stableKey != seriesKey) {
-      return;
+    await for (final update
+        in widget.controller.loadSimilarCandidatesProgressively(series)) {
+      if (!mounted ||
+          request != _detailSimilarRequest ||
+          _selectedSeries?.stableKey != seriesKey) {
+        return;
+      }
+      setState(() {
+        _detailSimilarResults = update.candidates.take(12).toList();
+        _detailSimilarStatus = update.status;
+        _detailSimilarLoading = update.loading;
+      });
     }
-    setState(() {
-      _detailSimilarResults = result.candidates.take(12).toList();
-      _detailSimilarStatus = result.status;
-      _detailSimilarLoading = false;
-    });
   }
 
   String get _detailBackLabel {
@@ -5287,46 +5289,52 @@ class _DetailSimilarCarousel extends StatelessWidget {
         const SizedBox(height: 8),
         SizedBox(
           height: posterHeight + 16,
-          child: loading
-              ? const Center(child: CircularProgressIndicator())
-              : candidates.isEmpty
-                  ? const _EmptyState(
+          child: candidates.isEmpty
+              ? loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : const _EmptyState(
                       icon: Icons.travel_explore,
                       title: 'Sin similares',
                       message:
                           'No encontre series relacionadas para esta ficha.',
                     )
-                  : _HorizontalFocusShelf(
-                      child: ListView.separated(
-                        clipBehavior: Clip.hardEdge,
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.fromLTRB(0, 2, 18, 6),
-                        itemBuilder: (context, index) {
-                          final candidate = candidates[index];
-                          return SizedBox(
-                            width: posterWidth,
-                            height: posterHeight,
-                            child: _SearchResultPosterCard(
-                              candidate: candidate,
-                              imported: controller.findRemoteSeriesForCandidate(
-                                    candidate,
-                                  ) !=
-                                  null,
-                              onTap: () => onCandidateSelected(candidate),
-                              onArrowRightEdge: () {
-                                if (!episodeListFocusNode.canRequestFocus) {
-                                  return KeyEventResult.ignored;
-                                }
-                                episodeListFocusNode.requestFocus();
-                                return KeyEventResult.handled;
-                              },
-                            ),
-                          );
-                        },
-                        separatorBuilder: (_, __) => const SizedBox(width: 8),
-                        itemCount: candidates.length,
-                      ),
-                    ),
+              : _HorizontalFocusShelf(
+                  child: ListView.separated(
+                    clipBehavior: Clip.hardEdge,
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.fromLTRB(0, 2, 18, 6),
+                    itemBuilder: (context, index) {
+                      final candidate = candidates[index];
+                      return _CandidateFadeIn(
+                        key: ValueKey(
+                          'detail-similar-${_homeCandidateKey(candidate)}-${candidate.relationLabel}',
+                        ),
+                        index: index,
+                        child: SizedBox(
+                          width: posterWidth,
+                          height: posterHeight,
+                          child: _SearchResultPosterCard(
+                            candidate: candidate,
+                            imported: controller.findRemoteSeriesForCandidate(
+                                  candidate,
+                                ) !=
+                                null,
+                            onTap: () => onCandidateSelected(candidate),
+                            onArrowRightEdge: () {
+                              if (!episodeListFocusNode.canRequestFocus) {
+                                return KeyEventResult.ignored;
+                              }
+                              episodeListFocusNode.requestFocus();
+                              return KeyEventResult.handled;
+                            },
+                          ),
+                        ),
+                      );
+                    },
+                    separatorBuilder: (_, __) => const SizedBox(width: 8),
+                    itemCount: candidates.length,
+                  ),
+                ),
         ),
       ],
     );
@@ -5379,50 +5387,52 @@ class _SimilarPanel extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           Expanded(
-            child: loading
-                ? const Center(child: CircularProgressIndicator())
-                : candidates.isEmpty
-                    ? const _EmptyState(
+            child: candidates.isEmpty
+                ? loading
+                    ? const Center(child: CircularProgressIndicator())
+                    : const _EmptyState(
                         icon: Icons.travel_explore,
                         title: 'Sin similares',
                         message:
                             'No encontre series relacionadas para esta ficha.',
                       )
-                    : LayoutBuilder(
-                        builder: (context, constraints) {
-                          var columns = constraints.maxWidth ~/ 166;
-                          if (columns < 2) {
-                            columns = 2;
-                          } else if (columns > 5) {
-                            columns = 5;
-                          }
-                          return GridView.builder(
-                            clipBehavior: Clip.none,
-                            padding:
-                                const EdgeInsets.only(bottom: 12, right: 8),
-                            gridDelegate:
-                                SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: columns,
-                              mainAxisExtent: 208,
-                              crossAxisSpacing: 12,
-                              mainAxisSpacing: 12,
+                : LayoutBuilder(
+                    builder: (context, constraints) {
+                      var columns = constraints.maxWidth ~/ 166;
+                      if (columns < 2) {
+                        columns = 2;
+                      } else if (columns > 5) {
+                        columns = 5;
+                      }
+                      return GridView.builder(
+                        clipBehavior: Clip.none,
+                        padding: const EdgeInsets.only(bottom: 12, right: 8),
+                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: columns,
+                          mainAxisExtent: 208,
+                          crossAxisSpacing: 12,
+                          mainAxisSpacing: 12,
+                        ),
+                        itemCount: candidates.length,
+                        itemBuilder: (context, index) {
+                          final candidate = candidates[index];
+                          return _CandidateFadeIn(
+                            key: ValueKey(
+                              'similar-panel-${_homeCandidateKey(candidate)}-${candidate.relationLabel}',
                             ),
-                            itemCount: candidates.length,
-                            itemBuilder: (context, index) {
-                              final candidate = candidates[index];
-                              return _SearchResultPosterCard(
-                                candidate: candidate,
-                                imported:
-                                    controller.findRemoteSeriesForCandidate(
-                                            candidate) !=
-                                        null,
-                                onTap: () =>
-                                    onRemoteCandidateSelected(candidate),
-                              );
-                            },
+                            index: index,
+                            child: _SearchResultPosterCard(
+                              candidate: candidate,
+                              imported: controller.findRemoteSeriesForCandidate(
+                                      candidate) !=
+                                  null,
+                              onTap: () => onRemoteCandidateSelected(candidate),
+                            ),
                           );
                         },
-                      ),
+                      );
+                    },
+                  ),
           ),
         ],
       ),
@@ -7564,6 +7574,37 @@ class _SearchFilterButton extends StatelessWidget {
   }
 }
 
+class _CandidateFadeIn extends StatelessWidget {
+  const _CandidateFadeIn({
+    required this.index,
+    required this.child,
+    super.key,
+  });
+
+  final int index;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final delay = (index.clamp(0, 6) * 35).toInt();
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: Duration(milliseconds: 180 + delay),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, 8 * (1 - value)),
+            child: child,
+          ),
+        );
+      },
+      child: child,
+    );
+  }
+}
+
 class _SearchResultPosterCard extends StatelessWidget {
   const _SearchResultPosterCard({
     required this.candidate,
@@ -7590,6 +7631,7 @@ class _SearchResultPosterCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheduleLabel = _candidateScheduleChipLabel(candidate);
+    final relationLabel = candidate.relationLabel.trim();
     return _FocusablePosterSurface(
       focusNode: focusNode,
       onTap: onTap,
@@ -7642,6 +7684,10 @@ class _SearchResultPosterCard extends StatelessWidget {
                 ],
                 if (showScheduleChip && scheduleLabel.isNotEmpty)
                   _ScheduleChip(text: scheduleLabel),
+                if (relationLabel.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  _RelationChip(text: relationLabel),
+                ],
               ],
             ),
           ),
@@ -9405,6 +9451,9 @@ RemoteSearchCandidate _mergeCandidateVisuals(
     catalogId: base.catalogId,
     cast: refreshed.cast.isNotEmpty ? refreshed.cast : base.cast,
     episodeDetails: base.episodeDetails,
+    relationLabel: base.relationLabel.isNotEmpty
+        ? base.relationLabel
+        : refreshed.relationLabel,
   );
 }
 
@@ -10739,6 +10788,43 @@ class _ScheduleChip extends StatelessWidget {
           color: const Color(0xFFF9FCFF),
           fontSize: fontSize,
           fontWeight: FontWeight.w900,
+        ),
+      ),
+    );
+  }
+}
+
+class _RelationChip extends StatelessWidget {
+  const _RelationChip({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final horizontalPadding = _homeResponsiveValue(context, 8, min: 6, max: 10);
+    final verticalPadding = _homeResponsiveValue(context, 4, min: 3, max: 6);
+    final fontSize = _homeResponsiveValue(context, 10, min: 9, max: 13);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 118),
+      child: Container(
+        padding: EdgeInsets.symmetric(
+          horizontal: horizontalPadding,
+          vertical: verticalPadding,
+        ),
+        decoration: BoxDecoration(
+          color: const Color(0xDD2A1F45),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0x88BDA7FF)),
+        ),
+        child: Text(
+          text,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: const Color(0xFFF2ECFF),
+            fontSize: fontSize,
+            fontWeight: FontWeight.w900,
+          ),
         ),
       ),
     );

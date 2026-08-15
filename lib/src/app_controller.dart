@@ -49,6 +49,17 @@ enum SearchFormatFilter {
   }
 }
 
+typedef SimilarCandidatesLoadResult = ({
+  List<RemoteSearchCandidate> candidates,
+  String status,
+});
+
+typedef SimilarCandidatesProgress = ({
+  List<RemoteSearchCandidate> candidates,
+  String status,
+  bool loading,
+});
+
 class SearchSeasonFilter {
   const SearchSeasonFilter({
     this.season = '',
@@ -1918,55 +1929,163 @@ class AppController extends ChangeNotifier {
     return null;
   }
 
-  Future<({List<RemoteSearchCandidate> candidates, String status})>
-      loadSimilarCandidates(SeriesItem series) async {
+  Future<SimilarCandidatesLoadResult> loadSimilarCandidates(
+    SeriesItem series,
+  ) async {
+    SimilarCandidatesLoadResult latest = (
+      candidates: const <RemoteSearchCandidate>[],
+      status: 'Buscando similares...',
+    );
+    await for (final update in loadSimilarCandidatesProgressively(series)) {
+      latest = (candidates: update.candidates, status: update.status);
+    }
+    return latest;
+  }
+
+  Stream<SimilarCandidatesProgress> loadSimilarCandidatesProgressively(
+    SeriesItem series,
+  ) async* {
     final related = <RemoteSearchCandidate>[];
+    var usedRelations = false;
     var usedRecommendations = false;
     var usedTitleFallback = false;
     final normalizedTitle = normalizeSeriesKey(
       _stripProviderSuffix(series.name),
     );
 
+    List<RemoteSearchCandidate> currentCandidates() {
+      return _dedupeCandidates(_activeRemoteCandidates(related))
+          .where((candidate) {
+            if (series.catalogId > 0 &&
+                candidate.catalogId == series.catalogId) {
+              return false;
+            }
+            return normalizeSeriesKey(candidate.title) != normalizedTitle;
+          })
+          .take(15)
+          .toList();
+    }
+
+    String currentStatus({
+      required List<RemoteSearchCandidate> candidates,
+      required bool loading,
+    }) {
+      if (candidates.isEmpty) {
+        return loading
+            ? 'Buscando relacionados y similares...'
+            : 'No encontre series similares para esta ficha todavia.';
+      }
+      if (loading) {
+        return usedRelations
+            ? 'Relacionados primero; cargando mas similares...'
+            : 'Cargando recomendaciones similares...';
+      }
+      return switch ((usedRelations, usedRecommendations, usedTitleFallback)) {
+        (true, true, _) =>
+          'Relacionados primero, luego recomendaciones similares.',
+        (true, false, _) => 'Relacionados directos de esta ficha.',
+        (false, true, _) =>
+          'Basado en recomendaciones de anime similares y afinidad del catalogo.',
+        (false, false, true) => 'Titulos con un nombre parecido.',
+        _ => 'Series cercanas a esta para seguir explorando.',
+      };
+    }
+
+    var candidates = currentCandidates();
+    yield (
+      candidates: candidates,
+      status: currentStatus(candidates: candidates, loading: true),
+      loading: true,
+    );
+
+    try {
+      final relations =
+          await _remoteCatalog.fetchAnimeAv1RelationsForSeries(series);
+      if (relations.isNotEmpty) {
+        related.addAll(relations);
+        usedRelations = true;
+        candidates = currentCandidates();
+        yield (
+          candidates: candidates,
+          status: currentStatus(candidates: candidates, loading: true),
+          loading: true,
+        );
+      }
+    } catch (_) {
+      // AnimeAV1 relations only exist for AnimeAV1-backed entries.
+    }
+
+    try {
+      final relations =
+          await _remoteCatalog.fetchAniListRelationsForSeries(series);
+      if (relations.isNotEmpty) {
+        related.addAll(relations);
+        usedRelations = true;
+        candidates = currentCandidates();
+        yield (
+          candidates: candidates,
+          status: currentStatus(candidates: candidates, loading: true),
+          loading: true,
+        );
+      }
+    } catch (_) {
+      // AniList is opportunistic and can be rate limited or temporarily down.
+    }
+
     try {
       final recommendations =
           await _remoteCatalog.fetchAniListRecommendationsForSeries(series);
       if (recommendations.isNotEmpty) {
-        related.addAll(recommendations);
+        related.addAll(_sortByPreferredProvider(recommendations));
         usedRecommendations = true;
+        candidates = currentCandidates();
+        yield (
+          candidates: candidates,
+          status: currentStatus(candidates: candidates, loading: true),
+          loading: true,
+        );
       }
     } catch (_) {
       // Jikan remains available below when AniList is rate limited.
     }
 
-    if (related.isEmpty) {
-      final malId = await _remoteCatalog.resolveMyAnimeListIdForSeries(series);
-      if (malId > 0) {
-        try {
-          final recommendations =
-              await _remoteCatalog.fetchCatalogRecommendations(malId);
-          if (recommendations.isNotEmpty) {
-            related.addAll(recommendations);
-            usedRecommendations = true;
-          }
-        } catch (_) {
-          // The public MAL page remains available when Jikan cannot reach MAL.
+    final malId = await _remoteCatalog.resolveMyAnimeListIdForSeries(series);
+    if (malId > 0) {
+      try {
+        final recommendations =
+            await _remoteCatalog.fetchCatalogRecommendations(malId);
+        if (recommendations.isNotEmpty) {
+          related.addAll(_sortByPreferredProvider(recommendations));
+          usedRecommendations = true;
+          candidates = currentCandidates();
+          yield (
+            candidates: candidates,
+            status: currentStatus(candidates: candidates, loading: true),
+            loading: true,
+          );
         }
-        if (related.isEmpty) {
-          try {
-            final recommendations =
-                await _remoteCatalog.fetchMyAnimeListWebRecommendations(malId);
-            if (recommendations.isNotEmpty) {
-              related.addAll(recommendations);
-              usedRecommendations = true;
-            }
-          } catch (_) {
-            // The empty state below is preferable to unrelated title matches.
-          }
+      } catch (_) {
+        // The public MAL page remains available when Jikan cannot reach MAL.
+      }
+      try {
+        final recommendations =
+            await _remoteCatalog.fetchMyAnimeListWebRecommendations(malId);
+        if (recommendations.isNotEmpty) {
+          related.addAll(_sortByPreferredProvider(recommendations));
+          usedRecommendations = true;
+          candidates = currentCandidates();
+          yield (
+            candidates: candidates,
+            status: currentStatus(candidates: candidates, loading: true),
+            loading: true,
+          );
         }
+      } catch (_) {
+        // The empty state below is preferable to unrelated title matches.
       }
     }
 
-    if (related.isEmpty && normalizedTitle.isNotEmpty) {
+    if (currentCandidates().isEmpty && normalizedTitle.isNotEmpty) {
       try {
         final matches = await _remoteCatalog.search(
           _stripProviderSuffix(series.name),
@@ -1986,35 +2105,24 @@ class AppController extends ChangeNotifier {
         if (similarMatches.isNotEmpty) {
           related.addAll(similarMatches);
           usedTitleFallback = true;
+          candidates = currentCandidates();
+          yield (
+            candidates: candidates,
+            status: currentStatus(candidates: candidates, loading: true),
+            loading: true,
+          );
         }
       } catch (_) {
         // Keep the honest empty state when every source is unavailable.
       }
     }
 
-    final candidates = _dedupeCandidates(
-      usedTitleFallback
-          ? _activeRemoteCandidates(related)
-          : _sortByPreferredProvider(_activeRemoteCandidates(related)),
-    )
-        .where((candidate) {
-          if (series.catalogId > 0 && candidate.catalogId == series.catalogId) {
-            return false;
-          }
-          return normalizeSeriesKey(candidate.title) != normalizedTitle;
-        })
-        .take(15)
-        .toList();
-
-    final status =
-        switch ((candidates.isEmpty, usedRecommendations, usedTitleFallback)) {
-      (true, _, _) => 'No encontre series similares para esta ficha todavia.',
-      (false, true, _) =>
-        'Basado en recomendaciones de anime similares y afinidad del catalogo.',
-      (false, false, true) => 'Titulos con un nombre parecido.',
-      _ => 'Series cercanas a esta para seguir explorando.',
-    };
-    return (candidates: candidates, status: status);
+    candidates = currentCandidates();
+    yield (
+      candidates: candidates,
+      status: currentStatus(candidates: candidates, loading: false),
+      loading: false,
+    );
   }
 
   int _similarTitleFallbackScore(String requested, String candidate) {
@@ -2867,6 +2975,10 @@ class AppController extends ChangeNotifier {
         candidates,
         (candidate) => candidate.episodeDetails,
       ),
+      relationLabel: _firstCandidateText(
+        candidates,
+        (candidate) => candidate.relationLabel,
+      ),
     );
   }
 
@@ -2920,6 +3032,7 @@ class AppController extends ChangeNotifier {
       episodeDetails: candidate.episodeDetails.isNotEmpty
           ? candidate.episodeDetails
           : cached.episodeDetails,
+      relationLabel: candidate.relationLabel,
     );
   }
 

@@ -497,7 +497,11 @@ Solo en la oscuridad, la luz.
     );
     expect(
       androidVideoViewTypeForCapabilities(tabletCapabilities),
-      vp.VideoViewType.textureView,
+      vp.VideoViewType.platformView,
+    );
+    expect(
+      androidVideoViewTypeForCapabilities(phoneCapabilities),
+      vp.VideoViewType.platformView,
     );
     expect(
       androidVideoViewTypeForCapabilities(

@@ -192,6 +192,123 @@ void main() {
     expect(recommendations.first.catalogId, 40437);
   });
 
+  test('parses AnimeAV1 related media with relation labels', () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(
+          request.url.toString(),
+          'https://animeav1.com/media/danmachi-iii',
+        );
+        return http.Response('''
+          <section>
+            <h2 class="text-lead">Relacionados</h2>
+            <div class="group/item flex w-72">
+              <div class="rounded px-2">2019</div>
+              <article>
+                <img src="https://cdn.animeav1.com/covers/241.jpg">
+                <h3>Dungeon ni Deai wo Motomeru no wa Machigatteiru Darou ka II</h3>
+                <span>Precuela</span>
+                <a href="/media/danmachi-ii"><span>ver</span></a>
+              </article>
+            </div>
+            <div class="group/item flex w-72">
+              <div class="rounded px-2">2022</div>
+              <article>
+                <img src="https://cdn.animeav1.com/covers/243.jpg">
+                <h3>Dungeon ni Deai wo Motomeru no wa Machigatteiru Darou ka IV</h3>
+                <span>Secuela</span>
+                <a href="/media/danmachi-iv"><span>ver</span></a>
+              </article>
+            </div>
+          </section>
+          <section><h2>Episodios</h2></section>
+        ''', 200, request: request);
+      }),
+    );
+    final series = const RemoteSearchCandidate(
+      provider: RemoteProvider.animeAv1,
+      slug: 'danmachi-iii',
+      title: 'Danmachi III',
+      seriesUrl: 'https://animeav1.com/media/danmachi-iii',
+      episodeCount: 12,
+    ).toSeries(existingNames: const []);
+
+    final related = await service.fetchAnimeAv1RelationsForSeries(series);
+
+    expect(related.map((candidate) => candidate.slug), [
+      'danmachi-ii',
+      'danmachi-iv',
+    ]);
+    expect(related.map((candidate) => candidate.relationLabel), [
+      'Precuela',
+      'Secuela',
+    ]);
+    expect(related.first.releaseYear, 2019);
+    expect(
+      related.first.seriesUrl,
+      'https://animeav1.com/media/danmachi-ii',
+    );
+  });
+
+  test('finds AnimeAV1 relations for catalog series by matching title',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        if (request.url.path == '/catalogo') {
+          expect(request.url.queryParameters['search'], 'Koukaku Kidoutai');
+          expect(request.url.queryParameters['minYear'], '1995');
+          expect(request.url.queryParameters['maxYear'], '1995');
+          return http.Response('''
+            <article class="group/item">
+              <img src="https://cdn.animeav1.com/covers/git.jpg">
+              <div class="rounded bg-line">Pelicula</div>
+              <h3>Koukaku Kidoutai</h3>
+              <a href="/media/koukaku-kidoutai"></a>
+            </article>
+          ''', 200, request: request);
+        }
+        expect(
+          request.url.toString(),
+          'https://animeav1.com/media/koukaku-kidoutai',
+        );
+        return http.Response('''
+          <section>
+            <h2>Relacionados</h2>
+            <div class="group/item flex w-72">
+              <div class="rounded px-2">2004</div>
+              <article>
+                <img src="https://cdn.animeav1.com/covers/gits2.jpg">
+                <h3>Ghost in The Shell 2: Innocence</h3>
+                <span>Secuela</span>
+                <a href="/media/ghost-in-the-shell-2-innocence"></a>
+              </article>
+            </div>
+          </section>
+          <section><h2>Episodios</h2></section>
+        ''', 200, request: request);
+      }),
+    );
+    final series = const RemoteSearchCandidate(
+      provider: RemoteProvider.catalog,
+      slug: '43',
+      title: 'Koukaku Kidoutai',
+      releaseYear: 1995,
+      format: 'Movie',
+      catalogId: 43,
+    ).toSeries(existingNames: const []);
+
+    final related = await service.fetchAnimeAv1RelationsForSeries(series);
+
+    expect(related.map((candidate) => candidate.title), [
+      'Ghost in The Shell 2: Innocence',
+    ]);
+    expect(related.single.relationLabel, 'Secuela');
+    expect(
+      related.single.seriesUrl,
+      'https://animeav1.com/media/ghost-in-the-shell-2-innocence',
+    );
+  });
+
   test('parses recommendations from the public MyAnimeList page', () async {
     final service = RemoteCatalogService(
       client: MockClient((request) async {
