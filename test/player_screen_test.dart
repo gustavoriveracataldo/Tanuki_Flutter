@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:toonami_viernes_noche_flutter/src/models.dart';
 import 'package:toonami_viernes_noche_flutter/src/ui/player_screen.dart';
+import 'package:video_player/video_player.dart' as vp;
 
 void main() {
   test('parses WebVTT cues with spaces around the timestamp separator', () {
@@ -164,6 +165,22 @@ Solo en la oscuridad, la luz.
     );
   });
 
+  test('watches AnimeAV1 MP4Upload AV1 streams for missing video frames', () {
+    expect(
+      shouldWatchAnimeAv1VideoFrame(
+        RemoteProvider.animeAv1,
+        const RemoteDirectStream(
+          playbackUrl: 'http://127.0.0.1:44519/media',
+          playbackKind: 'mp4',
+          pageUrl: 'https://www.mp4upload.com/embed-demo.html',
+          provider: RemoteProvider.animeAv1,
+          server: 'mp4upload',
+        ),
+      ),
+      isTrue,
+    );
+  });
+
   test('does not watch non AnimeAV1 streams for missing video frames', () {
     expect(
       shouldWatchAnimeAv1VideoFrame(
@@ -228,6 +245,173 @@ Solo en la oscuridad, la luz.
       ),
       isFalse,
     );
+  });
+
+  test('builds stable VLC profile for AnimeAV1 MP4Upload streams', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'http://127.0.0.1:44519/media',
+      playbackKind: 'mp4',
+      pageUrl: 'https://www.mp4upload.com/embed-demo.html',
+      provider: RemoteProvider.animeAv1,
+      server: 'mp4upload',
+    );
+    final args = desktopVlcCommandlineArguments(
+      stream: stream,
+      audioSlave: '',
+      referer: 'https://www.mp4upload.com/embed-demo.html',
+    );
+
+    expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
+    expect(shouldDeferAndroidExoInitialSeek(stream), isTrue);
+    expect(args, contains('--network-caching=20000'));
+    expect(args, contains('--file-caching=20000'));
+    expect(args, contains('--clock-jitter=0'));
+    expect(args, contains('--clock-synchro=0'));
+    expect(args, contains('--no-drop-late-frames'));
+    expect(
+      args,
+      contains('--http-referrer=https://www.mp4upload.com/embed-demo.html'),
+    );
+  });
+
+  test('calculates buffered time ahead of the current position', () {
+    final ahead = bufferedAheadForPosition(
+      position: const Duration(seconds: 12),
+      ranges: [
+        vp.DurationRange(
+          const Duration(seconds: 0),
+          const Duration(seconds: 5),
+        ),
+        vp.DurationRange(
+          const Duration(seconds: 10),
+          const Duration(seconds: 25),
+        ),
+      ],
+    );
+
+    expect(ahead, const Duration(seconds: 13));
+  });
+
+  test('ignores buffered ranges that do not cover current position', () {
+    final ahead = bufferedAheadForPosition(
+      position: const Duration(seconds: 12),
+      ranges: [
+        vp.DurationRange(
+          const Duration(seconds: 15),
+          const Duration(seconds: 30),
+        ),
+      ],
+    );
+
+    expect(ahead, Duration.zero);
+  });
+
+  test('holds mid-play rebuffer for stable AnimeAV1 MP4Upload streams', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'http://127.0.0.1:44519/media',
+      playbackKind: 'mp4',
+      pageUrl: 'https://www.mp4upload.com/embed-demo.html',
+      provider: RemoteProvider.animeAv1,
+      server: 'mp4upload',
+    );
+
+    expect(
+      shouldHoldStableRemoteAv1Rebuffer(
+        stream: stream,
+        openedMedia: true,
+        isBuffering: true,
+        isPlaying: true,
+        position: const Duration(seconds: 42),
+        holdActive: false,
+      ),
+      isTrue,
+    );
+  });
+
+  test('does not hold rebuffer before playback is established', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'http://127.0.0.1:44519/media',
+      playbackKind: 'mp4',
+      pageUrl: 'https://www.mp4upload.com/embed-demo.html',
+      provider: RemoteProvider.animeAv1,
+      server: 'mp4upload',
+    );
+
+    expect(
+      shouldHoldStableRemoteAv1Rebuffer(
+        stream: stream,
+        openedMedia: false,
+        isBuffering: true,
+        isPlaying: true,
+        position: const Duration(seconds: 42),
+        holdActive: false,
+      ),
+      isFalse,
+    );
+  });
+
+  test('does not hold rebuffer for ordinary remote streams', () {
+    expect(
+      shouldHoldStableRemoteAv1Rebuffer(
+        stream: const RemoteDirectStream(
+          playbackUrl: 'https://cdn.example.test/demo.m3u8',
+          playbackKind: 'hls',
+          pageUrl: 'https://jkanime.net/demo/1/',
+          provider: RemoteProvider.jkAnime,
+        ),
+        openedMedia: true,
+        isBuffering: true,
+        isPlaying: true,
+        position: const Duration(seconds: 42),
+        holdActive: false,
+      ),
+      isFalse,
+    );
+  });
+
+  test('keeps default VLC profile for ordinary remote streams', () {
+    final args = desktopVlcCommandlineArguments(
+      stream: const RemoteDirectStream(
+        playbackUrl: 'https://cdn.example.test/demo.m3u8',
+        playbackKind: 'hls',
+        pageUrl: 'https://jkanime.net/demo/1/',
+        provider: RemoteProvider.jkAnime,
+      ),
+      audioSlave: '',
+      referer: '',
+    );
+
+    expect(args, contains('--network-caching=3000'));
+    expect(args, isNot(contains('--file-caching=9000')));
+    expect(args, isNot(contains('--clock-synchro=0')));
+  });
+
+  test('defers initial resume seek for JKAnime Magi HLS streams', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'https://nika.playmudos.com/demo.m3u8',
+      playbackKind: 'hls',
+      pageUrl: 'https://jkanime.net/jkplayer/umv?e=demo',
+      provider: RemoteProvider.jkAnime,
+      server: 'magi',
+    );
+
+    expect(shouldDeferRemoteHlsInitialSeek(stream), isTrue);
+    expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
+    expect(shouldDeferAndroidExoInitialSeek(stream), isTrue);
+  });
+
+  test('defers initial resume seek for ani.pm HLS streams', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'https://ani.pm/api/anime/src/hls?t=demo',
+      playbackKind: 'hls',
+      pageUrl: 'https://ani.pm/api/anime/src/hls?t=demo',
+      provider: RemoteProvider.aniPm,
+      server: 'comet-1',
+    );
+
+    expect(shouldDeferRemoteHlsInitialSeek(stream), isTrue);
+    expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
+    expect(shouldDeferAndroidExoInitialSeek(stream), isTrue);
   });
 
   test('retries missing audio only after remote video is visible', () {

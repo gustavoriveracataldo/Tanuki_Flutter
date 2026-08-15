@@ -238,6 +238,7 @@ JustAnimePlaybackMode justAnimePlaybackModeFromId(Object? value) =>
         : JustAnimePlaybackMode.sub;
 
 enum JustAnimeServerPreference {
+  momo('momo', 'Momo'),
   neko('neko', 'Neko'),
   gigi('gigi', 'Gigi');
 
@@ -247,9 +248,13 @@ enum JustAnimeServerPreference {
 }
 
 JustAnimeServerPreference justAnimeServerPreferenceFromId(Object? value) =>
-    '$value'.trim().toLowerCase().contains('gigi')
-        ? JustAnimeServerPreference.gigi
-        : JustAnimeServerPreference.neko;
+    switch ('$value'.trim().toLowerCase()) {
+      String text when text.contains('gigi') || text.contains('animegg') =>
+        JustAnimeServerPreference.gigi,
+      String text when text.contains('neko') || text.contains('anineko') =>
+        JustAnimeServerPreference.neko,
+      _ => JustAnimeServerPreference.momo,
+    };
 
 LatAnimeServerPreference latAnimeServerPreferenceFromId(Object? value) {
   final normalized = '$value'.trim().toLowerCase();
@@ -1455,6 +1460,7 @@ class UserProfileState {
     this.watchingSeries = const {},
     this.abandonedSeries = const {},
     this.completedSeries = const {},
+    this.externalNoStatusSeries = const {},
     this.episodePlayback = const {},
     this.preferredRemoteProvider,
     this.seriesPlaybackPreferences = const {},
@@ -1475,6 +1481,7 @@ class UserProfileState {
   final Set<String> watchingSeries;
   final Set<String> abandonedSeries;
   final Set<String> completedSeries;
+  final Set<String> externalNoStatusSeries;
   final Map<String, EpisodePlaybackRecord> episodePlayback;
   final RemoteProvider? preferredRemoteProvider;
   final Map<String, SeriesPlaybackPreference> seriesPlaybackPreferences;
@@ -1517,6 +1524,8 @@ class UserProfileState {
       watchingSeries: _readStringList(json['watchingSeries']).toSet(),
       abandonedSeries: _readStringList(json['abandonedSeries']).toSet(),
       completedSeries: _readStringList(json['completedSeries']).toSet(),
+      externalNoStatusSeries:
+          _readStringList(json['externalNoStatusSeries']).toSet(),
       episodePlayback: _readEpisodePlaybackMap(json['episodePlayback']),
       preferredRemoteProvider: preferredProvider == RemoteProvider.animeKai
           ? null
@@ -1551,6 +1560,7 @@ class UserProfileState {
     Set<String>? watchingSeries,
     Set<String>? abandonedSeries,
     Set<String>? completedSeries,
+    Set<String>? externalNoStatusSeries,
     Map<String, EpisodePlaybackRecord>? episodePlayback,
     RemoteProvider? preferredRemoteProvider,
     bool clearPreferredRemoteProvider = false,
@@ -1580,6 +1590,8 @@ class UserProfileState {
       watchingSeries: watchingSeries ?? this.watchingSeries,
       abandonedSeries: abandonedSeries ?? this.abandonedSeries,
       completedSeries: completedSeries ?? this.completedSeries,
+      externalNoStatusSeries:
+          externalNoStatusSeries ?? this.externalNoStatusSeries,
       episodePlayback: episodePlayback ?? this.episodePlayback,
       preferredRemoteProvider: clearPreferredRemoteProvider
           ? null
@@ -1613,6 +1625,7 @@ class UserProfileState {
       'watchingSeries': watchingSeries.toList()..sort(),
       'abandonedSeries': abandonedSeries.toList()..sort(),
       'completedSeries': completedSeries.toList()..sort(),
+      'externalNoStatusSeries': externalNoStatusSeries.toList()..sort(),
       'episodePlayback': episodePlayback.map(
         (key, value) => MapEntry(key, value.toJson()),
       ),

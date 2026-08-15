@@ -120,6 +120,69 @@ void main() {
         'https://ani.pm/api/anime/src/vtt?t=sub');
   });
 
+  test('prefers Lyra over Comet for automatic ani.pm selection', () async {
+    final service = RemoteCatalogService(client: MockClient((request) async {
+      if (request.url.path == '/api/anime/series/8860') {
+        return http.Response(
+          jsonEncode({
+            'title': 'Trapped in a Dating Sim Season 2',
+            'year': 2026,
+            'anilistId': '159309',
+            'malId': '54000',
+          }),
+          200,
+        );
+      }
+      if (request.url.path == '/api/anime/src/servers') {
+        return http.Response(
+          jsonEncode({
+            'sub': [
+              {
+                'provider': 'Comet',
+                'name': 'Comet · 1',
+                'kind': 'hls',
+                'url': '/api/anime/src/hls?t=comet',
+                'priority': 106,
+                'subtitle': 'soft',
+              },
+              {
+                'provider': 'Lyra',
+                'name': 'Lyra · 6',
+                'kind': 'hls',
+                'url': '/api/anime/src/hls?t=lyra',
+                'priority': 108,
+                'subtitle': 'soft',
+              },
+            ],
+            'dub': [],
+          }),
+          200,
+        );
+      }
+      return http.Response('not found', 404);
+    }));
+    const episode = EpisodeItem(
+      seriesName: 'Trapped in a Dating Sim Season 2',
+      episodeIndex: 5,
+      episodeNumber: 6,
+      displayName: 'Episode 6',
+      relativePath: 'Episode 6',
+      filePath: 'https://ani.pm/anime/8860',
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.aniPm,
+      slug: 'anime:8860',
+      watchUrl: 'https://ani.pm/anime/8860',
+    );
+
+    final stream = await service.resolveDirectStream(
+      episode,
+      preferredMode: 'sub',
+    );
+
+    expect(stream?.server, 'lyra-6');
+    expect(stream?.playbackUrl, 'https://ani.pm/api/anime/src/hls?t=lyra');
+  });
+
   test('persists ani.pm audio and dynamic server preferences', () {
     const preference = SeriesPlaybackPreference(
       provider: RemoteProvider.aniPm,

@@ -12,6 +12,7 @@ void main() {
     const state = AppState(
       profiles: [
         UserProfileState(
+          externalNoStatusSeries: {'demo'},
           episodePlayback: {
             'demo|1': EpisodePlaybackRecord(
               positionMs: 60000,
@@ -27,6 +28,7 @@ void main() {
     expect(restored.profile.episodePlayback['demo|1']?.positionMs, 60000);
     expect(restored.profile.episodePlayback['demo|1']?.durationMs, 120000);
     expect(restored.profile.episodePlayback['demo|1']?.completed, isFalse);
+    expect(restored.profile.externalNoStatusSeries, contains('demo'));
   });
 
   test('serializes overscan padding settings', () {
@@ -539,6 +541,142 @@ void main() {
     expect(simkl.pushedUpdates, hasLength(1));
     expect(simkl.pushedUpdates.single.malId, 321);
     expect(simkl.pushedUpdates.single.listStatus, 'watching');
+  });
+
+  test('removes continue watching without marking abandoned externally',
+      () async {
+    final mal = _FakeMyAnimeListService(remoteEntries: const []);
+    final simkl = _FakeSimklService(remoteEntries: const []);
+    const episode = EpisodeItem(
+      seriesName: 'Demo',
+      seriesStateKey: 'demo',
+      episodeIndex: 0,
+      episodeNumber: 1,
+      displayName: 'Demo - Capitulo 1',
+      relativePath: 'Demo / Capitulo 1',
+      filePath: '',
+      sourceType: SourceType.remote,
+    );
+    const series = SeriesItem(
+      name: 'Demo',
+      seriesStateKey: 'demo',
+      sourceType: SourceType.remote,
+      episodeCount: 12,
+      catalogId: 321,
+      releaseYear: 2024,
+      episodes: [episode],
+    );
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        remoteLibrary: [series],
+        profiles: [
+          UserProfileState(
+            watchingSeries: {'demo'},
+            episodePlayback: {
+              'demo|1': EpisodePlaybackRecord(
+                positionMs: 600000,
+                durationMs: 1440000,
+              ),
+            },
+            myAnimeListAuth: MyAnimeListAuthState(
+              accessToken: 'mal-access',
+              refreshToken: 'mal-refresh',
+              userId: 42,
+            ),
+            myAnimeListMappings: {'demo': 321},
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+            simklMappings: {'demo': 654},
+            currentEntry: episode,
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(
+      store: store,
+      myAnimeListService: mal,
+      simklService: simkl,
+    );
+    await controller.initialize();
+
+    await controller.stopWatchingSeries(series);
+    await Future<void>.delayed(Duration.zero);
+
+    final profile = store.state.profile;
+    expect(profile.watchingSeries, isNot(contains('demo')));
+    expect(profile.abandonedSeries, isNot(contains('demo')));
+    expect(profile.externalNoStatusSeries, contains('demo'));
+    expect(profile.episodePlayback, isNot(contains('demo|1')));
+    expect(profile.currentEntry, isNull);
+    expect(mal.pushedUpdates, hasLength(1));
+    expect(mal.pushedUpdates.single.listStatus, isEmpty);
+    expect(mal.pushedUpdates.single.watchedEpisodes, 0);
+    expect(simkl.pushedUpdates, hasLength(1));
+    expect(simkl.pushedUpdates.single.removeFromList, isTrue);
+    expect(simkl.pushedUpdates.single.listStatus, isEmpty);
+  });
+
+  test('removing a completed series from continue watching keeps completed',
+      () async {
+    final mal = _FakeMyAnimeListService(remoteEntries: const []);
+    final simkl = _FakeSimklService(remoteEntries: const []);
+    const series = SeriesItem(
+      name: 'Demo',
+      seriesStateKey: 'demo',
+      sourceType: SourceType.remote,
+      episodeCount: 1,
+      catalogId: 321,
+      episodes: [
+        EpisodeItem(
+          seriesName: 'Demo',
+          seriesStateKey: 'demo',
+          episodeIndex: 0,
+          episodeNumber: 1,
+          displayName: 'Demo - Capitulo 1',
+          relativePath: 'Demo / Capitulo 1',
+          filePath: '',
+          sourceType: SourceType.remote,
+        ),
+      ],
+    );
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        remoteLibrary: [series],
+        profiles: [
+          UserProfileState(
+            completedSeries: {'demo'},
+            episodePlayback: {
+              'demo|1': EpisodePlaybackRecord(
+                positionMs: 1440000,
+                durationMs: 1440000,
+                completed: true,
+              ),
+            },
+            myAnimeListAuth: MyAnimeListAuthState(
+              accessToken: 'mal-access',
+              refreshToken: 'mal-refresh',
+              userId: 42,
+            ),
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(
+      store: store,
+      myAnimeListService: mal,
+      simklService: simkl,
+    );
+    await controller.initialize();
+
+    await controller.stopWatchingSeries(series);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(store.state.profile.completedSeries, contains('demo'));
+    expect(store.state.profile.externalNoStatusSeries, isNot(contains('demo')));
+    expect(mal.pushedUpdates, isEmpty);
+    expect(simkl.pushedUpdates, isEmpty);
   });
 
   test('sends SIMKL scrobble payload from current playback', () async {

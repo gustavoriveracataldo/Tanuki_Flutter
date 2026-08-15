@@ -15,6 +15,7 @@ import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
 const _appVersionLabel = '1.6.55';
+String? _lastFocusedHomeShelfId;
 
 enum _Section {
   anime,
@@ -894,13 +895,15 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) {
         return;
       }
-      final previousVisible = _airingShelfCandidates(previousResults);
+      final previousVisible = _homeAiringVisibleResults;
       final nextVisible = _airingShelfCandidates(results);
+      final visibleDropped = previousVisible.isNotEmpty &&
+          nextVisible.length < previousVisible.length;
       final resolvedResults = nextVisible.isEmpty && previousVisible.isNotEmpty
           ? previousResults
           : results;
-      final resolvedVisible = nextVisible.isEmpty && previousVisible.isNotEmpty
-          ? previousVisible
+      final resolvedVisible = visibleDropped
+          ? _mergeAiringVisibleCandidateLists(previousVisible, nextVisible)
           : nextVisible;
       setState(() {
         _homeAiringResults = resolvedResults;
@@ -997,19 +1000,17 @@ class _HomeScreenState extends State<HomeScreen> {
     if (candidates.isEmpty) {
       return;
     }
-    final previousResults = _homeAiringResults;
+    final visibleBeforeRefresh = _homeAiringVisibleResults;
     final request = ++_homeAiringVisualRequest;
     await _refreshHomeVisualsGradually(
       candidates: candidates,
       isCurrent: () => request == _homeAiringVisualRequest,
       apply: (refreshed) {
-        final previousVisible = _airingShelfCandidates(previousResults);
-        final refreshedVisible = _airingShelfCandidates(refreshed);
-        final keepPrevious =
-            refreshedVisible.isEmpty && previousVisible.isNotEmpty;
-        _homeAiringResults = keepPrevious ? previousResults : refreshed;
-        _homeAiringVisibleResults =
-            keepPrevious ? previousVisible : refreshedVisible;
+        _homeAiringResults = refreshed;
+        _homeAiringVisibleResults = _mergeVisibleAiringCandidateVisuals(
+          visibleBeforeRefresh,
+          refreshed,
+        );
       },
     );
   }
@@ -3567,7 +3568,11 @@ class _AnimePanel extends StatelessWidget {
     final heroHeight = (screenHeight * 0.36).clamp(320.0, 480.0);
     final topPadding = heroHeight + 18;
     final baseSectionHeight = (screenHeight * 0.3525).clamp(320.0, 480.0);
-    final sectionHeight = baseSectionHeight * _homePosterScale;
+    final posterShelfHeight = _homeShelfPosterHeight(context) + 52;
+    final continueShelfHeight =
+        ((_homeShelfPosterHeight(context, screenFactor: 0.205) * 0.58)
+                .clamp(142.0, 188.0)) +
+            52;
     const sectionGap = 28.0;
     const fadeDistance = 80.0;
 
@@ -3605,7 +3610,7 @@ class _AnimePanel extends StatelessWidget {
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
-      nextSectionTop += sectionHeight + sectionGap;
+      nextSectionTop += continueShelfHeight + sectionGap;
     }
     if (visibleSeason.isNotEmpty || trendingLoading) {
       panelChildren.add(fadeSection(
@@ -3624,7 +3629,7 @@ class _AnimePanel extends StatelessWidget {
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
-      nextSectionTop += sectionHeight + sectionGap;
+      nextSectionTop += posterShelfHeight + sectionGap;
     }
     if (visibleAiring.isNotEmpty || airingLoading) {
       panelChildren.add(fadeSection(
@@ -3644,7 +3649,7 @@ class _AnimePanel extends StatelessWidget {
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
-      nextSectionTop += sectionHeight + sectionGap;
+      nextSectionTop += posterShelfHeight + sectionGap;
     }
     if (latestMovies.isNotEmpty || moviesLoading) {
       panelChildren.add(fadeSection(
@@ -3664,7 +3669,7 @@ class _AnimePanel extends StatelessWidget {
         ),
       ));
       panelChildren.add(const SizedBox(height: sectionGap));
-      nextSectionTop += sectionHeight + sectionGap;
+      nextSectionTop += posterShelfHeight + sectionGap;
     }
     panelChildren.add(SizedBox(height: sectionPadding));
     panelChildren.add(const SizedBox(height: 56));
@@ -5805,7 +5810,7 @@ class _TrendingPosterShelf extends StatelessWidget {
     final posterWidth = posterHeight * 0.7;
     final visibleCandidates = candidates;
     void focusCandidate(RemoteSearchCandidate candidate) {
-      _ensureFocusedShelfVisible(context);
+      _ensureFocusedShelfVisible(context, shelfId: 'trending:$title');
       onCandidateFocused(candidate);
     }
 
@@ -5848,6 +5853,9 @@ class _TrendingPosterShelf extends StatelessWidget {
                     itemBuilder: (context, index) {
                       final candidate = visibleCandidates[index];
                       return _RemotePosterCard(
+                        key: ValueKey(
+                          'trending-${_homeCandidateKey(candidate)}',
+                        ),
                         width: posterWidth,
                         height: posterHeight,
                         candidate: candidate,
@@ -5873,6 +5881,7 @@ class _TrendingPosterShelf extends StatelessWidget {
 
 class _RemotePosterCard extends StatelessWidget {
   const _RemotePosterCard({
+    super.key,
     required this.width,
     required this.height,
     required this.candidate,
@@ -5970,7 +5979,7 @@ class _UpcomingPosterShelf extends StatelessWidget {
     final posterWidth = posterHeight * 0.7;
 
     void focusCandidate(RemoteSearchCandidate candidate) {
-      _ensureFocusedShelfVisible(context);
+      _ensureFocusedShelfVisible(context, shelfId: 'upcoming:$title');
       onCandidateFocused(candidate);
     }
 
@@ -6001,6 +6010,9 @@ class _UpcomingPosterShelf extends StatelessWidget {
                       itemBuilder: (context, index) {
                         final candidate = candidates[index];
                         return _RemotePosterCard(
+                          key: ValueKey(
+                            '${title.toLowerCase()}-${_homeCandidateKey(candidate)}',
+                          ),
                           width: posterWidth,
                           height: posterHeight,
                           candidate: candidate,
@@ -6185,7 +6197,7 @@ class _ContinueWatchingShelf extends StatelessWidget {
     final cardWidth = cardHeight * (16 / 9);
 
     void focusEntry(_ContinueWatchingEntry entry) {
-      _ensureFocusedShelfVisible(context);
+      _ensureFocusedShelfVisible(context, shelfId: 'continue-watching');
       final series = entry.series;
       if (series != null) {
         onEntryFocused(series);
@@ -8389,7 +8401,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         .toLowerCase()
         .compareTo(right.seriesName.toLowerCase());
   });
-  return entries.take(10).toList(growable: false);
+  return entries.toList(growable: false);
 }
 
 String _seriesTitleDedupeKey(String value) {
@@ -8610,18 +8622,22 @@ List<RemoteSearchCandidate> _airingShelfCandidates(
   final today = _todayDate();
   final byTitle = <String, RemoteSearchCandidate>{};
   for (final candidate in candidates) {
-    if (_candidateNextAirDate(candidate, today: today) == null) {
-      continue;
-    }
     final key = _seriesTitleDedupeKey(candidate.title);
     if (key.isEmpty) {
       continue;
     }
     final current = byTitle[key];
+    final candidateNext = _candidateNextAirDate(candidate, today: today);
+    final currentNext =
+        current == null ? null : _candidateNextAirDate(current, today: today);
     if (current == null ||
-        _candidateSortDate(candidate, today: today)
-                .compareTo(_candidateSortDate(current, today: today)) <
-            0) {
+        (candidateNext != null && currentNext == null) ||
+        (candidateNext != null &&
+            currentNext != null &&
+            candidateNext.compareTo(currentNext) < 0) ||
+        (candidateNext == null &&
+            currentNext == null &&
+            candidate.releaseYear > current.releaseYear)) {
       byTitle[key] = candidate;
     }
   }
@@ -8646,6 +8662,97 @@ List<RemoteSearchCandidate> _airingShelfCandidates(
     return left.title.toLowerCase().compareTo(right.title.toLowerCase());
   });
   return ordered;
+}
+
+List<RemoteSearchCandidate> _mergeVisibleAiringCandidateVisuals(
+  List<RemoteSearchCandidate> visible,
+  Iterable<RemoteSearchCandidate> refreshed,
+) {
+  if (visible.isEmpty) {
+    return const [];
+  }
+  final refreshedByKey = {
+    for (final candidate in refreshed) _homeCandidateKey(candidate): candidate,
+  };
+  return visible.map((candidate) {
+    final refreshedCandidate = refreshedByKey[_homeCandidateKey(candidate)];
+    return refreshedCandidate == null
+        ? candidate
+        : _mergeCandidateVisuals(candidate, refreshedCandidate);
+  }).toList(growable: false);
+}
+
+List<RemoteSearchCandidate> _mergeAiringVisibleCandidateLists(
+  List<RemoteSearchCandidate> previous,
+  List<RemoteSearchCandidate> next,
+) {
+  if (previous.isEmpty) {
+    return next.toList(growable: false);
+  }
+  if (next.isEmpty) {
+    return previous.toList(growable: false);
+  }
+  final nextByKey = {
+    for (final candidate in next) _homeCandidateKey(candidate): candidate,
+  };
+  final seen = <String>{};
+  final merged = <RemoteSearchCandidate>[];
+  for (final candidate in previous) {
+    final key = _homeCandidateKey(candidate);
+    seen.add(key);
+    final nextCandidate = nextByKey[key];
+    merged.add(
+      nextCandidate == null
+          ? candidate
+          : _mergeCandidateVisuals(candidate, nextCandidate),
+    );
+  }
+  for (final candidate in next) {
+    if (seen.add(_homeCandidateKey(candidate))) {
+      merged.add(candidate);
+    }
+  }
+  return merged;
+}
+
+RemoteSearchCandidate _mergeCandidateVisuals(
+  RemoteSearchCandidate base,
+  RemoteSearchCandidate refreshed,
+) {
+  return RemoteSearchCandidate(
+    provider: base.provider,
+    slug: base.slug,
+    title: base.title,
+    watchUrl: base.watchUrl.isNotEmpty ? base.watchUrl : refreshed.watchUrl,
+    seriesUrl: base.seriesUrl.isNotEmpty ? base.seriesUrl : refreshed.seriesUrl,
+    imageUrl:
+        refreshed.imageUrl.isNotEmpty ? refreshed.imageUrl : base.imageUrl,
+    backgroundUrl: refreshed.backgroundUrl.isNotEmpty
+        ? refreshed.backgroundUrl
+        : base.backgroundUrl,
+    logoUrl: refreshed.logoUrl.isNotEmpty ? refreshed.logoUrl : base.logoUrl,
+    trailerUrl: refreshed.trailerUrl.isNotEmpty
+        ? refreshed.trailerUrl
+        : base.trailerUrl,
+    description: refreshed.description.isNotEmpty
+        ? refreshed.description
+        : base.description,
+    rating: refreshed.rating.isNotEmpty ? refreshed.rating : base.rating,
+    episodeCount: base.episodeCount,
+    format: base.format,
+    japaneseTitle: refreshed.japaneseTitle.isNotEmpty
+        ? refreshed.japaneseTitle
+        : base.japaneseTitle,
+    aliases: {
+      ...base.aliases,
+      ...refreshed.aliases,
+    }.where((entry) => entry.trim().isNotEmpty).toList(growable: false),
+    releaseYear: base.releaseYear,
+    airDateIso: base.airDateIso,
+    catalogId: base.catalogId,
+    cast: refreshed.cast.isNotEmpty ? refreshed.cast : base.cast,
+    episodeDetails: base.episodeDetails,
+  );
 }
 
 String _homeCandidateKey(RemoteSearchCandidate candidate) {
@@ -8702,15 +8809,6 @@ DateTime? _candidateAirDate(RemoteSearchCandidate candidate) {
   return _parseAirDate(candidate.airDateIso);
 }
 
-DateTime _candidateSortDate(
-  RemoteSearchCandidate candidate, {
-  DateTime? today,
-}) {
-  return _candidateNextAirDate(candidate, today: today) ??
-      _candidateAirDate(candidate) ??
-      DateTime(9999);
-}
-
 DateTime? _candidateNextAirDate(
   RemoteSearchCandidate candidate, {
   DateTime? today,
@@ -8764,16 +8862,36 @@ DateTime? _parseAirDate(String airDateIso) {
   return DateTime(parsed.year, parsed.month, parsed.day);
 }
 
-void _ensureFocusedShelfVisible(BuildContext context) {
+void _ensureFocusedShelfVisible(
+  BuildContext context, {
+  required String shelfId,
+}) {
+  final shelfChanged = _lastFocusedHomeShelfId != shelfId;
+  _lastFocusedHomeShelfId = shelfId;
   WidgetsBinding.instance.addPostFrameCallback((_) {
     if (!context.mounted) {
       return;
+    }
+    final scrollable = Scrollable.maybeOf(context);
+    final item = context.findRenderObject();
+    final viewport = scrollable?.context.findRenderObject();
+    if (!shelfChanged && item is RenderBox && viewport is RenderBox) {
+      final rect = MatrixUtils.transformRect(
+        item.getTransformTo(viewport),
+        item.paintBounds,
+      );
+      const tolerance = 96.0;
+      final fullyVisible = rect.top >= -tolerance &&
+          rect.bottom <= viewport.size.height + tolerance;
+      if (fullyVisible) {
+        return;
+      }
     }
     Scrollable.ensureVisible(
       context,
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
-      alignment: 0.78,
+      alignment: shelfChanged ? 0.58 : 0.72,
       alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
     );
   });

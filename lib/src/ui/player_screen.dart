@@ -35,6 +35,10 @@ const _remoteSeekJumpThreshold = Duration(seconds: 45);
 const _remoteSeekStallDelay = Duration(seconds: 11);
 const _remoteOpeningRecoveryMaxAttempts = 1;
 const _desktopVlcAudioRecoveryMaxAttempts = 10;
+const _stableRemoteAv1VlcCacheMs = 20000;
+const _stableRemoteAv1InitialBufferWarmup = Duration(seconds: 10);
+const _stableRemoteAv1StartupBufferTarget = Duration(seconds: 10);
+const _stableRemoteAv1StartupBufferMaxWait = Duration(seconds: 25);
 const _animeSkipPromptLead = Duration(seconds: 1);
 const _animeSkipSeekEndOffset = Duration(milliseconds: 500);
 const _playerPointerOverlayRefreshInterval = Duration(milliseconds: 250);
@@ -112,9 +116,15 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _openedMedia = false;
   bool _completionCommitted = false;
   bool _androidExoCompletionHandled = false;
+  bool _androidExoDeferredResumeSeekHandled = false;
+  bool _androidExoRebufferHoldActive = false;
   bool _desktopVlcCompletionHandled = false;
   bool _desktopVlcIsPlaying = false;
   bool _desktopVlcAudioFallbackHandled = false;
+  bool _desktopVlcDeferredResumeSeekHandled = false;
+  bool _desktopVlcRebufferHoldActive = false;
+  Duration? _desktopVlcDeferredResumeSeekTarget;
+  DateTime? _desktopVlcDeferredResumeSeekReadyAt;
   bool _handlingAndroidExoError = false;
   bool _simklScrobbleActive = false;
   bool _remoteResumeRefined = false;
@@ -199,6 +209,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   StreamSubscription<Tracks>? _tracksSubscription;
   StreamSubscription<VideoParams>? _videoParamsSubscription;
   StreamSubscription<PlayerLog>? _nativeLogSubscription;
+  StreamSubscription<double>? _desktopVlcBufferingProgressSubscription;
   bool _remotePlaybackAccepted = false;
   bool _remoteVideoFrameReady = false;
   bool _remoteVideoFrameFallbackHandled = false;
@@ -299,6 +310,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     final tracksSubscription = _tracksSubscription;
     final videoParamsSubscription = _videoParamsSubscription;
     final nativeLogSubscription = _nativeLogSubscription;
+    final desktopVlcBufferingProgressSubscription =
+        _desktopVlcBufferingProgressSubscription;
     if (positionSubscription != null) {
       unawaited(positionSubscription.cancel());
     }
@@ -325,6 +338,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
     if (nativeLogSubscription != null) {
       unawaited(nativeLogSubscription.cancel());
+    }
+    if (desktopVlcBufferingProgressSubscription != null) {
+      unawaited(desktopVlcBufferingProgressSubscription.cancel());
     }
     final playerBufferingSubscription = _playerBufferingSubscription;
     if (playerBufferingSubscription != null) {
@@ -739,6 +755,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
     _androidExoController = null;
     _androidExoCompletionHandled = false;
+    _androidExoDeferredResumeSeekHandled = false;
+    _androidExoRebufferHoldActive = false;
     _handlingAndroidExoError = false;
 
     final headers = _remoteMediaHeaders(path) ?? const <String, String>{};
@@ -750,7 +768,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         ? vp.VideoFormat.hls
         : playbackKind == 'dash' || lowerPath.contains('.mpd')
             ? vp.VideoFormat.dash
-            : null;
+            : playbackKind == 'mp4' || lowerPath.contains('.mp4')
+                ? vp.VideoFormat.other
+                : null;
     final controller = vp.VideoPlayerController.networkUrl(
       Uri.parse(path),
       formatHint: formatHint,
@@ -779,9 +799,13 @@ class _PlayerScreenState extends State<PlayerScreen>
       );
       final resumePosition =
           widget.controller.resumePositionForEpisode(widget.episode);
+      final deferResumeSeek = resumePosition != null &&
+          resumePosition > const Duration(seconds: 2) &&
+          shouldDeferAndroidExoInitialSeek(_currentResolvedStream);
+      final openStart = deferResumeSeek ? Duration.zero : resumePosition;
       await controller.setVolume(_normalizedMaxVolume);
-      await controller.seekTo(resumePosition ?? Duration.zero);
-      _lastPosition = resumePosition ?? Duration.zero;
+      await controller.seekTo(openStart ?? Duration.zero);
+      _lastPosition = openStart ?? Duration.zero;
       _lastDuration = controller.value.duration;
       _lastPositionChangeAt = DateTime.now();
       _markSimklPlaybackPositionReady(
@@ -789,8 +813,10 @@ class _PlayerScreenState extends State<PlayerScreen>
         buffering: controller.value.isBuffering,
       );
       await _applyAndroidExoSubtitleTrack();
+      await _preloadAndroidExoStableStartupBuffer(controller);
       _debugPlayerEvent('ExoPlayer play start');
       await controller.play();
+      _scheduleAndroidExoDeferredResumeSeek(controller, resumePosition);
       _debugPlayerEvent('ExoPlayer play requested');
       _remotePlaybackAccepted = true;
       if (!mounted || _androidExoController != controller) {
@@ -824,12 +850,60 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
+  Future<void> _preloadAndroidExoStableStartupBuffer(
+    vp.VideoPlayerController controller,
+  ) async {
+    if (!shouldUseStableRemoteAv1PlaybackProfile(_currentResolvedStream)) {
+      return;
+    }
+    _setPlayerBuffering(true);
+    if (mounted) {
+      setState(() {
+        _status = 'Precargando buffer...';
+      });
+    }
+    final startedAt = DateTime.now();
+    var sawBufferedRange = controller.value.buffered.isNotEmpty;
+    var bufferedAhead = bufferedAheadForPosition(
+      position: controller.value.position,
+      ranges: controller.value.buffered,
+    );
+    _debugPlayerEvent(
+      'ExoPlayer startup buffer wait target='
+      '${_stableRemoteAv1StartupBufferTarget.inSeconds}s',
+    );
+    while (mounted && _androidExoController == controller) {
+      final value = controller.value;
+      sawBufferedRange = sawBufferedRange || value.buffered.isNotEmpty;
+      bufferedAhead = bufferedAheadForPosition(
+        position: value.position,
+        ranges: value.buffered,
+      );
+      final elapsed = DateTime.now().difference(startedAt);
+      if (bufferedAhead >= _stableRemoteAv1StartupBufferTarget ||
+          (!sawBufferedRange &&
+              elapsed >= _stableRemoteAv1StartupBufferTarget) ||
+          elapsed >= _stableRemoteAv1StartupBufferMaxWait) {
+        _debugPlayerEvent(
+          'ExoPlayer startup buffer ready ahead='
+          '${_formatPlaybackTime(bufferedAhead)} elapsed='
+          '${elapsed.inSeconds}s sawRanges=$sawBufferedRange',
+        );
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+  }
+
   Future<void> _openDesktopVlcPlayer(
     String path, {
     Duration? resumeOverride,
   }) async {
     await _disposeDesktopVlcPlayer(delayForBiliBili: true);
     _desktopVlcCompletionHandled = false;
+    _desktopVlcDeferredResumeSeekHandled = false;
+    _desktopVlcDeferredResumeSeekTarget = null;
+    _desktopVlcDeferredResumeSeekReadyAt = null;
     _setPlayerBuffering(true);
 
     final resumePosition = resumeOverride ??
@@ -842,19 +916,14 @@ class _PlayerScreenState extends State<PlayerScreen>
         _remoteMediaHeaders(playbackPath) ?? const <String, String>{};
     final referer = headers['Referer']?.trim() ?? '';
     final audioSlave = _desktopVlcAudioSlave();
+    final vlcArguments = desktopVlcCommandlineArguments(
+      stream: _currentResolvedStream,
+      audioSlave: audioSlave,
+      referer: referer,
+    );
     final player = vlc.Player(
       id: _nextDesktopVlcPlayerId++,
-      commandlineArguments: [
-        // Remote HLS segments sometimes arrive with PCR/PTS jitter above one
-        // second. A three-second buffer gives libVLC enough margin without
-        // disabling clock synchronization (which could desync A/V).
-        '--network-caching=3000',
-        '--live-caching=3000',
-        '--http-reconnect',
-        '--adaptive-logic=highest',
-        if (audioSlave.isNotEmpty) '--input-slave=$audioSlave',
-        if (referer.isNotEmpty) '--http-referrer=$referer',
-      ],
+      commandlineArguments: vlcArguments,
     );
     _desktopVlcPlayer = player;
     _activeDesktopVlcPlayers.add(player);
@@ -897,12 +966,18 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
       if (state.isCompleted && !_desktopVlcCompletionHandled) {
         if (!_shouldAcceptPlaybackCompletion()) {
+          _desktopVlcCompletionHandled = true;
           _debugPlayerEvent(
             'ignored early VLC completion position='
             '${_formatPlaybackTime(_lastPosition)} duration='
             '${_formatPlaybackTime(_lastDuration)} expected='
             '${_formatPlaybackTime(_expectedRemoteDuration)}',
           );
+          if (widget.episode.isRemote && _lastPosition <= Duration.zero) {
+            unawaited(
+              _retryRemoteFallback('VLC termino antes de iniciar'),
+            );
+          }
           return;
         }
         _desktopVlcCompletionHandled = true;
@@ -914,6 +989,13 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (mounted) {
         setState(() {});
       }
+    });
+    _desktopVlcBufferingProgressSubscription =
+        player.bufferingProgressStream.listen((progress) {
+      if (_desktopVlcPlayer != player) {
+        return;
+      }
+      _maybeHoldDesktopVlcRebuffer(player, progress);
     });
     _desktopVlcErrorSubscription = player.errorStream.listen((error) {
       if (!mounted || _desktopVlcPlayer != player || error.trim().isEmpty) {
@@ -940,11 +1022,12 @@ class _PlayerScreenState extends State<PlayerScreen>
           _markRemoteVideoFrameReady();
         }
         _setPlayerBuffering(false);
+        _maybeRunDesktopVlcDeferredResumeSeek(player);
       }
       setState(() {});
     });
 
-    _lastPosition = resumePosition ?? Duration.zero;
+    _lastPosition = openStart;
     _lastDuration = Duration.zero;
     _lastPositionChangeAt = DateTime.now();
     _markSimklPlaybackPositionReady(playing: _desktopVlcIsPlaying);
@@ -953,13 +1036,16 @@ class _PlayerScreenState extends State<PlayerScreen>
       'playbackUrl=${_debugMediaLabel(playbackPath)} '
       'audioSlave=${audioSlave.isEmpty ? 'none' : _debugMediaLabel(audioSlave)} '
       'start=${_formatPlaybackTime(_lastPosition)} '
-      'headers=${_debugHeadersLabel(headers)}',
+      'headers=${_debugHeadersLabel(headers)} '
+      'args=${vlcArguments.join(' ')}',
     );
     try {
       player.open(
         _desktopVlcMedia(playbackPath, startTime: openStart),
         autoStart: true,
       );
+      await _preloadDesktopVlcStableStartupBuffer(player);
+      _scheduleDesktopVlcDeferredResumeSeek(player, resumePosition);
       _scheduleDesktopVlcAudioRecovery(player);
       if (!mounted || _desktopVlcPlayer != player) {
         return;
@@ -987,12 +1073,213 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
+  Future<void> _preloadDesktopVlcStableStartupBuffer(vlc.Player player) async {
+    if (!shouldUseStableRemoteAv1PlaybackProfile(_currentResolvedStream)) {
+      return;
+    }
+    _setPlayerBuffering(true);
+    if (mounted) {
+      setState(() {
+        _status = 'Precargando buffer...';
+      });
+    }
+    var lastProgress = player.bufferingProgress;
+    var lastLoggedBucket = -1;
+    final progressSubscription =
+        player.bufferingProgressStream.listen((progress) {
+      lastProgress = progress;
+      final bucket = progress ~/ 20;
+      if (bucket != lastLoggedBucket) {
+        lastLoggedBucket = bucket;
+        _debugPlayerEvent(
+          'VLC startup buffering progress=${progress.toStringAsFixed(0)}%',
+        );
+      }
+    });
+    try {
+      player.pause();
+      _debugPlayerEvent(
+        'VLC startup buffer hold target='
+        '${_stableRemoteAv1StartupBufferTarget.inSeconds}s',
+      );
+      final startedAt = DateTime.now();
+      while (mounted &&
+          _desktopVlcPlayer == player &&
+          DateTime.now().difference(startedAt) <
+              _stableRemoteAv1StartupBufferTarget) {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+      if (!mounted || _desktopVlcPlayer != player) {
+        return;
+      }
+      _debugPlayerEvent(
+        'VLC startup buffer ready progress='
+        '${lastProgress.toStringAsFixed(0)}%',
+      );
+      player.play();
+    } finally {
+      unawaited(progressSubscription.cancel());
+    }
+  }
+
+  void _maybeHoldDesktopVlcRebuffer(
+    vlc.Player player,
+    double bufferingProgress,
+  ) {
+    if (!shouldHoldStableRemoteAv1Rebuffer(
+      stream: _currentResolvedStream,
+      openedMedia: _openedMedia,
+      isBuffering: bufferingProgress < 100,
+      isPlaying: _desktopVlcIsPlaying,
+      position: _lastPosition,
+      holdActive: _desktopVlcRebufferHoldActive,
+    )) {
+      return;
+    }
+    unawaited(_holdDesktopVlcRebuffer(player, bufferingProgress));
+  }
+
+  Future<void> _holdDesktopVlcRebuffer(
+    vlc.Player player,
+    double bufferingProgress,
+  ) async {
+    _desktopVlcRebufferHoldActive = true;
+    _setPlayerBuffering(true);
+    if (mounted) {
+      setState(() {
+        _status = 'Recargando buffer...';
+      });
+    }
+    try {
+      _debugPlayerEvent(
+        'VLC rebuffer hold target='
+        '${_stableRemoteAv1StartupBufferTarget.inSeconds}s '
+        'progress=${bufferingProgress.toStringAsFixed(0)}%',
+      );
+      player.pause();
+      final startedAt = DateTime.now();
+      while (mounted &&
+          _desktopVlcPlayer == player &&
+          DateTime.now().difference(startedAt) <
+              _stableRemoteAv1StartupBufferTarget) {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+      if (!mounted || _desktopVlcPlayer != player) {
+        return;
+      }
+      _debugPlayerEvent('VLC rebuffer hold ready');
+      player.play();
+    } finally {
+      _desktopVlcRebufferHoldActive = false;
+    }
+  }
+
   Duration _desktopVlcOpenStartPosition(Duration? resumePosition) {
     final start = resumePosition ?? Duration.zero;
     if (_currentResolvedStream?.provider == RemoteProvider.bilibili) {
       return Duration.zero;
     }
+    if (shouldDeferDesktopVlcInitialSeek(_currentResolvedStream)) {
+      return Duration.zero;
+    }
     return start;
+  }
+
+  void _scheduleDesktopVlcDeferredResumeSeek(
+    vlc.Player player,
+    Duration? resumePosition,
+  ) {
+    if (_desktopVlcDeferredResumeSeekHandled ||
+        resumePosition == null ||
+        resumePosition <= const Duration(seconds: 2) ||
+        !shouldDeferDesktopVlcInitialSeek(_currentResolvedStream)) {
+      return;
+    }
+    _desktopVlcDeferredResumeSeekTarget = resumePosition;
+    _desktopVlcDeferredResumeSeekReadyAt =
+        DateTime.now().add(_stableRemoteAv1InitialBufferWarmup);
+    _debugPlayerEvent(
+      'VLC deferred resume seek warming target='
+      '${_formatPlaybackTime(resumePosition)} warmup='
+      '${_stableRemoteAv1InitialBufferWarmup.inSeconds}s',
+    );
+    _maybeRunDesktopVlcDeferredResumeSeek(player);
+    _watchDesktopVlcDeferredResumeSeek(player);
+  }
+
+  void _maybeRunDesktopVlcDeferredResumeSeek(vlc.Player player) {
+    final target = _desktopVlcDeferredResumeSeekTarget;
+    final readyAt = _desktopVlcDeferredResumeSeekReadyAt;
+    if (_desktopVlcDeferredResumeSeekHandled ||
+        target == null ||
+        !mounted ||
+        _desktopVlcPlayer != player ||
+        !_hasRemoteVideoFrame ||
+        (readyAt != null && DateTime.now().isBefore(readyAt))) {
+      return;
+    }
+    _desktopVlcDeferredResumeSeekHandled = true;
+    _desktopVlcDeferredResumeSeekTarget = null;
+    _desktopVlcDeferredResumeSeekReadyAt = null;
+    try {
+      _debugPlayerEvent(
+        'VLC deferred resume seek target=${_formatPlaybackTime(target)}',
+      );
+      player.seek(target);
+      _lastPosition = target;
+      _lastPositionChangeAt = DateTime.now();
+    } catch (error) {
+      _debugPlayerEvent('VLC deferred resume seek ignored error: $error');
+    }
+  }
+
+  void _watchDesktopVlcDeferredResumeSeek(
+    vlc.Player player, [
+    int attempt = 1,
+  ]) {
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 700), () {
+      final target = _desktopVlcDeferredResumeSeekTarget;
+      if (_desktopVlcDeferredResumeSeekHandled ||
+          target == null ||
+          !mounted ||
+          _desktopVlcPlayer != player) {
+        return;
+      }
+      final readyAt = _desktopVlcDeferredResumeSeekReadyAt;
+      final warmingUp = readyAt != null && DateTime.now().isBefore(readyAt);
+      if (_hasRemoteVideoFrame && !warmingUp) {
+        _maybeRunDesktopVlcDeferredResumeSeek(player);
+        return;
+      }
+      if (attempt >= 45) {
+        _desktopVlcDeferredResumeSeekHandled = true;
+        _desktopVlcDeferredResumeSeekTarget = null;
+        _desktopVlcDeferredResumeSeekReadyAt = null;
+        _debugPlayerEvent(
+          'VLC deferred resume seek skipped target='
+          '${_formatPlaybackTime(target)} videoFrame=$_hasRemoteVideoFrame',
+        );
+        final stream = _currentResolvedStream;
+        final provider = stream?.provider;
+        if (!_hasRemoteVideoFrame &&
+            provider != null &&
+            _supportsRemoteServerFallback(provider) &&
+            shouldDeferRemoteHlsInitialSeek(stream)) {
+          unawaited(_retryRemoteServerFallback(
+            provider,
+            'no entrego video antes del seek inicial',
+          ));
+        }
+        return;
+      }
+      if (attempt == 1 || attempt % 4 == 0) {
+        _debugPlayerEvent(
+          'VLC deferred resume seek still warming attempt=$attempt target='
+          '${_formatPlaybackTime(target)} videoFrame=$_hasRemoteVideoFrame',
+        );
+      }
+      _watchDesktopVlcDeferredResumeSeek(player, attempt + 1);
+    }));
   }
 
   void _scheduleDesktopVlcAudioRecovery(vlc.Player player, [int attempt = 1]) {
@@ -1118,16 +1405,22 @@ class _PlayerScreenState extends State<PlayerScreen>
       _desktopVlcPlaybackSubscription,
       _desktopVlcErrorSubscription,
       _desktopVlcDimensionsSubscription,
+      _desktopVlcBufferingProgressSubscription,
     ];
     _desktopVlcPositionSubscription = null;
     _desktopVlcPlaybackSubscription = null;
     _desktopVlcErrorSubscription = null;
     _desktopVlcDimensionsSubscription = null;
+    _desktopVlcBufferingProgressSubscription = null;
     final wasBiliBili = treatAsBiliBili ||
         _currentResolvedStream?.provider == RemoteProvider.bilibili;
     final retiredSourcePath = _desktopVlcSourcePath;
     _desktopVlcSourcePath = '';
     _desktopVlcIsPlaying = false;
+    _desktopVlcDeferredResumeSeekHandled = false;
+    _desktopVlcDeferredResumeSeekTarget = null;
+    _desktopVlcDeferredResumeSeekReadyAt = null;
+    _desktopVlcRebufferHoldActive = false;
     final playbackUri = Uri.tryParse(retiredSourcePath);
     final wasLoopbackProxy = playbackUri != null &&
         (playbackUri.host == '127.0.0.1' || playbackUri.host == 'localhost');
@@ -1614,6 +1907,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
     _syncSimklPlaybackState(value.isPlaying, buffering: value.isBuffering);
     _maybeSendDeferredSimklStart();
+    _maybeHoldAndroidExoRebuffer(controller, value);
     _maybeScheduleUpcomingCards(value.position);
     _maybeUpdateAnimeSkipPrompt(value.position);
     _persistPlaybackThrottled();
@@ -1656,6 +1950,107 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
     } finally {
       _handlingAndroidExoError = false;
+    }
+  }
+
+  void _scheduleAndroidExoDeferredResumeSeek(
+    vp.VideoPlayerController controller,
+    Duration? resumePosition,
+  ) {
+    if (_androidExoDeferredResumeSeekHandled ||
+        resumePosition == null ||
+        resumePosition <= const Duration(seconds: 2) ||
+        !shouldDeferAndroidExoInitialSeek(_currentResolvedStream)) {
+      return;
+    }
+    _debugPlayerEvent(
+      'ExoPlayer deferred resume seek warming target='
+      '${_formatPlaybackTime(resumePosition)}',
+    );
+    unawaited(Future<void>.delayed(_stableRemoteAv1InitialBufferWarmup, () {
+      if (_androidExoDeferredResumeSeekHandled ||
+          !mounted ||
+          _androidExoController != controller ||
+          !controller.value.isInitialized) {
+        return;
+      }
+      _androidExoDeferredResumeSeekHandled = true;
+      _debugPlayerEvent(
+        'ExoPlayer deferred resume seek target='
+        '${_formatPlaybackTime(resumePosition)}',
+      );
+      unawaited(_seekAndroidExoPlayer(resumePosition));
+    }));
+  }
+
+  void _maybeHoldAndroidExoRebuffer(
+    vp.VideoPlayerController controller,
+    vp.VideoPlayerValue value,
+  ) {
+    if (!shouldHoldStableRemoteAv1Rebuffer(
+      stream: _currentResolvedStream,
+      openedMedia: _openedMedia,
+      isBuffering: value.isBuffering,
+      isPlaying: value.isPlaying,
+      position: value.position,
+      holdActive: _androidExoRebufferHoldActive,
+    )) {
+      return;
+    }
+    unawaited(_holdAndroidExoRebuffer(controller));
+  }
+
+  Future<void> _holdAndroidExoRebuffer(
+    vp.VideoPlayerController controller,
+  ) async {
+    _androidExoRebufferHoldActive = true;
+    _setPlayerBuffering(true);
+    if (mounted) {
+      setState(() {
+        _status = 'Recargando buffer...';
+      });
+    }
+    try {
+      _debugPlayerEvent(
+        'ExoPlayer rebuffer hold target='
+        '${_stableRemoteAv1StartupBufferTarget.inSeconds}s',
+      );
+      await controller.pause();
+      final startedAt = DateTime.now();
+      var sawBufferedRange = controller.value.buffered.isNotEmpty;
+      var bufferedAhead = bufferedAheadForPosition(
+        position: controller.value.position,
+        ranges: controller.value.buffered,
+      );
+      while (mounted && _androidExoController == controller) {
+        final value = controller.value;
+        sawBufferedRange = sawBufferedRange || value.buffered.isNotEmpty;
+        bufferedAhead = bufferedAheadForPosition(
+          position: value.position,
+          ranges: value.buffered,
+        );
+        final elapsed = DateTime.now().difference(startedAt);
+        if (bufferedAhead >= _stableRemoteAv1StartupBufferTarget ||
+            (!sawBufferedRange &&
+                elapsed >= _stableRemoteAv1StartupBufferTarget) ||
+            elapsed >= _stableRemoteAv1StartupBufferMaxWait) {
+          _debugPlayerEvent(
+            'ExoPlayer rebuffer hold ready ahead='
+            '${_formatPlaybackTime(bufferedAhead)} elapsed='
+            '${elapsed.inSeconds}s sawRanges=$sawBufferedRange',
+          );
+          break;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+      if (!mounted ||
+          _androidExoController != controller ||
+          !controller.value.isInitialized) {
+        return;
+      }
+      await controller.play();
+    } finally {
+      _androidExoRebufferHoldActive = false;
     }
   }
 
@@ -7827,12 +8222,101 @@ bool shouldWatchAnimeAv1VideoFrame(
   if (provider != RemoteProvider.animeAv1 || stream == null) {
     return false;
   }
-  if (stream.playbackKind.toLowerCase() != 'hls') {
+  final source = '${stream.playbackUrl} ${stream.pageUrl}'.trim().toLowerCase();
+  final server = stream.server.trim().toLowerCase();
+  if (stream.playbackKind.toLowerCase() == 'hls') {
+    return source.contains('player.zilla-networks.com') ||
+        source.contains('zilla-networks.com');
+  }
+  if (stream.playbackKind.toLowerCase() == 'mp4') {
+    return server == 'mp4upload' || source.contains('mp4upload.com');
+  }
+  return false;
+}
+
+bool shouldUseStableRemoteAv1PlaybackProfile(RemoteDirectStream? stream) {
+  if (stream == null || stream.provider != RemoteProvider.animeAv1) {
     return false;
   }
-  final source = '${stream.playbackUrl} ${stream.pageUrl}'.trim().toLowerCase();
-  return source.contains('player.zilla-networks.com') ||
-      source.contains('zilla-networks.com');
+  final source =
+      '${stream.playbackUrl} ${stream.pageUrl} ${stream.server}'.toLowerCase();
+  return stream.playbackKind.toLowerCase() == 'mp4' &&
+      (source.contains('mp4upload') || source.contains('127.0.0.1'));
+}
+
+bool shouldDeferRemoteHlsInitialSeek(RemoteDirectStream? stream) {
+  if (stream == null || stream.playbackKind.toLowerCase() != 'hls') {
+    return false;
+  }
+  if (stream.provider == RemoteProvider.aniPm) {
+    return true;
+  }
+  return stream.provider == RemoteProvider.jkAnime &&
+      stream.server.trim().toLowerCase() == 'magi';
+}
+
+bool shouldDeferDesktopVlcInitialSeek(RemoteDirectStream? stream) {
+  return shouldUseStableRemoteAv1PlaybackProfile(stream) ||
+      shouldDeferRemoteHlsInitialSeek(stream);
+}
+
+bool shouldDeferAndroidExoInitialSeek(RemoteDirectStream? stream) {
+  return shouldUseStableRemoteAv1PlaybackProfile(stream) ||
+      shouldDeferRemoteHlsInitialSeek(stream);
+}
+
+Duration bufferedAheadForPosition({
+  required Duration position,
+  required List<vp.DurationRange> ranges,
+}) {
+  var bufferedEnd = position;
+  for (final range in ranges) {
+    if (range.start <= position && range.end > bufferedEnd) {
+      bufferedEnd = range.end;
+    }
+  }
+  final ahead = bufferedEnd - position;
+  return ahead.isNegative ? Duration.zero : ahead;
+}
+
+bool shouldHoldStableRemoteAv1Rebuffer({
+  required RemoteDirectStream? stream,
+  required bool openedMedia,
+  required bool isBuffering,
+  required bool isPlaying,
+  required Duration position,
+  required bool holdActive,
+}) {
+  return openedMedia &&
+      !holdActive &&
+      isBuffering &&
+      isPlaying &&
+      position >= _stableRemoteAv1StartupBufferTarget &&
+      shouldUseStableRemoteAv1PlaybackProfile(stream);
+}
+
+List<String> desktopVlcCommandlineArguments({
+  required RemoteDirectStream? stream,
+  required String audioSlave,
+  required String referer,
+}) {
+  final stableAv1 = shouldUseStableRemoteAv1PlaybackProfile(stream);
+  final args = <String>[
+    '--network-caching=${stableAv1 ? _stableRemoteAv1VlcCacheMs : 3000}',
+    '--live-caching=${stableAv1 ? _stableRemoteAv1VlcCacheMs : 3000}',
+    if (stableAv1) '--file-caching=$_stableRemoteAv1VlcCacheMs',
+    '--http-reconnect',
+    '--adaptive-logic=highest',
+    if (stableAv1) ...[
+      '--clock-jitter=0',
+      '--clock-synchro=0',
+      '--no-drop-late-frames',
+      '--no-skip-frames',
+    ],
+    if (audioSlave.isNotEmpty) '--input-slave=$audioSlave',
+    if (referer.isNotEmpty) '--http-referrer=$referer',
+  ];
+  return args;
 }
 
 Duration? initialMediaStartPosition({

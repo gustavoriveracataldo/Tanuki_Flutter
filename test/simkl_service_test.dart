@@ -16,6 +16,7 @@ void main() {
         if (request.url.path == '/users/settings' ||
             request.url.path == '/sync/all-items/anime/' ||
             request.url.path == '/sync/add-to-list' ||
+            request.url.path == '/sync/remove-from-list' ||
             request.url.path == '/sync/history' ||
             request.url.path == '/sync/playback/episodes' ||
             request.url.path == '/scrobble/start') {
@@ -100,6 +101,11 @@ void main() {
               200,
               request: request,
             ),
+          'POST /sync/remove-from-list' => http.Response(
+              jsonEncode({'result': 'OK'}),
+              200,
+              request: request,
+            ),
           'POST /scrobble/start' => http.Response(
               jsonEncode({'result': 'OK'}),
               200,
@@ -153,6 +159,19 @@ void main() {
         ),
       ],
     );
+    final removePush = await service.pushLocalAnimeState(
+      accessToken: 'token',
+      clientId: clientId,
+      updates: const [
+        SimklLocalAnimeUpdate(
+          seriesKey: 'remove',
+          title: 'Remove Demo',
+          malId: 456,
+          year: 2026,
+          removeFromList: true,
+        ),
+      ],
+    );
     await service.scrobbleEpisode(
       accessToken: 'token',
       clientId: clientId,
@@ -180,6 +199,7 @@ void main() {
     expect(episodeProgress.single.progressPercent, 42.5);
     expect(push.pushedCount, 1);
     expect(planPush.pushedCount, 1);
+    expect(removePush.pushedCount, 1);
     expect(
       postedBodies['/sync/add-to-list']['shows'].single['to'],
       'plantowatch',
@@ -194,6 +214,10 @@ void main() {
     expect(
       postedBodies['/sync/history']['shows'].single['episodes'].last['number'],
       3,
+    );
+    expect(
+      postedBodies['/sync/remove-from-list']['anime'].single['ids']['mal'],
+      456,
     );
     expect(postedBodies['/scrobble/start']['anime']['ids']['simkl'], 654);
     expect(postedBodies['/scrobble/start']['anime']['ids']['mal'], 321);

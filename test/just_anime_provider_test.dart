@@ -108,6 +108,67 @@ void main() {
         contains('momo.calm-koi.workers.dev/proxy'));
   });
 
+  test('resolves Momo video through JustAnime proxy headers', () async {
+    final service = RemoteCatalogService(client: MockClient((request) async {
+      if (request.url.path.endsWith('/megaplay')) {
+        return http.Response(
+            jsonEncode({
+              'sub': {
+                'sources': [
+                  {
+                    'url': 'https://cdn.mewstream.buzz/anime/master.m3u8',
+                    'quality': 'auto',
+                    'isM3U8': true,
+                  }
+                ],
+                'headers': {'Referer': 'https://megaplay.buzz/'},
+                'subtitles': [
+                  {
+                    'file': 'https://subs.test/english.vtt',
+                    'label': 'English',
+                    'default': true,
+                  }
+                ],
+              },
+              'dub': null,
+            }),
+            200);
+      }
+      return http.Response('not found', 404);
+    }));
+    const episode = EpisodeItem(
+      seriesName: 'Lamune',
+      episodeIndex: 0,
+      episodeNumber: 1,
+      displayName: 'Episode 1',
+      relativePath: 'Episode 1',
+      filePath: 'https://www.justanime.to/anime/670/lamune',
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.justAnime,
+      slug: '670',
+      watchUrl: 'https://www.justanime.to/anime/670/lamune',
+    );
+
+    final stream = await service.resolveDirectStream(
+      episode,
+      preferredMode: 'sub',
+      preferredServer: 'megaplay',
+    );
+
+    expect(stream?.provider, RemoteProvider.justAnime);
+    expect(stream?.server, 'momo');
+    expect(stream?.playbackKind, 'hls');
+    expect(stream?.playbackUrl, startsWith('https://momo.justanime.to/proxy?'));
+    final playbackUri = Uri.parse(stream!.playbackUrl);
+    expect(playbackUri.queryParameters['url'],
+        'https://cdn.mewstream.buzz/anime/master.m3u8');
+    expect(jsonDecode(playbackUri.queryParameters['headers']!)['Referer'],
+        'https://megaplay.buzz/');
+    expect(stream.subtitleTracks.single.label, 'English');
+    expect(stream.subtitleTracks.single.url,
+        contains('momo.calm-koi.workers.dev/proxy'));
+  });
+
   test('persists JustAnime audio and server preferences', () {
     const preference = SeriesPlaybackPreference(
       provider: RemoteProvider.justAnime,

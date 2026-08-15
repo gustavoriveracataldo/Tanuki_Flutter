@@ -3110,6 +3110,69 @@ void main() {
         isNot(contains('https://generic-player.test/embed/desu')));
   });
 
+  test('keeps JKAnime Desu native HLS before download host fallback', () async {
+    final desuUrl = base64Encode(
+      utf8.encode('https://jkanime.net/jkplayer/um?e=demo&t=token'),
+    );
+    final streamTapeUrl = base64Encode(
+      utf8.encode('https://streamtape.com/e/demo/demo.mp4'),
+    );
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://jkanime.net/demo/1/' => http.Response(
+              '''
+              <script>
+                video[0] = '<iframe src="https://jkanime.net/jkplayer/um?e=demo&t=token"></iframe>';
+                var servers = [
+                  {"remote":"$desuUrl","server":"Desu"},
+                  {"remote":"$streamTapeUrl","server":"Streamtape"}
+                ];
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://jkanime.net/jkplayer/um?e=demo&t=token' => http.Response(
+              '''
+              <script>
+                const player = {
+                  video: {
+                    url: 'https://nika.playmudos.com/demo/desu.m3u8',
+                    type: 'customHls'
+                  }
+                };
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://streamtape.com/e/demo/demo.mp4' => http.Response(
+              '''
+              <div id="botlink">//streamtape.com/get_video?id=demo</div>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.jkAnime,
+        filePath: 'https://jkanime.net/demo/1/',
+        watchUrl: 'https://jkanime.net/demo/',
+        slug: 'demo',
+      ),
+      preferredServer: 'desu',
+    );
+
+    expect(stream?.playbackUrl, 'https://nika.playmudos.com/demo/desu.m3u8');
+    expect(stream?.server, 'desu');
+  });
+
   test('prefers JKAnime var servers over native iframe like Android', () async {
     const jkIframe =
         'https://jkanime.net/jkplayer/um?e=demo&t=hash&op=OTc0MQ==';
@@ -3834,6 +3897,256 @@ void main() {
       stream?.playbackUrl,
       'https://player.zilla-networks.com/m3u8/148c333c484207780ae81447a5145a66',
     );
+  });
+
+  test('rejects WebView AnimeAV1 HLS when segments remain protected', () async {
+    const streamId = '33666400d29fbaf3f499efc5eff29c0d';
+    final segmentCookies = <String>[];
+    final webResolver = _FakeRemoteWebResolver(
+      const RemoteDirectStream(
+        playbackUrl: 'https://player.zilla-networks.com/m3u8/$streamId',
+        playbackKind: 'hls',
+        pageUrl: 'https://player.zilla-networks.com/play/$streamId',
+        selectedMode: 'android-webview',
+        httpHeaders: {'Cookie': 'zilla=session'},
+      ),
+    );
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2' =>
+            http.Response(
+              '''
+              <script>
+                data:[{type:"data",data:{episode:{number:2},
+                embeds:{SUB:[{server:"HLS",url:"https://player.zilla-networks.com/play/$streamId"}]}}}]
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/m3u8/$streamId' => http.Response(
+              '''
+              #EXTM3U
+              #EXT-X-VERSION:7
+              #EXT-X-MAP:URI="https://player.zilla-networks.com/segs/$streamId/init.html"
+              #EXTINF:10.0,
+              https://player.zilla-networks.com/segs/$streamId/000.html
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/segs/$streamId/init.html' => () {
+              segmentCookies.add(request.headers['Cookie'] ?? '');
+              return http.Response(
+                '<html>blocked</html>',
+                403,
+                request: request,
+              );
+            }(),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+      webResolver: webResolver,
+    );
+    addTearDown(service.close);
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.animeAv1,
+        episodeNumber: 2,
+        filePath: 'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2',
+        watchUrl: 'https://animeav1.com/media/tensei-shitara-slime-datta-ken',
+        slug: 'tensei-shitara-slime-datta-ken',
+      ),
+    );
+
+    expect(webResolver.requests, hasLength(1));
+    expect(
+      webResolver.requests.single.pageUrl,
+      'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2',
+    );
+    expect(webResolver.requests.single.preferredServer, 'mp4upload');
+    expect(segmentCookies, ['', 'zilla=session']);
+    expect(stream, isNull);
+  });
+
+  test('uses MP4Upload HTTP fallback when AnimeAV1 Zilla is protected',
+      () async {
+    const streamId = '33666400d29fbaf3f499efc5eff29c0d';
+    final segmentCookies = <String>[];
+    final webResolver = _FakeRemoteWebResolver(null);
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2' =>
+            http.Response(
+              '''
+              <script>
+                data:[{type:"data",data:{episode:{number:2},
+                embeds:{SUB:[
+                  {server:"HLS",url:"https://player.zilla-networks.com/play/$streamId"},
+                  {server:"MP4Upload",url:"https://www.mp4upload.com/embed-demo.html"}
+                ]}}}]
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/m3u8/$streamId' => http.Response(
+              '''
+              #EXTM3U
+              #EXT-X-VERSION:7
+              #EXT-X-MAP:URI="https://player.zilla-networks.com/segs/$streamId/init.html"
+              #EXTINF:10.0,
+              https://player.zilla-networks.com/segs/$streamId/000.html
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/segs/$streamId/init.html' => () {
+              segmentCookies.add(request.headers['Cookie'] ?? '');
+              return http.Response(
+                '<html>blocked</html>',
+                403,
+                request: request,
+              );
+            }(),
+          'https://www.mp4upload.com/embed-demo.html' => http.Response(
+              '''
+              <script>
+                player.src({ src: "https://cdn.example.test/animeav1/mp4upload.mp4" });
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+      webResolver: webResolver,
+    );
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.animeAv1,
+        episodeNumber: 2,
+        filePath: 'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2',
+        watchUrl: 'https://animeav1.com/media/tensei-shitara-slime-datta-ken',
+        slug: 'tensei-shitara-slime-datta-ken',
+      ),
+    );
+
+    expect(webResolver.requests, isEmpty);
+    expect(segmentCookies, ['']);
+    expect(stream?.playbackUrl, startsWith('http://127.0.0.1:'));
+    expect(stream?.playbackKind, 'mp4');
+    expect(stream?.selectedMode, AnimeAv1PlaybackMode.subHls.id);
+    expect(stream?.server, 'mp4upload');
+    expect(stream?.httpHeaders['X-Tanuki-Upstream-Url'],
+        'https://cdn.example.test/animeav1/mp4upload.mp4');
+  });
+
+  test('uses DUB MP4Upload fallback when AnimeAV1 DUB Zilla is protected',
+      () async {
+    const subStreamId = '11116400d29fbaf3f499efc5eff29c0d';
+    const dubStreamId = '22226400d29fbaf3f499efc5eff29c0d';
+    final segmentRequests = <String>[];
+    final embedRequests = <String>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2' =>
+            http.Response(
+              '''
+              <script>
+                data:[{type:"data",data:{episode:{number:2},
+                embeds:{
+                  SUB:[
+                    {server:"HLS",url:"https://player.zilla-networks.com/play/$subStreamId"},
+                    {server:"MP4Upload",url:"https://www.mp4upload.com/embed-sub.html"}
+                  ],
+                  DUB:[
+                    {server:"HLS",url:"https://player.zilla-networks.com/play/$dubStreamId"},
+                    {server:"MP4Upload",url:"https://www.mp4upload.com/embed-dub.html"}
+                  ]
+                }}}]
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/m3u8/$dubStreamId' =>
+            http.Response(
+              '''
+              #EXTM3U
+              #EXT-X-VERSION:7
+              #EXT-X-MAP:URI="https://player.zilla-networks.com/segs/$dubStreamId/init.html"
+              #EXTINF:10.0,
+              https://player.zilla-networks.com/segs/$dubStreamId/000.html
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/segs/$dubStreamId/init.html' =>
+            () {
+              segmentRequests.add(request.url.toString());
+              return http.Response(
+                '<html>blocked</html>',
+                403,
+                request: request,
+              );
+            }(),
+          'https://www.mp4upload.com/embed-dub.html' => () {
+              embedRequests.add(request.url.toString());
+              return http.Response(
+                '''
+                <script>
+                  player.src({ src: "https://cdn.example.test/animeav1/dub.mp4" });
+                </script>
+                ''',
+                200,
+                request: request,
+              );
+            }(),
+          'https://www.mp4upload.com/embed-sub.html' => () {
+              embedRequests.add(request.url.toString());
+              return http.Response(
+                '''
+                <script>
+                  player.src({ src: "https://cdn.example.test/animeav1/sub.mp4" });
+                </script>
+                ''',
+                200,
+                request: request,
+              );
+            }(),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+    addTearDown(service.close);
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.animeAv1,
+        episodeNumber: 2,
+        filePath: 'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2',
+        watchUrl: 'https://animeav1.com/media/tensei-shitara-slime-datta-ken',
+        slug: 'tensei-shitara-slime-datta-ken',
+      ),
+      preferredMode: AnimeAv1PlaybackMode.dubHls.id,
+    );
+
+    expect(segmentRequests, [
+      'https://player.zilla-networks.com/segs/$dubStreamId/init.html',
+    ]);
+    expect(embedRequests, ['https://www.mp4upload.com/embed-dub.html']);
+    expect(stream?.playbackKind, 'mp4');
+    expect(stream?.selectedMode, AnimeAv1PlaybackMode.dubHls.id);
+    expect(stream?.server, 'mp4upload');
+    expect(stream?.httpHeaders['X-Tanuki-Upstream-Url'],
+        'https://cdn.example.test/animeav1/dub.mp4');
   });
 
   test('resolves AnimeFLV var videos payload through Streamtape', () async {

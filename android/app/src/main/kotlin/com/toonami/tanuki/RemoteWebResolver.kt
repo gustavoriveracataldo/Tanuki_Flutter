@@ -632,6 +632,17 @@ class RemoteWebResolver(private val activity: Activity) {
                   if (server === 'netu') score += 300;
                   return score;
                 }
+                if (provider === 'animeav1') {
+                  if (server === 'mp4upload') score += 760;
+                  if (server === 'streamwish') score += 500;
+                  if (server === 'mixdrop') score += 430;
+                  if (server === 'doodstream') score += 390;
+                  if (server === 'streamtape') score += 320;
+                  if (server === 'netu') score += 300;
+                  if (server === 'uqload') score += 180;
+                  if (server === 'yourupload') score += 170;
+                  return score;
+                }
                 if (server === 'streamwish') score += provider === 'jkanime' ? 500 : 180;
                 if (server === 'mixdrop') score += 430;
                 if (server === 'doodstream') score += 390;
@@ -824,6 +835,10 @@ class RemoteWebResolver(private val activity: Activity) {
                 if (!target) return false;
                 const directAttr = target.attrs.map((value) => toAbsoluteUrl(value)).find((value) => supportedHostPattern.test(value));
                 emitHostAttempt(directAttr || target.attrs.join(' ') || target.server, target.server);
+                try {
+                  if (target.node.dataset?.tanukiResolverClicked === '1') return false;
+                  target.node.dataset.tanukiResolverClicked = '1';
+                } catch (_) {}
                 if (directAttr) return navigateToHost([directAttr]);
                 try { target.node.click(); return true; } catch (_) { return false; }
               };
@@ -840,7 +855,7 @@ class RemoteWebResolver(private val activity: Activity) {
               const run = () => {
                 installNetworkHooks();
                 emitSubtitleTracksFromDom();
-                clickPreferredServer();
+                if (clickPreferredServer() && provider === 'animeav1') return true;
                 clickLikelyPlayer();
                 if (emitVideoTagCandidate() || emitJwPlayerCandidate() || emitStructuredPlayerCandidate()) return true;
                 const html = String(document.documentElement?.outerHTML || '');
@@ -924,13 +939,20 @@ class RemoteWebResolver(private val activity: Activity) {
         }
         val lower = url.lowercase(Locale.ROOT)
         return when {
-            ".m3u8" in lower || "/m3u8/" in lower -> "hls"
-            ".mpd" in lower -> "dash"
-            ".mp4" in lower ||
+            hasMediaPathExtension(lower, "m3u8") || "/m3u8/" in lower -> "hls"
+            hasMediaPathExtension(lower, "mpd") -> "dash"
+            hasMediaPathExtension(lower, "mp4") ||
                 "streamtape.com/get_video" in lower ||
                 ("hqq.tv" in lower && "stream=1" in lower) -> "mp4"
             else -> ""
         }
+    }
+
+    private fun hasMediaPathExtension(url: String, extension: String): Boolean {
+        val path = runCatching { Uri.parse(url).path.orEmpty() }
+            .getOrDefault(url)
+            .lowercase(Locale.ROOT)
+        return path.endsWith(".$extension")
     }
 
     private fun normalizeZillaPlayUrl(url: String): String {

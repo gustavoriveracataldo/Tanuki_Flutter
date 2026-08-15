@@ -3479,6 +3479,8 @@ class AppController extends ChangeNotifier {
     final nextWatching = {...profile.watchingSeries};
     final nextCompleted = {...profile.completedSeries};
     final nextAbandoned = {...profile.abandonedSeries};
+    final nextExternalNoStatus = {...profile.externalNoStatusSeries}
+      ..removeAll(matchingKeys);
     if (completedSeries) {
       nextWatching.removeAll(matchingKeys);
       nextAbandoned.removeAll(matchingKeys);
@@ -3491,6 +3493,7 @@ class AppController extends ChangeNotifier {
       watchingSeries: nextWatching,
       abandonedSeries: nextAbandoned,
       completedSeries: nextCompleted,
+      externalNoStatusSeries: nextExternalNoStatus,
       episodePlayback: nextPlayback,
       currentEntry: targetEpisode,
     );
@@ -3918,6 +3921,7 @@ class AppController extends ChangeNotifier {
       watchingSeries: {...profile.watchingSeries}..remove(key),
       abandonedSeries: {...profile.abandonedSeries}..remove(key),
       completedSeries: {...profile.completedSeries}..remove(key),
+      externalNoStatusSeries: {...profile.externalNoStatusSeries}..remove(key),
     );
 
     switch (statusKey) {
@@ -3952,6 +3956,8 @@ class AppController extends ChangeNotifier {
   Future<void> stopWatchingSeries(SeriesItem series) async {
     final key = series.stableKey;
     final profile = _state.profile;
+    final matchingKeys = _matchingSeriesKeysForState(series);
+    final wasCompleted = matchingKeys.any(profile.completedSeries.contains);
     final nextPlayback = Map<String, EpisodePlaybackRecord>.from(
       profile.episodePlayback,
     );
@@ -3978,10 +3984,13 @@ class AppController extends ChangeNotifier {
     );
     _state = _state.copyWith(
       profile: profileWithPlaylist.copyWith(
-        watchlistSeries: {...profile.watchlistSeries}..remove(key),
-        watchingSeries: {...profile.watchingSeries}..remove(key),
-        abandonedSeries: {...profile.abandonedSeries}..remove(key),
-        completedSeries: {...profile.completedSeries}..remove(key),
+        watchlistSeries: {...profile.watchlistSeries}..removeAll(matchingKeys),
+        watchingSeries: {...profile.watchingSeries}..removeAll(matchingKeys),
+        abandonedSeries: {...profile.abandonedSeries}..removeAll(matchingKeys),
+        completedSeries: {...profile.completedSeries},
+        externalNoStatusSeries: wasCompleted
+            ? ({...profile.externalNoStatusSeries}..removeAll(matchingKeys))
+            : ({...profile.externalNoStatusSeries}..addAll(matchingKeys)),
         episodePlayback: nextPlayback,
         currentEntry: clearCurrent ? null : currentEntry,
         clearCurrentEntry: clearCurrent,
@@ -3990,6 +3999,9 @@ class AppController extends ChangeNotifier {
     _statusMessage = '${series.name} salio de Continuar viendo.';
     await _save();
     notifyListeners();
+    if (!wasCompleted) {
+      unawaited(_syncSeriesStateExternal(key));
+    }
   }
 
   List<MyAnimeListLocalAnimeUpdate> _buildMyAnimeListLocalUpdates(
@@ -4006,6 +4018,7 @@ class AppController extends ChangeNotifier {
       ...profile.watchingSeries,
       ...profile.abandonedSeries,
       ...profile.completedSeries,
+      ...profile.externalNoStatusSeries,
       ...profile.activePlaylist.progress.keys,
       ...profile.myAnimeListMappings.keys,
       if (profile.currentEntry != null)
@@ -4020,7 +4033,10 @@ class AppController extends ChangeNotifier {
                   _seriesStateKeyForEpisode(profile.currentEntry!) == key
               ? profile.currentEntry!.seriesName
               : key);
-      final watched = _watchedEpisodesForSeriesKey(profile, key, series);
+      final forceNoStatus = profile.externalNoStatusSeries.contains(key);
+      final watched = forceNoStatus
+          ? 0
+          : _watchedEpisodesForSeriesKey(profile, key, series);
       final listStatus = _myAnimeListListStatusForKey(
         profile,
         key,
@@ -4028,7 +4044,7 @@ class AppController extends ChangeNotifier {
         series,
       );
       final favorite = profile.favoriteSeries.contains(key);
-      if (!favorite && listStatus.isEmpty && watched <= 0) {
+      if (!favorite && !forceNoStatus && listStatus.isEmpty && watched <= 0) {
         continue;
       }
       final catalogId = series?.catalogId ?? 0;
@@ -4064,6 +4080,7 @@ class AppController extends ChangeNotifier {
       ...profile.watchingSeries,
       ...profile.abandonedSeries,
       ...profile.completedSeries,
+      ...profile.externalNoStatusSeries,
       ...profile.activePlaylist.progress.keys,
       ...profile.simklMappings.keys,
       if (profile.currentEntry != null)
@@ -4078,9 +4095,12 @@ class AppController extends ChangeNotifier {
                   _seriesStateKeyForEpisode(profile.currentEntry!) == key
               ? profile.currentEntry!.seriesName
               : key);
-      final watched = _watchedEpisodesForSeriesKey(profile, key, series);
+      final forceNoStatus = profile.externalNoStatusSeries.contains(key);
+      final watched = forceNoStatus
+          ? 0
+          : _watchedEpisodesForSeriesKey(profile, key, series);
       final listStatus = _simklListStatusForKey(profile, key, watched, series);
-      if (listStatus.isEmpty && watched <= 0) {
+      if (!forceNoStatus && listStatus.isEmpty && watched <= 0) {
         continue;
       }
       final catalogId = series?.catalogId ?? 0;
@@ -4094,6 +4114,7 @@ class AppController extends ChangeNotifier {
           listStatus: listStatus,
           watchedEpisodes: watched,
           episodeCount: series?.episodeCount ?? 0,
+          removeFromList: forceNoStatus,
         ),
       );
     }
@@ -4186,6 +4207,9 @@ class AppController extends ChangeNotifier {
     if (profile.completedSeries.contains(key)) {
       return 'completed';
     }
+    if (profile.externalNoStatusSeries.contains(key)) {
+      return '';
+    }
     if (profile.abandonedSeries.contains(key)) {
       return 'dropped';
     }
@@ -4215,6 +4239,9 @@ class AppController extends ChangeNotifier {
   ) {
     if (profile.completedSeries.contains(key)) {
       return 'completed';
+    }
+    if (profile.externalNoStatusSeries.contains(key)) {
+      return '';
     }
     if (profile.abandonedSeries.contains(key)) {
       return 'dropped';
@@ -5259,6 +5286,8 @@ class AppController extends ChangeNotifier {
     final nextWatching = {...profile.watchingSeries};
     final nextCompleted = {...profile.completedSeries};
     final nextAbandoned = {...profile.abandonedSeries};
+    final nextExternalNoStatus = {...profile.externalNoStatusSeries}
+      ..removeAll(matchingKeys);
     if (completedSeries) {
       nextWatching.removeAll(matchingKeys);
       nextAbandoned.removeAll(matchingKeys);
@@ -5275,6 +5304,7 @@ class AppController extends ChangeNotifier {
       watchingSeries: nextWatching,
       abandonedSeries: nextAbandoned,
       completedSeries: nextCompleted,
+      externalNoStatusSeries: nextExternalNoStatus,
       currentEntry: episode,
     );
   }
@@ -5296,6 +5326,8 @@ class AppController extends ChangeNotifier {
     return profile.copyWith(
       watchlistSeries: {...profile.watchlistSeries}..removeAll(matchingKeys),
       watchingSeries: {...profile.watchingSeries}..add(key),
+      externalNoStatusSeries: {...profile.externalNoStatusSeries}
+        ..removeAll(matchingKeys),
       currentEntry: episode,
     );
   }

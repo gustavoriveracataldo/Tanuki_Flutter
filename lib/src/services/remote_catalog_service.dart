@@ -56,6 +56,7 @@ class RemoteCatalogService {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
   static const _animeAv1ModeSubHls = 'sub-hls';
   static const _animeAv1ModeDubHls = 'dub-hls';
+  static const _animeAv1ProtectedFallbackServer = 'mp4upload';
   static const _bilibiliEpisodeOptionsPrefix = 'tanuki:bilibili-options:';
   static const _youtubeEpisodeOptionsPrefix = 'tanuki:youtube-options:';
 
@@ -67,6 +68,7 @@ class RemoteCatalogService {
   final String _myAnimeListClientId;
   final List<_BiliBiliDashProxy> _bilibiliDashProxies = <_BiliBiliDashProxy>[];
   final List<_JustAnimeHlsProxy> _justAnimeHlsProxies = [];
+  final List<_DirectMediaProxy> _directMediaProxies = [];
   final Map<int, Future<RemoteSearchCandidate?>> _aniListDetailCache = {};
   final Map<int, Future<List<SeriesEpisodeMetadata>>> _aniListEpisodeCache = {};
   DateTime? _aniListBlockedUntil;
@@ -3322,8 +3324,221 @@ $airingScheduleFields
       availableModes: playbackByMode.keys.toSet(),
       selectedMode: selectedMode,
     );
+    if (await _isAnimeAv1HlsProtected(resolved)) {
+      _debugResolver(
+        'animeav1 direct HLS protected, using platform web '
+        '${_debugStreamLabel(resolved)}',
+      );
+      final webPreferredServer = preferredServer.trim().isNotEmpty
+          ? preferredServer
+          : _animeAv1ProtectedFallbackServer;
+      final hostResolved = await _resolveAnimeAv1ProtectedFallbackStream(
+        html: response.body,
+        episodeUrl: episodeUrl,
+        selectedMode: selectedMode,
+        preferredServer: webPreferredServer,
+        excludedServers: excludedServers,
+        provider: entry.provider,
+      );
+      if (hostResolved != null) {
+        _debugResolver(
+          'animeav1 protected host ${_debugStreamLabel(hostResolved)}',
+        );
+        return hostResolved;
+      }
+      final webResolved = await _resolvePlatformWebDirectStream(
+        entry,
+        preferredServer: webPreferredServer,
+        excludedServers: excludedServers,
+      );
+      if (webResolved != null && await _isAnimeAv1HlsProtected(webResolved)) {
+        _debugResolver(
+          'animeav1 protected web still blocked '
+          '${_debugStreamLabel(webResolved)}',
+        );
+        return null;
+      }
+      _debugResolver(
+        'animeav1 protected web ${_debugStreamLabel(webResolved)}',
+      );
+      return webResolved;
+    }
     _debugResolver('animeav1 resolved ${_debugStreamLabel(resolved)}');
     return resolved;
+  }
+
+  Future<RemoteDirectStream?> _resolveAnimeAv1ProtectedFallbackStream({
+    required String html,
+    required String episodeUrl,
+    required String selectedMode,
+    required String preferredServer,
+    required Set<String> excludedServers,
+    required RemoteProvider? provider,
+  }) async {
+    final server = _normalizeServerPreference(
+      preferredServer.trim().isEmpty
+          ? _animeAv1ProtectedFallbackServer
+          : preferredServer,
+    );
+    final excluded = excludedServers
+        .map(_normalizeServerPreference)
+        .where((value) => value.isNotEmpty)
+        .toSet();
+    if (server.isEmpty || excluded.contains(server)) {
+      return null;
+    }
+    final variants = selectedMode == _animeAv1ModeDubHls
+        ? const ['DUB', 'SUB']
+        : const ['SUB', 'DUB'];
+    for (final variant in variants) {
+      final embedUrl = _extractAnimeAv1EmbedUrl(
+        html,
+        variant: variant,
+        server: server,
+        baseUrl: episodeUrl,
+      );
+      if (embedUrl.isEmpty) {
+        continue;
+      }
+      final uri = Uri.tryParse(embedUrl);
+      if (uri == null || !uri.hasScheme) {
+        continue;
+      }
+      _debugResolver(
+        'animeav1 protected fallback fetch server=$server variant=$variant '
+        'url=${_debugUrlLabel(embedUrl)}',
+      );
+      final response = await _get(uri, referer: episodeUrl);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        _debugResolver(
+          'animeav1 protected fallback fetch failed server=$server '
+          'status=${response.statusCode} url=${_debugUrlLabel(embedUrl)}',
+        );
+        continue;
+      }
+      final effectiveUrl = response.request?.url.toString() ?? embedUrl;
+      final resolved = await _resolveDirectStreamFromHtml(
+        html: response.body,
+        pageUrl: effectiveUrl,
+        referer: episodeUrl,
+        visited: {episodeUrl, embedUrl, effectiveUrl},
+        preferredServer: server,
+        excludedServers: excludedServers,
+      );
+      if (resolved == null) {
+        _debugResolver(
+          'animeav1 protected fallback unresolved server=$server '
+          'url=${_debugUrlLabel(effectiveUrl)}',
+        );
+        continue;
+      }
+      final resolvedServer = resolved.server.trim().isNotEmpty
+          ? resolved.server
+          : _normalizeServerPreference(effectiveUrl).isNotEmpty
+              ? _normalizeServerPreference(effectiveUrl)
+              : server;
+      final tagged = resolved.copyWith(
+        provider: provider,
+        server: resolvedServer,
+        availableServers: {server},
+        selectedMode: selectedMode,
+      );
+      return _proxyAnimeAv1Mp4UploadIfNeeded(tagged);
+    }
+    return null;
+  }
+
+  Future<RemoteDirectStream> _proxyAnimeAv1Mp4UploadIfNeeded(
+    RemoteDirectStream stream,
+  ) async {
+    if (stream.provider != RemoteProvider.animeAv1 ||
+        stream.playbackKind.toLowerCase() != 'mp4' ||
+        _normalizeServerPreference(stream.server) != 'mp4upload' ||
+        !(io.Platform.isLinux || io.Platform.isAndroid)) {
+      return stream;
+    }
+    final proxy = await _DirectMediaProxy.start(
+      client: _client,
+      upstreamUrl: stream.playbackUrl,
+      headers: stream.httpHeaders,
+      userAgent: _defaultFetchUserAgent,
+    );
+    _directMediaProxies.add(proxy);
+    return stream.copyWith(
+      playbackUrl: proxy.playbackUrl,
+      httpHeaders: {
+        'X-Tanuki-Upstream-Url': stream.playbackUrl,
+      },
+    );
+  }
+
+  Future<bool> _isAnimeAv1HlsProtected(RemoteDirectStream stream) async {
+    if (stream.playbackKind.toLowerCase() != 'hls' ||
+        !stream.playbackUrl.contains('player.zilla-networks.com/m3u8/')) {
+      return false;
+    }
+    final playlistUri = Uri.tryParse(stream.playbackUrl);
+    if (playlistUri == null || !playlistUri.hasScheme) {
+      return false;
+    }
+    try {
+      final playlist = await _get(
+        playlistUri,
+        referer: stream.pageUrl,
+        headers: {
+          'Accept': 'application/x-mpegURL,*/*;q=0.8',
+          ...stream.httpHeaders,
+        },
+      ).timeout(const Duration(seconds: 8));
+      if (playlist.statusCode == 401 || playlist.statusCode == 403) {
+        _debugResolver(
+          'animeav1 HLS playlist protected status=${playlist.statusCode}',
+        );
+        return true;
+      }
+      if (playlist.statusCode < 200 || playlist.statusCode >= 300) {
+        _debugResolver(
+          'animeav1 HLS playlist probe inconclusive '
+          'status=${playlist.statusCode}',
+        );
+        return false;
+      }
+      final firstSegment = _firstHlsMediaUrl(playlist.body, stream.playbackUrl);
+      if (firstSegment.isEmpty) {
+        _debugResolver('animeav1 HLS segment probe skipped empty playlist');
+        return false;
+      }
+      final segmentUri = Uri.tryParse(firstSegment);
+      if (segmentUri == null || !segmentUri.hasScheme) {
+        return false;
+      }
+      final segment = await _client.get(segmentUri, headers: {
+        'Accept': '*/*',
+        'User-Agent': _defaultFetchUserAgent,
+        'Referer': stream.pageUrl,
+        'Origin': _baseOrigin(stream.pageUrl),
+        ...stream.httpHeaders,
+        'Range': 'bytes=0-0',
+      }).timeout(const Duration(seconds: 8));
+      if (segment.statusCode == 401 || segment.statusCode == 403) {
+        _debugResolver(
+          'animeav1 HLS segment protected status=${segment.statusCode} '
+          'segment=${_debugUrlLabel(firstSegment)}',
+        );
+        return true;
+      }
+      _debugResolver(
+        'animeav1 HLS segment probe ok status=${segment.statusCode} '
+        'segment=${_debugUrlLabel(firstSegment)}',
+      );
+      return false;
+    } on TimeoutException catch (error) {
+      _debugResolver('animeav1 HLS probe timeout $error');
+      return false;
+    } catch (error) {
+      _debugResolver('animeav1 HLS probe failed $error');
+      return false;
+    }
   }
 
   Future<RemoteDirectStream?> _resolvePlatformWebDirectStream(
@@ -3397,14 +3612,17 @@ $airingScheduleFields
       if (server == JustAnimeServerPreference.neko && language == 'dub') {
         continue;
       }
-      final endpoint = server == JustAnimeServerPreference.neko
-          ? 'anineko/$language/hd1'
-          : 'animegg';
+      final endpoint = switch (server) {
+        JustAnimeServerPreference.momo => 'megaplay',
+        JustAnimeServerPreference.neko => 'anineko/$language/hd1',
+        JustAnimeServerPreference.gigi => 'animegg',
+      };
       final response = await _getJustAnimeApi(
         '/watch/$animeId/episode/$episode/$endpoint',
       );
       if (response == null) continue;
-      final selected = server == JustAnimeServerPreference.gigi
+      final selected = server == JustAnimeServerPreference.gigi ||
+              server == JustAnimeServerPreference.momo
           ? (response[language] is Map
               ? Map<String, dynamic>.from(response[language] as Map)
               : null)
@@ -3418,8 +3636,11 @@ $airingScheduleFields
       final isHls = source['isM3U8'] == true || rawUrl.contains('.m3u8');
       var playbackUrl = rawUrl;
       if (server == JustAnimeServerPreference.neko) {
-        final upstream = Uri.parse('https://neko.justanime.to/m3u8-proxy')
-            .replace(queryParameters: {'url': rawUrl}).toString();
+        final upstream = _buildJustAnimeProxyUrl(
+          'https://neko.justanime.to/m3u8-proxy',
+          rawUrl,
+          _readHeaderMap(selected['headers'] ?? response['headers']),
+        );
         final proxy = await _JustAnimeHlsProxy.start(
           client: _client,
           upstreamUrl: upstream,
@@ -3427,10 +3648,17 @@ $airingScheduleFields
         );
         _justAnimeHlsProxies.add(proxy);
         playbackUrl = proxy.playlistUrl;
+      } else if (server == JustAnimeServerPreference.momo) {
+        playbackUrl = _buildJustAnimeProxyUrl(
+          'https://momo.justanime.to/proxy',
+          rawUrl,
+          _readHeaderMap(selected['headers'] ?? response['headers']),
+        );
       }
       final ownTracks = _parseJustAnimeSubtitleTracks(
         selected['subtitles'] ?? selected['tracks'],
-        proxy: server == JustAnimeServerPreference.neko,
+        proxy: server == JustAnimeServerPreference.neko ||
+            server == JustAnimeServerPreference.momo,
       );
       return RemoteDirectStream(
         playbackUrl: playbackUrl,
@@ -3446,15 +3674,47 @@ $airingScheduleFields
         provider: RemoteProvider.justAnime,
         server: server.id,
         subtitleTracks: _mergeJustAnimeSubtitleTracks(subtitles, ownTracks),
-        httpHeaders: server == JustAnimeServerPreference.neko
-            ? const {'User-Agent': _defaultFetchUserAgent}
-            : const {
-                'Referer': 'https://www.animegg.org/',
-                'User-Agent': _defaultFetchUserAgent,
-              },
+        httpHeaders: switch (server) {
+          JustAnimeServerPreference.momo => const {
+              'Referer': _justAnimeBaseUrl,
+              'Origin': _justAnimeBaseUrl,
+              'User-Agent': _defaultFetchUserAgent,
+            },
+          JustAnimeServerPreference.neko => const {
+              'User-Agent': _defaultFetchUserAgent
+            },
+          JustAnimeServerPreference.gigi => const {
+              'Referer': 'https://www.animegg.org/',
+              'User-Agent': _defaultFetchUserAgent,
+            },
+        },
       );
     }
     return null;
+  }
+
+  String _buildJustAnimeProxyUrl(
+    String proxyBaseUrl,
+    String targetUrl,
+    Map<String, String> headers,
+  ) {
+    return Uri.parse(proxyBaseUrl).replace(queryParameters: {
+      'url': targetUrl,
+      if (headers.isNotEmpty) 'headers': jsonEncode(headers),
+    }).toString();
+  }
+
+  Map<String, String> _readHeaderMap(Object? value) {
+    if (value is! Map) return const {};
+    final headers = <String, String>{};
+    for (final entry in value.entries) {
+      final key = _readString(entry.key);
+      final headerValue = _readString(entry.value);
+      if (key.isNotEmpty && headerValue.isNotEmpty) {
+        headers[key] = headerValue;
+      }
+    }
+    return headers;
   }
 
   Future<Map<String, dynamic>?> _getJustAnimeApi(String path) async {
@@ -3520,17 +3780,8 @@ $airingScheduleFields
     if (candidates.isEmpty) return null;
     final preferred = preferredServer.trim().toLowerCase();
     candidates.sort((left, right) {
-      int score(({Map<String, dynamic> item, String key}) candidate) {
-        final family = _aniPmServerFamily(candidate.key);
-        final preferredScore = candidate.key == preferred
-            ? 100000
-            : family == preferred
-                ? 50000
-                : 0;
-        return preferredScore + _readInt(candidate.item['priority']);
-      }
-
-      return score(right).compareTo(score(left));
+      return _aniPmCandidateSortScore(right, preferred)
+          .compareTo(_aniPmCandidateSortScore(left, preferred));
     });
     final availableServers = candidates.map((item) => item.key).toSet();
     for (final candidate in candidates) {
@@ -3647,6 +3898,35 @@ $airingScheduleFields
   }
 
   String _aniPmServerFamily(String key) => key.split('-').first;
+
+  int _aniPmCandidateSortScore(
+    ({Map<String, dynamic> item, String key}) candidate,
+    String preferred,
+  ) {
+    final family = _aniPmServerFamily(candidate.key);
+    var score = _readInt(candidate.item['priority']);
+    if (candidate.key == preferred) {
+      score += 100000;
+    } else if (family == preferred) {
+      score += 50000;
+    }
+    final provider = _readString(candidate.item['provider']).toLowerCase();
+    final kind = _readString(candidate.item['kind']).toLowerCase();
+    final subtitle = _readString(candidate.item['subtitle']).toLowerCase();
+    if (provider == 'lyra') {
+      score += 2000;
+    }
+    if (subtitle == 'soft') {
+      score += 500;
+    }
+    if (provider == 'comet') {
+      score -= 5000;
+    }
+    if (kind == 'dash') {
+      score -= 20000;
+    }
+    return score;
+  }
 
   List<RemoteSubtitleTrack> _parseAniPmSubtitleTracks(Object? value) {
     if (value is! List) return const [];
@@ -4829,8 +5109,11 @@ $airingScheduleFields
   }) async {
     final resolverHtml = _expandResolverHtml(html);
     final subtitleTracks = _extractSubtitleTracks(resolverHtml, pageUrl);
-    final endpointStream =
-        await _resolveDownloadEndpointStream(resolverHtml, pageUrl);
+    final preferHostCandidates =
+        _shouldPreferHostCandidateResolution(resolverHtml, pageUrl);
+    final endpointStream = preferHostCandidates
+        ? null
+        : await _resolveDownloadEndpointStream(resolverHtml, pageUrl);
     if (endpointStream != null) {
       return endpointStream.copyWith(
         subtitleTracks: _mergeRemoteSubtitleTracks(
@@ -4840,8 +5123,29 @@ $airingScheduleFields
       );
     }
 
-    final preferHostCandidates =
-        _shouldPreferHostCandidateResolution(resolverHtml, pageUrl);
+    final preferDirectMediaBeforeHostCandidates =
+        _shouldPreferDirectMediaBeforeHostCandidates(pageUrl);
+    final directUrl = _findBestDirectMediaUrl(
+      resolverHtml,
+      pageUrl,
+      preferredFacebookMode: preferredFacebookMode,
+    );
+    if (preferDirectMediaBeforeHostCandidates && directUrl.isNotEmpty) {
+      return RemoteDirectStream(
+        playbackUrl: directUrl,
+        playbackKind: _inferPlaybackKind(directUrl),
+        pageUrl: pageUrl,
+        availableModes: const {'http-direct'},
+        selectedMode: 'http-direct',
+        server: _normalizeServerPreference(pageUrl),
+        subtitleTracks: subtitleTracks,
+        httpHeaders: _directMediaHttpHeaders(
+          directUrl: directUrl,
+          pageUrl: pageUrl,
+        ),
+      );
+    }
+
     if (preferHostCandidates) {
       final hostStream = await _resolveHostCandidateStream(
         html: resolverHtml,
@@ -4863,11 +5167,6 @@ $airingScheduleFields
       }
     }
 
-    final directUrl = _findBestDirectMediaUrl(
-      resolverHtml,
-      pageUrl,
-      preferredFacebookMode: preferredFacebookMode,
-    );
     if (directUrl.isNotEmpty) {
       return RemoteDirectStream(
         playbackUrl: directUrl,
@@ -4880,6 +5179,16 @@ $airingScheduleFields
         httpHeaders: _directMediaHttpHeaders(
           directUrl: directUrl,
           pageUrl: pageUrl,
+        ),
+      );
+    }
+    final fallbackEndpointStream =
+        await _resolveDownloadEndpointStream(resolverHtml, pageUrl);
+    if (fallbackEndpointStream != null) {
+      return fallbackEndpointStream.copyWith(
+        subtitleTracks: _mergeRemoteSubtitleTracks(
+          subtitleTracks,
+          fallbackEndpointStream.subtitleTracks,
         ),
       );
     }
@@ -4936,6 +5245,13 @@ $airingScheduleFields
       }
     }
     return null;
+  }
+
+  bool _shouldPreferDirectMediaBeforeHostCandidates(String pageUrl) {
+    final uri = Uri.tryParse(pageUrl);
+    final host = uri?.host.toLowerCase() ?? '';
+    final path = uri?.path.toLowerCase() ?? '';
+    return host.contains('jkanime.net') && path.contains('/jkplayer/');
   }
 
   Future<RemoteDirectStream?> _resolveHostCandidateStream({
@@ -7806,6 +8122,10 @@ $airingScheduleFields
       unawaited(proxy.close());
     }
     _justAnimeHlsProxies.clear();
+    for (final proxy in _directMediaProxies) {
+      unawaited(proxy.close());
+    }
+    _directMediaProxies.clear();
     _client.close();
   }
 
@@ -7821,14 +8141,21 @@ $airingScheduleFields
     final biliBili = _bilibiliDashProxies
         .where((proxy) => Uri.parse(proxy.manifestUrl).port == target.port)
         .toList(growable: false);
+    final directMedia = _directMediaProxies
+        .where((proxy) => Uri.parse(proxy.playbackUrl).port == target.port)
+        .toList(growable: false);
     _justAnimeHlsProxies.removeWhere(justAnime.contains);
     _bilibiliDashProxies.removeWhere(biliBili.contains);
-    if (justAnime.isEmpty && biliBili.isEmpty) return;
+    _directMediaProxies.removeWhere(directMedia.contains);
+    if (justAnime.isEmpty && biliBili.isEmpty && directMedia.isEmpty) return;
     unawaited(Future<void>.delayed(const Duration(milliseconds: 250), () async {
       for (final proxy in justAnime) {
         await proxy.close();
       }
       for (final proxy in biliBili) {
+        await proxy.close();
+      }
+      for (final proxy in directMedia) {
         await proxy.close();
       }
     }));
@@ -9506,6 +9833,9 @@ $airingScheduleFields
         lower.contains('sbplay')) {
       return 'streamsb';
     }
+    if (lower.contains('stape') || lower.contains('streamtape')) {
+      return 'stape';
+    }
     if (lower.contains('desu')) {
       return 'desu';
     }
@@ -9520,9 +9850,6 @@ $airingScheduleFields
     }
     if (lower.contains('netu') || lower.contains('hqq')) {
       return 'netu';
-    }
-    if (lower.contains('stape') || lower.contains('streamtape')) {
-      return 'stape';
     }
     return lower.replaceAll(RegExp(r'[^a-z0-9]+'), '');
   }
@@ -10793,12 +11120,74 @@ $airingScheduleFields
     return '';
   }
 
+  String _extractAnimeAv1EmbedUrl(
+    String html, {
+    required String variant,
+    required String server,
+    required String baseUrl,
+  }) {
+    final normalizedHtml = _decodeHtml(html).replaceAll(r'\/', '/');
+    final variantKey = RegExp.escape(variant);
+    final block = RegExp(
+          '["\\\']?$variantKey["\\\']?\\s*:\\s*\\[([\\s\\S]{0,3200}?)\\]',
+          caseSensitive: false,
+        ).firstMatch(normalizedHtml)?.group(1) ??
+        '';
+    if (block.isEmpty) {
+      return '';
+    }
+    final normalizedServer = _normalizeServerPreference(server);
+    final entryPattern = RegExp(r'\{([\s\S]*?)\}', caseSensitive: false);
+    for (final match in entryPattern.allMatches(block)) {
+      final entry = match.group(1) ?? '';
+      final rawServer = RegExp(
+            '["\\\']?server["\\\']?\\s*:\\s*["\\\']([^"\\\']+)["\\\']',
+            caseSensitive: false,
+          ).firstMatch(entry)?.group(1) ??
+          '';
+      if (_normalizeServerPreference(rawServer) != normalizedServer) {
+        continue;
+      }
+      final rawUrl = RegExp(
+            '["\\\']?url["\\\']?\\s*:\\s*["\\\']([^"\\\']+)["\\\']',
+            caseSensitive: false,
+          ).firstMatch(entry)?.group(1) ??
+          '';
+      return _normalizeExtractedUrl(rawUrl, baseUrl: baseUrl);
+    }
+    return '';
+  }
+
   String _buildAnimeAv1HlsUrl(String playUrl) {
     final streamId =
         playUrl.split('/play/').last.split('?').first.split('#').first.trim();
     return RegExp(r'^[a-f0-9]{32}$', caseSensitive: false).hasMatch(streamId)
         ? 'https://player.zilla-networks.com/m3u8/$streamId'
         : '';
+  }
+
+  String _firstHlsMediaUrl(String playlist, String playlistUrl) {
+    for (final rawLine in const LineSplitter().convert(playlist)) {
+      final line = rawLine.trim();
+      if (!line.startsWith('#EXT-X-MAP:')) {
+        continue;
+      }
+      final uri = RegExp(
+        r'''URI\s*=\s*["']([^"']+)["']''',
+        caseSensitive: false,
+      ).firstMatch(line)?.group(1);
+      if (uri != null && uri.trim().isNotEmpty) {
+        return _normalizeExtractedUrl(uri, baseUrl: playlistUrl);
+      }
+    }
+    for (final rawLine in const LineSplitter().convert(playlist)) {
+      final line = rawLine.trim();
+      if (line.isEmpty || line.startsWith('#')) {
+        continue;
+      }
+      return _normalizeExtractedUrl(line, baseUrl: playlistUrl);
+    }
+    return '';
   }
 
   String _normalizeUrl(String rawUrl, String baseUrl) {
@@ -10957,6 +11346,112 @@ class RemoteCatalogException implements Exception {
 
   @override
   String toString() => message;
+}
+
+class _DirectMediaProxy {
+  _DirectMediaProxy._({
+    required io.HttpServer server,
+    required http.Client client,
+    required String upstreamUrl,
+    required Map<String, String> headers,
+    required String userAgent,
+  })  : _server = server,
+        _client = client,
+        _upstreamUrl = upstreamUrl,
+        _headers = headers,
+        _userAgent = userAgent;
+
+  final io.HttpServer _server;
+  final http.Client _client;
+  final String _upstreamUrl;
+  final Map<String, String> _headers;
+  final String _userAgent;
+
+  String get playbackUrl => 'http://127.0.0.1:${_server.port}/media';
+
+  static Future<_DirectMediaProxy> start({
+    required http.Client client,
+    required String upstreamUrl,
+    required Map<String, String> headers,
+    required String userAgent,
+  }) async {
+    final server = await io.HttpServer.bind(io.InternetAddress.loopbackIPv4, 0);
+    final proxy = _DirectMediaProxy._(
+      server: server,
+      client: client,
+      upstreamUrl: upstreamUrl,
+      headers: headers,
+      userAgent: userAgent,
+    );
+    unawaited(proxy._serve());
+    return proxy;
+  }
+
+  Future<void> _serve() async {
+    await for (final request in _server) {
+      unawaited(_handle(request));
+    }
+  }
+
+  Future<void> _handle(io.HttpRequest request) async {
+    try {
+      if (request.uri.path != '/media') {
+        request.response.statusCode = io.HttpStatus.notFound;
+        await request.response.close();
+        return;
+      }
+      final uri = Uri.tryParse(_upstreamUrl);
+      if (uri == null || !uri.hasScheme) {
+        request.response.statusCode = io.HttpStatus.badRequest;
+        await request.response.close();
+        return;
+      }
+      final upstreamRequest = http.Request(request.method, uri);
+      upstreamRequest.followRedirects = true;
+      upstreamRequest.headers.addAll({
+        'User-Agent': _headers['User-Agent'] ?? _userAgent,
+        if (_headers['Referer']?.trim().isNotEmpty == true)
+          'Referer': _headers['Referer']!.trim(),
+        if (_headers['Origin']?.trim().isNotEmpty == true)
+          'Origin': _headers['Origin']!.trim(),
+        if (request.headers.value(io.HttpHeaders.rangeHeader) case final range?)
+          'Range': range,
+      });
+      final upstream = await _client.send(upstreamRequest);
+      request.response.statusCode = upstream.statusCode;
+      for (final name in const [
+        io.HttpHeaders.acceptRangesHeader,
+        io.HttpHeaders.cacheControlHeader,
+        'content-disposition',
+        io.HttpHeaders.contentLengthHeader,
+        io.HttpHeaders.contentRangeHeader,
+        io.HttpHeaders.contentTypeHeader,
+        io.HttpHeaders.etagHeader,
+        io.HttpHeaders.lastModifiedHeader,
+      ]) {
+        final value = upstream.headers[name];
+        if (value != null && value.trim().isNotEmpty) {
+          request.response.headers.set(name, value);
+        }
+      }
+      final upstreamType = upstream.headers[io.HttpHeaders.contentTypeHeader];
+      if (uri.path.toLowerCase().endsWith('.mp4') ||
+          upstreamType == null ||
+          upstreamType.toLowerCase().contains('octet-stream')) {
+        request.response.headers.set(io.HttpHeaders.contentTypeHeader,
+            io.ContentType('video', 'mp4').toString());
+      }
+      request.response.headers.set(io.HttpHeaders.acceptRangesHeader, 'bytes');
+      if (request.method.toUpperCase() != 'HEAD') {
+        await request.response.addStream(upstream.stream);
+      }
+    } catch (_) {
+      request.response.statusCode = io.HttpStatus.badGateway;
+    }
+    await request.response.close();
+  }
+
+  Future<void> close() => _server.close(force: true);
 }
 
 class _JustAnimeHlsProxy {

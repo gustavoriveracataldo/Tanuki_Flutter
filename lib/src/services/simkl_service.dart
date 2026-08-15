@@ -221,7 +221,14 @@ class SimklService {
         continue;
       }
       var didPush = false;
-      if (update.watchedEpisodes > 0) {
+      if (update.removeFromList) {
+        await _removeFromList(
+          accessToken: accessToken,
+          clientId: clientId,
+          itemPayload: itemPayload,
+        );
+        didPush = true;
+      } else if (update.watchedEpisodes > 0) {
         await _addHistory(
           accessToken: accessToken,
           clientId: clientId,
@@ -371,6 +378,26 @@ class SimklService {
       accessToken: accessToken,
       body: {
         'shows': [item],
+      },
+    );
+    if (!_isOk(response)) {
+      throw SimklException(
+        _extractApiError(_decodeJsonObject(response.body), response.statusCode),
+      );
+    }
+  }
+
+  Future<void> _removeFromList({
+    required String accessToken,
+    required String clientId,
+    required Map<String, dynamic> itemPayload,
+  }) async {
+    final response = await _post(
+      '/sync/remove-from-list',
+      clientId: clientId,
+      accessToken: accessToken,
+      body: {
+        'anime': [itemPayload],
       },
     );
     if (!_isOk(response)) {
@@ -641,6 +668,7 @@ class SimklLocalAnimeUpdate {
     this.listStatus = '',
     this.watchedEpisodes = 0,
     this.episodeCount = 0,
+    this.removeFromList = false,
   });
 
   final String seriesKey;
@@ -653,6 +681,7 @@ class SimklLocalAnimeUpdate {
   final String listStatus;
   final int watchedEpisodes;
   final int episodeCount;
+  final bool removeFromList;
 }
 
 class SimklEpisodeScrobbleUpdate {
