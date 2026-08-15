@@ -274,6 +274,34 @@ Solo en la oscuridad, la luz.
     );
   });
 
+  test('builds stable VLC profile for proxied AnimeAV1 Zilla HLS streams', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'http://127.0.0.1:44519/playlist.m3u8',
+      playbackKind: 'hls',
+      pageUrl:
+          'https://player.zilla-networks.com/play/6a91a9fceb2dc7ac9385520de35977b3',
+      provider: RemoteProvider.animeAv1,
+      httpHeaders: {
+        'X-Tanuki-Upstream-Url':
+            'https://player.zilla-networks.com/m3u8/6a91a9fceb2dc7ac9385520de35977b3',
+      },
+    );
+    final args = desktopVlcCommandlineArguments(
+      stream: stream,
+      audioSlave: '',
+      referer:
+          'https://player.zilla-networks.com/play/6a91a9fceb2dc7ac9385520de35977b3',
+    );
+
+    expect(
+        shouldWatchAnimeAv1VideoFrame(RemoteProvider.animeAv1, stream), isTrue);
+    expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
+    expect(shouldDeferAndroidExoInitialSeek(stream), isTrue);
+    expect(args, contains('--network-caching=20000'));
+    expect(args, contains('--file-caching=20000'));
+    expect(args, contains('--clock-jitter=0'));
+  });
+
   test('calculates buffered time ahead of the current position', () {
     final ahead = bufferedAheadForPosition(
       position: const Duration(seconds: 12),

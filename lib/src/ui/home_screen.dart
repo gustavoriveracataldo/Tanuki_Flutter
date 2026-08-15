@@ -1145,10 +1145,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     _playerRouteActive = true;
     try {
-      await widget.controller.setCurrentEntry(episode);
-      if (!mounted) {
-        return;
-      }
       await Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => PlayerScreen(

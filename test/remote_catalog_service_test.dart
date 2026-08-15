@@ -2488,6 +2488,37 @@ void main() {
       skip: io.Platform.environment['RUN_JKANIME_PROBE'] != '1',
       timeout: const Timeout(Duration(minutes: 8)));
 
+  test('probes real AnimeAV1 Zilla HLS proxy with ffprobe', () async {
+    final service = RemoteCatalogService();
+    addTearDown(service.close);
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.animeAv1,
+        episodeNumber: 18,
+        filePath:
+            'https://animeav1.com/media/tensei-shitara-slime-datta-ken-4th-season/18',
+        watchUrl:
+            'https://animeav1.com/media/tensei-shitara-slime-datta-ken-4th-season',
+        slug: 'tensei-shitara-slime-datta-ken-4th-season',
+      ),
+    );
+
+    expect(stream?.playbackKind, 'hls');
+    expect(stream?.playbackUrl, startsWith('http://127.0.0.1:'));
+    expect(
+      stream?.httpHeaders['X-Tanuki-Upstream-Url'],
+      contains('https://player.zilla-networks.com/m3u8/'),
+    );
+
+    final probe = await _probeMediaUrlWithFfprobe(stream!.playbackUrl);
+    expect(probe.exitCode, 0, reason: probe.stderr);
+    expect(probe.streamTypes, containsAll(['video', 'audio']));
+    expect(probe.duration, greaterThan(1200));
+  },
+      skip: io.Platform.environment['RUN_ANIMEAV1_HLS_PROBE'] != '1',
+      timeout: const Timeout(Duration(minutes: 2)));
+
   test('probes real BiliBili dash media with ffprobe', () async {
     const pageUrl = 'https://www.bilibili.tv/en/video/2044128968';
     final service = RemoteCatalogService();
@@ -3967,8 +3998,117 @@ void main() {
       'https://animeav1.com/media/tensei-shitara-slime-datta-ken/2',
     );
     expect(webResolver.requests.single.preferredServer, 'mp4upload');
-    expect(segmentCookies, ['', 'zilla=session']);
+    expect(segmentCookies, ['', '', 'zilla=session']);
     expect(stream, isNull);
+  });
+
+  test('uses AnimeAV1 Zilla HLS proxy when browser segment headers work',
+      () async {
+    const streamId = '6a91a9fceb2dc7ac9385520de35977b3';
+    final segmentHeaders = <Map<String, String>>[];
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        return switch (request.url.toString()) {
+          'https://animeav1.com/media/tensei-shitara-slime-datta-ken-4th-season/18' =>
+            http.Response(
+              '''
+              <script>
+                data:[{type:"data",data:{episode:{number:18},
+                embeds:{SUB:[
+                  {server:"HLS",url:"https://player.zilla-networks.com/play/$streamId"},
+                  {server:"MP4Upload",url:"https://www.mp4upload.com/embed-demo.html"}
+                ]}}}]
+              </script>
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/m3u8/$streamId' => http.Response(
+              '''
+              #EXTM3U
+              #EXT-X-VERSION:7
+              #EXT-X-MAP:URI="https://player.zilla-networks.com/segs/$streamId/init.html"
+              #EXTINF:10.0,
+              https://player.zilla-networks.com/segs/$streamId/000.html
+              #EXT-X-ENDLIST
+              ''',
+              200,
+              request: request,
+            ),
+          'https://player.zilla-networks.com/segs/$streamId/init.html' => () {
+              segmentHeaders.add(Map<String, String>.from(request.headers));
+              if (request.headers['Sec-Fetch-Mode'] == 'cors' &&
+                  !request.headers.containsKey('Referer') &&
+                  !request.headers.containsKey('Origin')) {
+                return http.Response.bytes(
+                  utf8.encode('\u0000\u0000\u0000 ftypiso5'),
+                  200,
+                  headers: const {'content-type': 'text/html'},
+                  request: request,
+                );
+              }
+              return http.Response(
+                '<html>blocked</html>',
+                403,
+                request: request,
+              );
+            }(),
+          'https://player.zilla-networks.com/segs/$streamId/000.html' => () {
+              segmentHeaders.add(Map<String, String>.from(request.headers));
+              return http.Response.bytes(
+                utf8.encode('\u0000\u0000\u0000\u0018stypmsdh'),
+                200,
+                headers: const {'content-type': 'text/html'},
+                request: request,
+              );
+            }(),
+          _ => http.Response('', 404, request: request),
+        };
+      }),
+    );
+    addTearDown(service.close);
+
+    final stream = await service.resolveDirectStream(
+      _episode(
+        provider: RemoteProvider.animeAv1,
+        episodeNumber: 18,
+        filePath:
+            'https://animeav1.com/media/tensei-shitara-slime-datta-ken-4th-season/18',
+        watchUrl:
+            'https://animeav1.com/media/tensei-shitara-slime-datta-ken-4th-season',
+        slug: 'tensei-shitara-slime-datta-ken-4th-season',
+      ),
+    );
+
+    expect(stream?.playbackKind, 'hls');
+    expect(stream?.playbackUrl, startsWith('http://127.0.0.1:'));
+    expect(stream?.playbackUrl, endsWith('/playlist.m3u8'));
+    expect(stream?.selectedMode, AnimeAv1PlaybackMode.subHls.id);
+    expect(
+      stream?.httpHeaders['X-Tanuki-Upstream-Url'],
+      'https://player.zilla-networks.com/m3u8/$streamId',
+    );
+
+    final playlist = await http.get(Uri.parse(stream!.playbackUrl));
+    expect(playlist.statusCode, 200);
+    expect(playlist.body, contains('/media/init.mp4?url='));
+    expect(playlist.body, contains('/media/segment.m4s?url='));
+    expect(playlist.body, isNot(contains('player.zilla-networks.com/segs')));
+
+    final initUrl =
+        RegExp(r'URI="([^"]+)"').firstMatch(playlist.body)!.group(1)!;
+    final initResponse = await http.get(Uri.parse(initUrl));
+    expect(initResponse.statusCode, 200);
+    expect(initResponse.headers['content-type'], contains('video/mp4'));
+
+    expect(segmentHeaders, hasLength(3));
+    expect(segmentHeaders[0]['Sec-Fetch-Mode'], isNull);
+    expect(segmentHeaders[1]['Sec-Fetch-Mode'], 'cors');
+    expect(segmentHeaders[1].containsKey('Referer'), isFalse);
+    expect(segmentHeaders[1].containsKey('Origin'), isFalse);
+    expect(segmentHeaders[2]['Sec-Fetch-Mode'], 'cors');
+    expect(segmentHeaders[2].containsKey('Referer'), isFalse);
+    expect(segmentHeaders[2].containsKey('Origin'), isFalse);
   });
 
   test('uses MP4Upload HTTP fallback when AnimeAV1 Zilla is protected',
@@ -4038,7 +4178,7 @@ void main() {
     );
 
     expect(webResolver.requests, isEmpty);
-    expect(segmentCookies, ['']);
+    expect(segmentCookies, ['', '']);
     expect(stream?.playbackUrl, startsWith('http://127.0.0.1:'));
     expect(stream?.playbackKind, 'mp4');
     expect(stream?.selectedMode, AnimeAv1PlaybackMode.subHls.id);
@@ -4139,6 +4279,7 @@ void main() {
     );
 
     expect(segmentRequests, [
+      'https://player.zilla-networks.com/segs/$dubStreamId/init.html',
       'https://player.zilla-networks.com/segs/$dubStreamId/init.html',
     ]);
     expect(embedRequests, ['https://www.mp4upload.com/embed-dub.html']);

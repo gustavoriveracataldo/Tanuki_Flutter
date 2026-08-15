@@ -230,6 +230,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _leavingPlayer = false;
   bool _episodeTransitionInProgress = false;
   bool _remoteReloadInProgress = false;
+  bool _currentEntryCommitted = false;
   bool _loadingAnimeSkipIntervals = false;
   bool _animeSkipLoadCompleted = false;
   Duration _animeSkipLoadedDuration = Duration.zero;
@@ -421,6 +422,14 @@ class _PlayerScreenState extends State<PlayerScreen>
     }());
   }
 
+  void _commitCurrentEntryAfterOpen() {
+    if (_currentEntryCommitted) {
+      return;
+    }
+    _currentEntryCommitted = true;
+    unawaited(widget.controller.setCurrentEntry(widget.episode));
+  }
+
   String _debugMediaLabel(String value) {
     final uri = Uri.tryParse(value);
     if (uri == null || !uri.hasScheme) {
@@ -505,7 +514,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       'open start remote=${widget.episode.isRemote} '
       'episode="${widget.episode.displayName}"',
     );
-    unawaited(widget.controller.setCurrentEntry(widget.episode));
     _cancelRemoteVideoFrameWatchdog();
     _resetUpcomingCards();
     _resetAnimeSkip();
@@ -724,6 +732,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                 : 'Reproduccion local'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
       });
+      _commitCurrentEntryAfterOpen();
       unawaited(_loadDesktopVlcSubtitleCues());
       _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
@@ -829,6 +838,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             ? 'Reproduciendo con ExoPlayer'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
       });
+      _commitCurrentEntryAfterOpen();
       _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
     } catch (error) {
@@ -1057,6 +1067,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             ? 'Reproduciendo con VLC'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
       });
+      _commitCurrentEntryAfterOpen();
       unawaited(_loadDesktopVlcSubtitleCues());
       _scheduleOpeningUpcomingCards();
       _schedulePlayerOverlayHide();
@@ -1424,6 +1435,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     final playbackUri = Uri.tryParse(retiredSourcePath);
     final wasLoopbackProxy = playbackUri != null &&
         (playbackUri.host == '127.0.0.1' || playbackUri.host == 'localhost');
+    final wasRemoteNetwork = playbackUri != null &&
+        (playbackUri.scheme == 'http' || playbackUri.scheme == 'https');
     final player = _desktopVlcPlayer;
     _desktopVlcPlayer = null;
     for (final subscription in subscriptions) {
@@ -1433,14 +1446,15 @@ class _PlayerScreenState extends State<PlayerScreen>
       _activeDesktopVlcPlayers.remove(player);
       if (delayForBiliBili &&
           widget.episode.isRemote &&
-          (wasBiliBili || wasLoopbackProxy)) {
+          (wasBiliBili || wasLoopbackProxy || wasRemoteNetwork)) {
         // libVLC can still be reading a remote stream or local proxy while
         // buffering. Native stop/dispose can block Flutter's UI thread.
         // Stopping or disposing that native player synchronously is what can
         // freeze Linux when the user changes source or leaves the screen.
         _debugPlayerEvent(
           'VLC native dispose deferred '
-          'bilibili=$wasBiliBili loopback=$wasLoopbackProxy',
+          'bilibili=$wasBiliBili loopback=$wasLoopbackProxy '
+          'network=$wasRemoteNetwork',
         );
         try {
           player.setVolume(0);
@@ -1558,6 +1572,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             ? 'YouTube reanudado en ${_formatPlaybackTime(startPosition)}'
             : 'Reproduciendo YouTube';
       });
+      _commitCurrentEntryAfterOpen();
     }
     await controller.loadHtmlString(
       _youtubeSeriesWebPlayerHtml(
@@ -4715,6 +4730,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           _openedMedia = true;
           _status = 'Stream recuperado en ${_formatPlaybackTime(target)}';
         });
+        _commitCurrentEntryAfterOpen();
       }
     } catch (error) {
       if (!mounted) {
@@ -5057,10 +5073,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (selectedEpisode == null ||
         !mounted ||
         _isSameEpisode(selectedEpisode, widget.episode)) {
-      return;
-    }
-    await widget.controller.setCurrentEntry(selectedEpisode);
-    if (!mounted) {
       return;
     }
     await Navigator.of(context).pushReplacement(
@@ -8238,9 +8250,15 @@ bool shouldUseStableRemoteAv1PlaybackProfile(RemoteDirectStream? stream) {
   if (stream == null || stream.provider != RemoteProvider.animeAv1) {
     return false;
   }
-  final source =
-      '${stream.playbackUrl} ${stream.pageUrl} ${stream.server}'.toLowerCase();
-  return stream.playbackKind.toLowerCase() == 'mp4' &&
+  final source = '${stream.playbackUrl} ${stream.pageUrl} ${stream.server} '
+          '${stream.httpHeaders['X-Tanuki-Upstream-Url'] ?? ''}'
+      .toLowerCase();
+  final kind = stream.playbackKind.toLowerCase();
+  if (kind == 'hls') {
+    return source.contains('player.zilla-networks.com') ||
+        source.contains('zilla-networks.com');
+  }
+  return kind == 'mp4' &&
       (source.contains('mp4upload') || source.contains('127.0.0.1'));
 }
 
