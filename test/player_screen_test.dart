@@ -400,6 +400,11 @@ Solo en la oscuridad, la luz.
       'manufacturer': 'Xiaomi',
       'model': '2201117TG',
       'device': 'spes',
+      'isTelevision': false,
+      'isFireTv': false,
+      'isTablet': false,
+      'isPhone': true,
+      'deviceClass': 'phone',
       'hasHardwareAv1Decoder': false,
       'av1Decoders': [
         {
@@ -409,13 +414,109 @@ Solo en la oscuridad, la luz.
           'vendor': false,
         },
       ],
+      'videoDecoders': {
+        'h264': [
+          {
+            'name': 'c2.qti.avc.decoder',
+            'hardwareAccelerated': true,
+            'softwareOnly': false,
+            'vendor': true,
+          },
+        ],
+        'av1': [
+          {
+            'name': 'c2.android.av1-dav1d.decoder',
+            'hardwareAccelerated': false,
+            'softwareOnly': true,
+            'vendor': false,
+          },
+        ],
+      },
     });
 
     expect(capabilities, isNotNull);
-    expect(capabilities!.hasHardwareAv1Decoder, isFalse);
+    expect(capabilities!.isTelevision, isFalse);
+    expect(capabilities.isPhone, isTrue);
+    expect(capabilities.deviceClassLabel, 'celular');
+    expect(capabilities.hasHardwareAv1Decoder, isFalse);
     expect(capabilities.av1Decoders.single.softwareOnly, isTrue);
     expect(capabilities.summaryLabel, contains('hardwareAv1=false'));
+    expect(capabilities.summaryLabel, contains('class=phone'));
+    expect(capabilities.summaryLabel, contains('tv=false'));
+    expect(capabilities.summaryLabel, contains('h264=[c2.qti.avc.decoder'));
     expect(capabilities.summaryLabel, contains('c2.android.av1-dav1d.decoder'));
+  });
+
+  test('uses platform video view for Android TV devices', () {
+    const tvCapabilities = AndroidMediaCapabilities(
+      sdkInt: 33,
+      manufacturer: 'Amazon',
+      model: 'AFTSS',
+      device: 'sheldon',
+      isTelevision: true,
+      isFireTv: true,
+      isTablet: false,
+      isPhone: false,
+      deviceClass: 'fire-tv',
+      hasHardwareAv1Decoder: false,
+      av1Decoders: [],
+      videoDecoders: {},
+    );
+    const tabletCapabilities = AndroidMediaCapabilities(
+      sdkInt: 33,
+      manufacturer: 'Samsung',
+      model: 'Galaxy Tab',
+      device: 'gta',
+      isTelevision: false,
+      isFireTv: false,
+      isTablet: true,
+      isPhone: false,
+      deviceClass: 'tablet',
+      hasHardwareAv1Decoder: false,
+      av1Decoders: [],
+      videoDecoders: {},
+    );
+    const phoneCapabilities = AndroidMediaCapabilities(
+      sdkInt: 33,
+      manufacturer: 'Samsung',
+      model: 'Redmi Note',
+      device: 'redmi',
+      isTelevision: false,
+      isFireTv: false,
+      isTablet: false,
+      isPhone: true,
+      deviceClass: 'phone',
+      hasHardwareAv1Decoder: false,
+      av1Decoders: [],
+      videoDecoders: {},
+    );
+
+    expect(
+      androidVideoViewTypeForCapabilities(tvCapabilities),
+      vp.VideoViewType.platformView,
+    );
+    expect(
+      androidVideoViewTypeForCapabilities(tabletCapabilities),
+      vp.VideoViewType.textureView,
+    );
+    expect(
+      androidVideoViewTypeForCapabilities(
+        phoneCapabilities,
+        mode: AndroidVideoViewMode.surface,
+      ),
+      vp.VideoViewType.platformView,
+    );
+    expect(
+      androidVideoViewTypeForCapabilities(
+        tvCapabilities,
+        mode: AndroidVideoViewMode.texture,
+      ),
+      vp.VideoViewType.textureView,
+    );
+
+    expect(shouldUseAndroidPhoneUi(tvCapabilities), isFalse);
+    expect(shouldUseAndroidPhoneUi(tabletCapabilities), isFalse);
+    expect(shouldUseAndroidPhoneUi(phoneCapabilities), isTrue);
   });
 
   test('rebuilds Android Exo progress only for visible UI needs', () {

@@ -1,6 +1,8 @@
 package com.toonami.tanuki
 
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.os.Build
@@ -124,20 +126,66 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun androidMediaCapabilities(): Map<String, Any?> {
-        val av1Decoders = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
-            .filter { codec ->
-                !codec.isEncoder &&
-                    codec.supportedTypes.any { type -> type.equals(AV1_MIME_TYPE, ignoreCase = true) }
-            }
-            .map { codec -> codecInfoMap(codec) }
+        val codecInfos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        val videoDecoders = VIDEO_MIME_TYPES.mapValues { (_, mimeType) ->
+            codecInfos
+                .filter { codec ->
+                    !codec.isEncoder &&
+                        codec.supportedTypes.any { type -> type.equals(mimeType, ignoreCase = true) }
+                }
+                .map { codec -> codecInfoMap(codec) }
+        }
+        val av1Decoders = videoDecoders["av1"].orEmpty()
+        val isTelevision = isTelevisionDevice()
+        val isFireTv = isFireTvDevice()
+        val isTablet = !isTelevision && isTabletDevice()
+        val isPhone = !isTelevision && !isTablet
+        val deviceClass = when {
+            isFireTv -> "fire-tv"
+            isTelevision -> "android-tv"
+            isTablet -> "tablet"
+            else -> "phone"
+        }
         return mapOf(
             "sdkInt" to Build.VERSION.SDK_INT,
             "manufacturer" to Build.MANUFACTURER,
             "model" to Build.MODEL,
             "device" to Build.DEVICE,
+            "isTelevision" to isTelevision,
+            "isFireTv" to isFireTv,
+            "isTablet" to isTablet,
+            "isPhone" to isPhone,
+            "deviceClass" to deviceClass,
             "hasHardwareAv1Decoder" to av1Decoders.any { it["hardwareAccelerated"] == true },
             "av1Decoders" to av1Decoders,
+            "videoDecoders" to videoDecoders,
         )
+    }
+
+    private fun isTelevisionDevice(): Boolean {
+        val uiModeType = resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK
+        val packageManager = packageManager
+        return uiModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+    }
+
+    private fun isFireTvDevice(): Boolean {
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        val model = Build.MODEL.lowercase()
+        val device = Build.DEVICE.lowercase()
+        return manufacturer.contains("amazon") ||
+            model.contains("aft") ||
+            device.contains("aft") ||
+            packageManager.hasSystemFeature("amazon.hardware.fire_tv")
+    }
+
+    private fun isTabletDevice(): Boolean {
+        val configuration = resources.configuration
+        val screenLayoutSize = configuration.screenLayout and Configuration.SCREENLAYOUT_SIZE_MASK
+        return configuration.smallestScreenWidthDp >= 600 ||
+            screenLayoutSize == Configuration.SCREENLAYOUT_SIZE_LARGE ||
+            screenLayoutSize == Configuration.SCREENLAYOUT_SIZE_XLARGE
     }
 
     private fun codecInfoMap(codec: MediaCodecInfo): Map<String, Any?> {
@@ -178,7 +226,12 @@ class MainActivity : FlutterActivity() {
     }
 
     companion object {
-        private const val AV1_MIME_TYPE = "video/av01"
+        private val VIDEO_MIME_TYPES = linkedMapOf(
+            "h264" to "video/avc",
+            "hevc" to "video/hevc",
+            "vp9" to "video/x-vnd.on2.vp9",
+            "av1" to "video/av01",
+        )
         const val EXTRA_INTERNAL_DEEP_LINK = "com.toonami.tanuki.extra.INTERNAL_DEEP_LINK"
     }
 }

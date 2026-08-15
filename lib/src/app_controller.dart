@@ -3742,6 +3742,15 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  Future<void> setAndroidVideoViewMode(AndroidVideoViewMode mode) async {
+    if (_state.androidVideoViewMode == mode) {
+      return;
+    }
+    _state = _state.copyWith(androidVideoViewMode: mode);
+    await _save();
+    notifyListeners();
+  }
+
   int myAnimeListIdForEpisode(EpisodeItem episode) {
     final key = _seriesStateKeyForEpisode(episode);
     final profile = _state.profile;

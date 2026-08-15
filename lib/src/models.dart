@@ -353,6 +353,29 @@ YoutubePlaybackOption youtubePlaybackOptionFromId(Object? value) {
   };
 }
 
+enum AndroidVideoViewMode {
+  automatic('auto', 'Auto'),
+  texture('texture', 'TextureView'),
+  surface('surface', 'SurfaceView');
+
+  const AndroidVideoViewMode(this.id, this.label);
+
+  final String id;
+  final String label;
+}
+
+AndroidVideoViewMode androidVideoViewModeFromId(Object? value) {
+  return switch ('$value'.trim().toLowerCase()) {
+    'texture' || 'textureview' => AndroidVideoViewMode.texture,
+    'surface' ||
+    'surfaceview' ||
+    'platform' ||
+    'platformview' =>
+      AndroidVideoViewMode.surface,
+    _ => AndroidVideoViewMode.automatic,
+  };
+}
+
 class EpisodeItem {
   const EpisodeItem({
     required this.seriesName,
@@ -1660,6 +1683,7 @@ class AppState {
     this.overscanHorizontal = 0,
     this.overscanTop = 0,
     this.overscanBottom = 0,
+    this.androidVideoViewMode = AndroidVideoViewMode.automatic,
     this.fillerCache = const {},
     this.visualCache = const {},
     this.myAnimeListClientId = '',
@@ -1684,6 +1708,7 @@ class AppState {
   final double overscanHorizontal;
   final double overscanTop;
   final double overscanBottom;
+  final AndroidVideoViewMode androidVideoViewMode;
   final Map<String, FillerMetadataRecord> fillerCache;
   final Map<String, CandidateVisualCacheEntry> visualCache;
   final String myAnimeListClientId;
@@ -1736,6 +1761,8 @@ class AppState {
       overscanHorizontal: _readDouble(json['overscanHorizontal']),
       overscanTop: _readDouble(json['overscanTop']),
       overscanBottom: _readDouble(json['overscanBottom']),
+      androidVideoViewMode:
+          androidVideoViewModeFromId(json['androidVideoViewMode']),
       fillerCache: _readFillerCache(json['fillerCache']),
       visualCache: _readCandidateVisualCache(json['visualCache']),
       myAnimeListClientId: _readString(json['myAnimeListClientId']),
@@ -1784,6 +1811,7 @@ class AppState {
     double? overscanHorizontal,
     double? overscanTop,
     double? overscanBottom,
+    AndroidVideoViewMode? androidVideoViewMode,
     Map<String, FillerMetadataRecord>? fillerCache,
     Map<String, CandidateVisualCacheEntry>? visualCache,
     String? myAnimeListClientId,
@@ -1821,6 +1849,7 @@ class AppState {
       overscanHorizontal: overscanHorizontal ?? this.overscanHorizontal,
       overscanTop: overscanTop ?? this.overscanTop,
       overscanBottom: overscanBottom ?? this.overscanBottom,
+      androidVideoViewMode: androidVideoViewMode ?? this.androidVideoViewMode,
       fillerCache: fillerCache ?? this.fillerCache,
       visualCache: visualCache ?? this.visualCache,
       myAnimeListClientId: myAnimeListClientId ?? this.myAnimeListClientId,
@@ -1854,6 +1883,7 @@ class AppState {
       'overscanHorizontal': overscanHorizontal,
       'overscanTop': overscanTop,
       'overscanBottom': overscanBottom,
+      'androidVideoViewMode': androidVideoViewMode.id,
       'fillerCache': fillerCache.map(
         (key, value) => MapEntry(key, value.toJson()),
       ),

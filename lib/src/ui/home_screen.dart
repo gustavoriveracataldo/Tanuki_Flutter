@@ -14,7 +14,7 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
-const _appVersionLabel = '1.7.3';
+const _appVersionLabel = '1.7.4';
 String? _lastFocusedHomeShelfId;
 DateTime _suppressHomeActivationUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -95,6 +95,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _playerRouteActive = false;
   DateTime _lastPlayerReturnAt = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _suppressEpisodeLaunchUntil = DateTime.fromMillisecondsSinceEpoch(0);
+  AndroidMediaCapabilities? _androidMediaCapabilities;
   final Set<String> _continueWatchingVisualHydrationKeys = {};
   final Map<String, DateTime> _continueWatchingVisualHydrationAttempts = {};
 
@@ -102,6 +103,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     widget.controller.addListener(_handlePendingTrailerDetailRequest);
+    _loadAndroidMediaCapabilities();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         unawaited(_loadHomeTrending());
@@ -110,6 +112,20 @@ class _HomeScreenState extends State<HomeScreen> {
         _handlePendingTrailerDetailRequest();
       }
     });
+  }
+
+  void _loadAndroidMediaCapabilities() {
+    if (!io.Platform.isAndroid) {
+      return;
+    }
+    unawaited(loadAndroidMediaCapabilities().then((capabilities) {
+      if (!mounted || capabilities == null) {
+        return;
+      }
+      setState(() {
+        _androidMediaCapabilities = capabilities;
+      });
+    }));
   }
 
   @override
@@ -162,82 +178,90 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 child: LayoutBuilder(
                   builder: (context, constraints) {
-                    final compactNavigation = constraints.maxWidth < 720 ||
+                    final phoneNavigation =
+                        shouldUseAndroidPhoneUi(_androidMediaCapabilities);
+                    final compactNavigation = phoneNavigation ||
+                        constraints.maxWidth < 720 ||
                         constraints.maxHeight > constraints.maxWidth;
+                    final compactPanelBottom = phoneNavigation ? 148.0 : 64.0;
                     return _HomeFocusTargets(
                       sideAnimeFocusNode: _sideAnimeFocusNode,
                       searchFieldFocusNode: _searchFieldFocusNode,
-                      child: Stack(
-                        children: [
-                          Positioned.fill(
-                            child: _HeroBackground(series: heroSeries),
-                          ),
-                          if (compactNavigation) ...[
+                      child: _HomePhoneUi(
+                        enabled: phoneNavigation,
+                        child: Stack(
+                          children: [
                             Positioned.fill(
-                              bottom: 64,
-                              child: Padding(
-                                padding:
-                                    const EdgeInsets.fromLTRB(12, 14, 12, 0),
-                                child: _buildPanel(widget.controller),
-                              ),
+                              child: _HeroBackground(series: heroSeries),
                             ),
-                            Positioned(
-                              left: 0,
-                              right: 0,
-                              bottom: 0,
-                              child: _BottomRail(
-                                activeSection: _section,
-                                profile: widget.controller.state.profile,
-                                onSectionSelected: _selectSection,
-                                onProfilePressed: _showProfilePicker,
+                            if (compactNavigation) ...[
+                              Positioned.fill(
+                                bottom: compactPanelBottom,
+                                child: Padding(
+                                  padding:
+                                      const EdgeInsets.fromLTRB(12, 14, 12, 0),
+                                  child: _buildPanel(widget.controller),
+                                ),
                               ),
-                            ),
-                          ] else ...[
-                            Positioned.fill(
-                              left: 54,
-                              child: Padding(
-                                padding:
-                                    const EdgeInsets.fromLTRB(0, 14, 14, 14),
-                                child: _buildPanel(widget.controller),
+                              Positioned(
+                                left: 0,
+                                right: 0,
+                                bottom: 0,
+                                child: _BottomRail(
+                                  activeSection: _section,
+                                  profile: widget.controller.state.profile,
+                                  phoneNavigation: phoneNavigation,
+                                  onSectionSelected: _selectSection,
+                                  onProfilePressed: _showProfilePicker,
+                                ),
                               ),
-                            ),
-                            Positioned(
-                              left: 0,
-                              top: 0,
-                              bottom: 0,
-                              child: _SideRail(
-                                activeSection: _section,
-                                profile: widget.controller.state.profile,
-                                animeFocusNode: _sideAnimeFocusNode,
-                                searchFocusNode: _searchFieldFocusNode,
-                                homeContentFocusNode: _selectedSeries == null
-                                    ? _homeContentFocusNode
-                                    : _detailActionFocusNodes.favorite,
-                                onSectionSelected: _selectSection,
-                                onProfilePressed: _showProfilePicker,
+                            ] else ...[
+                              Positioned.fill(
+                                left: 54,
+                                child: Padding(
+                                  padding:
+                                      const EdgeInsets.fromLTRB(0, 14, 14, 14),
+                                  child: _buildPanel(widget.controller),
+                                ),
                               ),
-                            ),
+                              Positioned(
+                                left: 0,
+                                top: 0,
+                                bottom: 0,
+                                child: _SideRail(
+                                  activeSection: _section,
+                                  profile: widget.controller.state.profile,
+                                  animeFocusNode: _sideAnimeFocusNode,
+                                  searchFocusNode: _searchFieldFocusNode,
+                                  homeContentFocusNode: _selectedSeries == null
+                                      ? _homeContentFocusNode
+                                      : _detailActionFocusNodes.favorite,
+                                  onSectionSelected: _selectSection,
+                                  onProfilePressed: _showProfilePicker,
+                                ),
+                              ),
+                            ],
+                            if (widget.controller.isSaving)
+                              const Positioned(
+                                right: 18,
+                                top: 18,
+                                child: _SavingPill(),
+                              ),
+                            if (_profilePickerVisible)
+                              Positioned.fill(
+                                child: _ProfilePickerOverlay(
+                                  controller: widget.controller,
+                                  onClose: _hideProfilePicker,
+                                  onSelectProfile: _selectProfile,
+                                  onCreateProfile: _createProfile,
+                                  onRenameProfile: _renameProfile,
+                                  onChangeProfileAvatar: _changeProfileAvatar,
+                                  onSetDefaultProfile: _setDefaultProfile,
+                                  onDeleteProfile: _deleteProfile,
+                                ),
+                              ),
                           ],
-                          if (widget.controller.isSaving)
-                            const Positioned(
-                              right: 18,
-                              top: 18,
-                              child: _SavingPill(),
-                            ),
-                          if (_profilePickerVisible)
-                            Positioned.fill(
-                              child: _ProfilePickerOverlay(
-                                controller: widget.controller,
-                                onClose: _hideProfilePicker,
-                                onSelectProfile: _selectProfile,
-                                onCreateProfile: _createProfile,
-                                onRenameProfile: _renameProfile,
-                                onChangeProfileAvatar: _changeProfileAvatar,
-                                onSetDefaultProfile: _setDefaultProfile,
-                                onDeleteProfile: _deleteProfile,
-                              ),
-                            ),
-                        ],
+                        ),
                       ),
                     );
                   },
@@ -1650,17 +1674,86 @@ class _BottomRail extends StatelessWidget {
   const _BottomRail({
     required this.activeSection,
     required this.profile,
+    required this.phoneNavigation,
     required this.onSectionSelected,
     required this.onProfilePressed,
   });
 
   final _Section activeSection;
   final UserProfileState profile;
+  final bool phoneNavigation;
   final ValueChanged<_Section> onSectionSelected;
   final VoidCallback onProfilePressed;
 
   @override
   Widget build(BuildContext context) {
+    if (phoneNavigation) {
+      final mainItem = _navigationItemForSection(_Section.anime);
+      final searchItem = _navigationItemForSection(_Section.search);
+      final menuItems = _navigationItems()
+          .where((item) =>
+              item.section != _Section.anime && item.section != _Section.search)
+          .toList(growable: false);
+      return Container(
+        decoration: const BoxDecoration(
+          color: TanukiColors.rail,
+          border: Border(top: BorderSide(color: TanukiColors.panelStroke)),
+        ),
+        child: SafeArea(
+          top: false,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final buttonSize =
+                  ((constraints.maxWidth - 16) / 3).clamp(104.0, 132.0);
+              return SizedBox(
+                height: 132,
+                child: Row(
+                  children: [
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Center(
+                        child: _BottomRailButton(
+                          item: searchItem,
+                          active: activeSection == searchItem.section,
+                          buttonSize: buttonSize,
+                          iconSize: 50,
+                          onPressed: () =>
+                              onSectionSelected(searchItem.section),
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Center(
+                        child: _BottomRailButton(
+                          item: mainItem,
+                          active: activeSection == mainItem.section,
+                          buttonSize: buttonSize,
+                          iconSize: 50,
+                          onPressed: () => onSectionSelected(mainItem.section),
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Center(
+                        child: _MobileAvatarMenuButton(
+                          profile: profile,
+                          activeSection: activeSection,
+                          items: menuItems,
+                          buttonSize: buttonSize,
+                          onSectionSelected: onSectionSelected,
+                          onProfilePressed: onProfilePressed,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      );
+    }
     final items = _navigationItems();
     return Container(
       decoration: const BoxDecoration(
@@ -1696,6 +1789,8 @@ class _BottomRail extends StatelessWidget {
                       _BottomRailButton(
                         item: item,
                         active: activeSection == item.section,
+                        buttonSize: 72,
+                        iconSize: 21,
                         onPressed: () => onSectionSelected(item.section),
                       ),
                   ],
@@ -1714,11 +1809,15 @@ class _BottomRailButton extends StatelessWidget {
   const _BottomRailButton({
     required this.item,
     required this.active,
+    required this.buttonSize,
+    required this.iconSize,
     required this.onPressed,
   });
 
   final _RailItem item;
   final bool active;
+  final double buttonSize;
+  final double iconSize;
   final VoidCallback onPressed;
 
   @override
@@ -1729,12 +1828,12 @@ class _BottomRailButton extends StatelessWidget {
         onPressed: onPressed,
         icon: _RailItemIcon(
           item: item,
-          size: 21,
+          size: iconSize,
           color: active ? TanukiColors.text : TanukiColors.muted,
         ),
         color: active ? TanukiColors.text : TanukiColors.muted,
         style: ButtonStyle(
-          fixedSize: WidgetStateProperty.all(const Size(72, 72)),
+          fixedSize: WidgetStateProperty.all(Size(buttonSize, buttonSize)),
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             return active ? const Color(0x332B3B4D) : Colors.transparent;
           }),
@@ -1757,6 +1856,174 @@ class _BottomRailButton extends StatelessWidget {
   }
 }
 
+class _MobileAvatarMenuButton extends StatelessWidget {
+  const _MobileAvatarMenuButton({
+    required this.profile,
+    required this.activeSection,
+    required this.items,
+    required this.buttonSize,
+    required this.onSectionSelected,
+    required this.onProfilePressed,
+  });
+
+  final UserProfileState profile;
+  final _Section activeSection;
+  final List<_RailItem> items;
+  final double buttonSize;
+  final ValueChanged<_Section> onSectionSelected;
+  final VoidCallback onProfilePressed;
+
+  Future<void> _showMenu(BuildContext context) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xF214171C),
+      barrierColor: Colors.black54,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          top: false,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.sizeOf(context).height * 0.88,
+            ),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(18, 16, 18, 22),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 56,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: const Color(0x668A939E),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  _MobileNavigationMenuEntry(
+                    icon: Icons.account_circle,
+                    leading: _ProfileAvatar(
+                      profile: profile,
+                      size: 92,
+                      radius: 46,
+                      fontSize: 42,
+                      borderColor: const Color(0x88334A62),
+                    ),
+                    label: profile.name,
+                    active: false,
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                      onProfilePressed();
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  for (final item in items)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _MobileNavigationMenuEntry(
+                        icon: item.icon,
+                        label: item.label,
+                        assetPath: item.assetPath,
+                        active: activeSection == item.section,
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          onSectionSelected(item.section);
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final avatarSize = (buttonSize * 0.76).clamp(76.0, 94.0);
+    return Tooltip(
+      message: 'Menu',
+      child: Material(
+        color: Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: InkWell(
+          onTap: () => unawaited(_showMenu(context)),
+          borderRadius: BorderRadius.circular(12),
+          child: SizedBox(
+            width: buttonSize,
+            height: buttonSize,
+            child: Center(
+              child: _ProfileAvatar(
+                profile: profile,
+                size: avatarSize,
+                radius: avatarSize / 2,
+                fontSize: avatarSize * 0.48,
+                borderColor: const Color(0x88334A62),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MobileNavigationMenuEntry extends StatelessWidget {
+  const _MobileNavigationMenuEntry({
+    required this.icon,
+    required this.label,
+    required this.active,
+    required this.onPressed,
+    this.assetPath = '',
+    this.leading,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool active;
+  final VoidCallback onPressed;
+  final String assetPath;
+  final Widget? leading;
+
+  @override
+  Widget build(BuildContext context) {
+    final foreground = active ? Colors.black : TanukiColors.text;
+    return SizedBox(
+      width: double.infinity,
+      height: 124,
+      child: FilledButton.icon(
+        onPressed: onPressed,
+        icon: leading ??
+            (assetPath.isEmpty
+                ? Icon(icon, size: 56)
+                : ImageIcon(AssetImage(assetPath), size: 60)),
+        label: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w900),
+          ),
+        ),
+        style: FilledButton.styleFrom(
+          alignment: Alignment.centerLeft,
+          backgroundColor:
+              active ? TanukiColors.orange : const Color(0x332B3B4D),
+          foregroundColor: foreground,
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      ),
+    );
+  }
+}
+
 List<_RailItem> _navigationItems() {
   return const [
     _RailItem(_Section.search, Icons.search, 'Buscar'),
@@ -1771,6 +2038,10 @@ List<_RailItem> _navigationItems() {
     _RailItem(_Section.playlist, Icons.playlist_play, 'Playlist'),
     _RailItem(_Section.settings, Icons.settings, 'Ajustes'),
   ];
+}
+
+_RailItem _navigationItemForSection(_Section section) {
+  return _navigationItems().firstWhere((item) => item.section == section);
 }
 
 class _RailItem {
@@ -1839,6 +2110,134 @@ class _HomeFocusTargets extends InheritedWidget {
   bool updateShouldNotify(_HomeFocusTargets oldWidget) {
     return sideAnimeFocusNode != oldWidget.sideAnimeFocusNode ||
         searchFieldFocusNode != oldWidget.searchFieldFocusNode;
+  }
+}
+
+class _HomePhoneUi extends InheritedWidget {
+  const _HomePhoneUi({
+    required this.enabled,
+    required super.child,
+  });
+
+  final bool enabled;
+
+  static bool enabledOf(BuildContext context) {
+    return context
+            .dependOnInheritedWidgetOfExactType<_HomePhoneUi>()
+            ?.enabled ??
+        false;
+  }
+
+  @override
+  bool updateShouldNotify(_HomePhoneUi oldWidget) {
+    return enabled != oldWidget.enabled;
+  }
+}
+
+double _homeActionSheetScale(BuildContext context) {
+  return _HomePhoneUi.enabledOf(context) ? 2.0 : 1.0;
+}
+
+double? _homeActionSheetWidth(BuildContext context) {
+  if (!_HomePhoneUi.enabledOf(context)) {
+    return null;
+  }
+  final screenWidth = MediaQuery.sizeOf(context).width;
+  final availableWidth = screenWidth > 280 ? screenWidth - 24 : screenWidth;
+  return (360.0 * 3.0).clamp(0.0, availableWidth).toDouble();
+}
+
+BoxConstraints? _homeActionSheetConstraints(BuildContext context) {
+  if (!_HomePhoneUi.enabledOf(context)) {
+    return null;
+  }
+  final width = _homeActionSheetWidth(context)!;
+  return BoxConstraints(minWidth: width, maxWidth: width);
+}
+
+class _HomeActionSheetBody extends StatelessWidget {
+  const _HomeActionSheetBody({
+    required this.children,
+    this.padding,
+  });
+
+  final List<Widget> children;
+  final EdgeInsetsGeometry? padding;
+
+  @override
+  Widget build(BuildContext context) {
+    final scale = _homeActionSheetScale(context);
+    final width = _homeActionSheetWidth(context);
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * 0.88,
+        ),
+        child: SizedBox(
+          width: width,
+          child: SingleChildScrollView(
+            padding: padding ?? EdgeInsets.symmetric(vertical: 8 * scale),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: children,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HomeActionSheetTile extends StatelessWidget {
+  const _HomeActionSheetTile({
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.subtitle = '',
+    this.iconColor = TanukiColors.orange,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color iconColor;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scale = _homeActionSheetScale(context);
+    final subtitleText = subtitle.trim();
+    return ListTile(
+      contentPadding: EdgeInsets.symmetric(
+        horizontal: 16 * scale,
+        vertical: 4 * scale,
+      ),
+      minLeadingWidth: 40 * scale,
+      horizontalTitleGap: 16 * scale,
+      leading: Icon(icon, color: iconColor, size: 24 * scale),
+      title: Text(
+        title,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          color: TanukiColors.text,
+          fontSize: 16 * scale,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      subtitle: subtitleText.isEmpty
+          ? null
+          : Text(
+              subtitleText,
+              maxLines: scale > 1 ? 2 : 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: TanukiColors.muted,
+                fontSize: 14 * scale,
+              ),
+            ),
+      onTap: onTap,
+    );
   }
 }
 
@@ -5191,29 +5590,36 @@ class _DetailEpisodesColumnState extends State<_DetailEpisodesColumn> {
     BuildContext context,
     EpisodeItem episode,
   ) async {
+    final phoneUi = _HomePhoneUi.enabledOf(context);
     final action = await showModalBottomSheet<_DetailEpisodeAction>(
       context: context,
       backgroundColor: TanukiColors.panelSolid,
+      constraints: _homeActionSheetConstraints(context),
       showDragHandle: true,
       builder: (context) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.check_circle_outline),
-                title: const Text('Marcar capitulo como completado'),
-                onTap: () => Navigator.of(context)
-                    .pop(_DetailEpisodeAction.markCompleted),
-              ),
-              ListTile(
-                leading: const Icon(Icons.done_all),
-                title: const Text('Completar capitulos hasta este'),
-                onTap: () => Navigator.of(context)
-                    .pop(_DetailEpisodeAction.completeThrough),
-              ),
-              const SizedBox(height: 8),
-            ],
+        return _HomePhoneUi(
+          enabled: phoneUi,
+          child: Builder(
+            builder: (context) {
+              final scale = _homeActionSheetScale(context);
+              return _HomeActionSheetBody(
+                padding: EdgeInsets.only(bottom: 8 * scale),
+                children: [
+                  _HomeActionSheetTile(
+                    icon: Icons.check_circle_outline,
+                    title: 'Marcar capitulo como completado',
+                    onTap: () => Navigator.of(context)
+                        .pop(_DetailEpisodeAction.markCompleted),
+                  ),
+                  _HomeActionSheetTile(
+                    icon: Icons.done_all,
+                    title: 'Completar capitulos hasta este',
+                    onTap: () => Navigator.of(context)
+                        .pop(_DetailEpisodeAction.completeThrough),
+                  ),
+                ],
+              );
+            },
           ),
         );
       },
@@ -5657,54 +6063,73 @@ class _DetailSpaceButtonState extends State<_DetailSpaceButton> {
   }
 
   Future<void> _showSpaceDialog(BuildContext context) async {
+    final phoneUi = _HomePhoneUi.enabledOf(context);
     final selected = await showDialog<String>(
       context: context,
       builder: (context) {
-        return AlertDialog(
-          backgroundColor: TanukiColors.panelSolid,
-          title: const Text(
-            'Mi espacio',
-            style: TextStyle(
-              color: TanukiColors.text,
-              fontWeight: FontWeight.w900,
-            ),
-          ),
-          contentPadding: const EdgeInsets.fromLTRB(0, 8, 0, 8),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _SpaceDialogOption(
-                label: 'Quiero ver',
-                icon: Icons.bookmark_add,
-                color: const Color(0xFF6FC2FF),
-                onTap: () => Navigator.of(context).pop('want_to_watch'),
-              ),
-              _SpaceDialogOption(
-                label: 'Viendo',
-                icon: Icons.visibility,
-                color: TanukiColors.orange,
-                onTap: () => Navigator.of(context).pop('watching'),
-              ),
-              _SpaceDialogOption(
-                label: 'Abandonada',
-                icon: Icons.visibility_off,
-                color: const Color(0xFFFF8F9D),
-                onTap: () => Navigator.of(context).pop('abandoned'),
-              ),
-              _SpaceDialogOption(
-                label: 'Completada',
-                icon: Icons.check_circle,
-                color: const Color(0xFF72E0A0),
-                onTap: () => Navigator.of(context).pop('completed'),
-              ),
-              if (widget.value.trim().isNotEmpty)
-                _SpaceDialogOption(
-                  label: 'Quitar de Mi espacio',
-                  icon: Icons.remove_circle_outline,
-                  color: TanukiColors.muted,
-                  onTap: () => Navigator.of(context).pop(''),
+        return _HomePhoneUi(
+          enabled: phoneUi,
+          child: Builder(
+            builder: (context) {
+              final scale = _homeActionSheetScale(context);
+              final width = MediaQuery.sizeOf(context).width -
+                  (scale > 1 ? 20 : 80).clamp(0, 80);
+              return AlertDialog(
+                backgroundColor: TanukiColors.panelSolid,
+                insetPadding: EdgeInsets.symmetric(
+                  horizontal: scale > 1 ? 10 : 40,
+                  vertical: 24,
                 ),
-            ],
+                title: Text(
+                  'Mi espacio',
+                  style: TextStyle(
+                    color: TanukiColors.text,
+                    fontSize: 20 * scale,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                contentPadding: EdgeInsets.fromLTRB(0, 8 * scale, 0, 8 * scale),
+                content: SizedBox(
+                  width: width.toDouble(),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _SpaceDialogOption(
+                        label: 'Quiero ver',
+                        icon: Icons.bookmark_add,
+                        color: const Color(0xFF6FC2FF),
+                        onTap: () => Navigator.of(context).pop('want_to_watch'),
+                      ),
+                      _SpaceDialogOption(
+                        label: 'Viendo',
+                        icon: Icons.visibility,
+                        color: TanukiColors.orange,
+                        onTap: () => Navigator.of(context).pop('watching'),
+                      ),
+                      _SpaceDialogOption(
+                        label: 'Abandonada',
+                        icon: Icons.visibility_off,
+                        color: const Color(0xFFFF8F9D),
+                        onTap: () => Navigator.of(context).pop('abandoned'),
+                      ),
+                      _SpaceDialogOption(
+                        label: 'Completada',
+                        icon: Icons.check_circle,
+                        color: const Color(0xFF72E0A0),
+                        onTap: () => Navigator.of(context).pop('completed'),
+                      ),
+                      if (widget.value.trim().isNotEmpty)
+                        _SpaceDialogOption(
+                          label: 'Quitar de Mi espacio',
+                          icon: Icons.remove_circle_outline,
+                          color: TanukiColors.muted,
+                          onTap: () => Navigator.of(context).pop(''),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            },
           ),
         );
       },
@@ -5775,12 +6200,17 @@ class _SpaceDialogOption extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scale = _homeActionSheetScale(context);
     return ListTile(
-      leading: Icon(icon, color: color),
+      contentPadding: EdgeInsets.symmetric(horizontal: 16 * scale),
+      minLeadingWidth: 40 * scale,
+      horizontalTitleGap: 16 * scale,
+      leading: Icon(icon, color: color, size: 24 * scale),
       title: Text(
         label,
-        style: const TextStyle(
+        style: TextStyle(
           color: TanukiColors.text,
+          fontSize: 16 * scale,
           fontWeight: FontWeight.w800,
         ),
       ),
@@ -5927,27 +6357,23 @@ class _RemotePosterCard extends StatelessWidget {
   }
 
   Future<void> _showCardMenu(BuildContext context) async {
+    final phoneUi = _HomePhoneUi.enabledOf(context);
     final selected = await showModalBottomSheet<bool>(
       context: context,
       backgroundColor: const Color(0xFF101821),
+      constraints: _homeActionSheetConstraints(context),
       builder: (context) {
-        return SafeArea(
-          child: ListTile(
-            leading: const Icon(Icons.tv, color: TanukiColors.orange),
-            title: const Text(
-              'Ir a serie',
-              style: TextStyle(
-                color: TanukiColors.text,
-                fontWeight: FontWeight.w800,
+        return _HomePhoneUi(
+          enabled: phoneUi,
+          child: _HomeActionSheetBody(
+            children: [
+              _HomeActionSheetTile(
+                icon: Icons.tv,
+                title: 'Ir a serie',
+                subtitle: candidate.title,
+                onTap: () => Navigator.of(context).pop(true),
               ),
-            ),
-            subtitle: Text(
-              candidate.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: TanukiColors.muted),
-            ),
-            onTap: () => Navigator.of(context).pop(true),
+            ],
           ),
         );
       },
@@ -6400,74 +6826,38 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
   }
 
   Future<void> _showCardMenu(BuildContext context) async {
+    final phoneUi = _HomePhoneUi.enabledOf(context);
     final selected = await showModalBottomSheet<_ContinueWatchingAction>(
       context: context,
       backgroundColor: const Color(0xFF101821),
+      constraints: _homeActionSheetConstraints(context),
       builder: (context) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+        return _HomePhoneUi(
+          enabled: phoneUi,
+          child: _HomeActionSheetBody(
             children: [
               if (onGoToSeries != null)
-                ListTile(
-                  leading: const Icon(Icons.tv, color: TanukiColors.orange),
-                  title: const Text(
-                    'Ir a serie',
-                    style: TextStyle(
-                      color: TanukiColors.text,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  subtitle: Text(
-                    entry.seriesName,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: TanukiColors.muted),
-                  ),
+                _HomeActionSheetTile(
+                  icon: Icons.tv,
+                  title: 'Ir a serie',
+                  subtitle: entry.seriesName,
                   onTap: () => Navigator.of(context)
                       .pop(_ContinueWatchingAction.goToSeries),
                 ),
               if (onStopWatching != null)
-                ListTile(
-                  leading: const Icon(
-                    Icons.remove_circle_outline,
-                    color: TanukiColors.orange,
-                  ),
-                  title: const Text(
-                    'Quitar de Continuar viendo',
-                    style: TextStyle(
-                      color: TanukiColors.text,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  subtitle: const Text(
-                    'Borra el progreso local sin marcarla abandonada',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: TanukiColors.muted),
-                  ),
+                _HomeActionSheetTile(
+                  icon: Icons.remove_circle_outline,
+                  title: 'Quitar de Continuar viendo',
+                  subtitle: 'Borra el progreso local sin marcarla abandonada',
                   onTap: () => Navigator.of(context)
                       .pop(_ContinueWatchingAction.stopWatching),
                 ),
               if (onAbandon != null)
-                ListTile(
-                  leading: const Icon(
-                    Icons.visibility_off_outlined,
-                    color: TanukiColors.danger,
-                  ),
-                  title: const Text(
-                    'Marcar como abandonada',
-                    style: TextStyle(
-                      color: TanukiColors.text,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  subtitle: Text(
-                    'Sacarla de Continuar viendo y marcarla abandonada',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: TanukiColors.muted),
-                  ),
+                _HomeActionSheetTile(
+                  icon: Icons.visibility_off_outlined,
+                  iconColor: TanukiColors.danger,
+                  title: 'Marcar como abandonada',
+                  subtitle: 'Sacarla de Continuar viendo y marcarla abandonada',
                   onTap: () => Navigator.of(context)
                       .pop(_ContinueWatchingAction.abandon),
                 ),
@@ -7579,6 +7969,14 @@ class _SettingsPanel extends StatelessWidget {
     final aspectDiff = (aspectRatio - targetAspectRatio).abs();
     final isSixteenByNine = aspectDiff <= 0.05;
     final safePadding = media.padding;
+    final screenDebugInfo = _SettingsScreenDebugInfo(
+      logicalSize: logicalSize,
+      physicalSize: physicalSize,
+      devicePixelRatio: dpr,
+      aspectRatio: aspectRatio,
+      isSixteenByNine: isSixteenByNine,
+      safePadding: safePadding,
+    );
     return SingleChildScrollView(
       padding: const EdgeInsets.only(left: 20, right: 4, bottom: 24),
       child: ConstrainedBox(
@@ -7586,10 +7984,9 @@ class _SettingsPanel extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Ajustes', style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 10),
-            const _SettingsStatusText(
-              'Tanuki Flutter v$_appVersionLabel\nby Guzz.',
+            _SettingsHeader(
+              controller: controller,
+              screenDebugInfo: screenDebugInfo,
             ),
             const _SettingsSectionTitle('Cuentas'),
             const _SettingsSectionTitle('MyAnimeList'),
@@ -7757,6 +8154,7 @@ class _SettingsPanel extends StatelessWidget {
                   : 'Sincronizar cuentas conectadas'),
             ),
             const _SettingsSectionTitle('Reproduccion'),
+            _AndroidVideoViewModeSetting(controller: controller),
             const _SettingsSectionTitle('Overscan CRT'),
             _SettingsSlider(
               value: controller.state.overscanHorizontal,
@@ -7852,19 +8250,6 @@ class _SettingsPanel extends StatelessWidget {
                   : const Icon(Icons.cloud_sync),
               label: const Text('Actualizar relleno'),
             ),
-            const _SettingsSectionTitle('Debug de pantalla'),
-            _SettingsStatusText(
-                'Resolución lógica: ${logicalSize.width.toStringAsFixed(0)} x ${logicalSize.height.toStringAsFixed(0)}'),
-            _SettingsStatusText(
-                'Resolución física: ${physicalSize.width.toStringAsFixed(0)} x ${physicalSize.height.toStringAsFixed(0)}'),
-            _SettingsStatusText(
-                'DPI de dispositivo: ${dpr.toStringAsFixed(2)}'),
-            _SettingsStatusText(
-                'Aspect ratio: ${aspectRatio.toStringAsFixed(3)}'),
-            _SettingsStatusText(
-                'Cerca de 16:9: ${isSixteenByNine ? 'Sí' : 'No'}'),
-            _SettingsStatusText(
-                'Safe area: top ${safePadding.top.toStringAsFixed(0)}, bottom ${safePadding.bottom.toStringAsFixed(0)}, left ${safePadding.left.toStringAsFixed(0)}, right ${safePadding.right.toStringAsFixed(0)}'),
           ],
         ),
       ),
@@ -8234,19 +8619,276 @@ class _SettingsSliderState extends State<_SettingsSlider> {
 }
 
 class _SettingsStatusText extends StatelessWidget {
-  const _SettingsStatusText(this.text);
+  const _SettingsStatusText(this.text, {this.textAlign = TextAlign.start});
 
   final String text;
+  final TextAlign textAlign;
 
   @override
   Widget build(BuildContext context) {
     return Text(
       text,
+      textAlign: textAlign,
       style: const TextStyle(
         color: TanukiColors.muted,
         fontSize: 13,
         height: 1.35,
       ),
+    );
+  }
+}
+
+class _SettingsHeader extends StatelessWidget {
+  const _SettingsHeader({
+    required this.controller,
+    required this.screenDebugInfo,
+  });
+
+  final AppController controller;
+  final _SettingsScreenDebugInfo screenDebugInfo;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < 620) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Ajustes', style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 10),
+              _SettingsHeaderStatus(
+                controller: controller,
+                screenDebugInfo: screenDebugInfo,
+                textAlign: TextAlign.start,
+              ),
+              const SizedBox(height: 10),
+            ],
+          );
+        }
+        return Padding(
+          padding: const EdgeInsets.only(right: 12),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(
+                  'Ajustes',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+              ),
+              const SizedBox(width: 24),
+              SizedBox(
+                width: 430,
+                child: _SettingsHeaderStatus(
+                  controller: controller,
+                  screenDebugInfo: screenDebugInfo,
+                  textAlign: TextAlign.right,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SettingsHeaderStatus extends StatelessWidget {
+  const _SettingsHeaderStatus({
+    required this.controller,
+    required this.screenDebugInfo,
+    required this.textAlign,
+  });
+
+  final AppController controller;
+  final _SettingsScreenDebugInfo screenDebugInfo;
+  final TextAlign textAlign;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: textAlign == TextAlign.right
+          ? CrossAxisAlignment.end
+          : CrossAxisAlignment.start,
+      children: [
+        _SettingsStatusText(
+          'Tanuki Flutter v$_appVersionLabel\nby Guzz.',
+          textAlign: textAlign,
+        ),
+        const SizedBox(height: 8),
+        _AndroidVideoViewSettingsStatus(
+          mode: controller.state.androidVideoViewMode,
+          textAlign: textAlign,
+        ),
+        const SizedBox(height: 8),
+        _SettingsStatusText(
+          screenDebugInfo.label,
+          textAlign: textAlign,
+        ),
+      ],
+    );
+  }
+}
+
+class _SettingsScreenDebugInfo {
+  const _SettingsScreenDebugInfo({
+    required this.logicalSize,
+    required this.physicalSize,
+    required this.devicePixelRatio,
+    required this.aspectRatio,
+    required this.isSixteenByNine,
+    required this.safePadding,
+  });
+
+  final Size logicalSize;
+  final Size physicalSize;
+  final double devicePixelRatio;
+  final double aspectRatio;
+  final bool isSixteenByNine;
+  final EdgeInsets safePadding;
+
+  String get label {
+    return 'Resolución lógica: ${logicalSize.width.toStringAsFixed(0)} x '
+        '${logicalSize.height.toStringAsFixed(0)}\n'
+        'Resolución física: ${physicalSize.width.toStringAsFixed(0)} x '
+        '${physicalSize.height.toStringAsFixed(0)}\n'
+        'DPI de dispositivo: ${devicePixelRatio.toStringAsFixed(2)}\n'
+        'Aspect ratio: ${aspectRatio.toStringAsFixed(3)}\n'
+        'Cerca de 16:9: ${isSixteenByNine ? 'Sí' : 'No'}\n'
+        'Safe area: top ${safePadding.top.toStringAsFixed(0)}, '
+        'bottom ${safePadding.bottom.toStringAsFixed(0)}, '
+        'left ${safePadding.left.toStringAsFixed(0)}, '
+        'right ${safePadding.right.toStringAsFixed(0)}';
+  }
+}
+
+class _AndroidVideoViewSettingsStatus extends StatelessWidget {
+  const _AndroidVideoViewSettingsStatus({
+    required this.mode,
+    this.textAlign = TextAlign.start,
+  });
+
+  final AndroidVideoViewMode mode;
+  final TextAlign textAlign;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!io.Platform.isAndroid) {
+      return _SettingsStatusText(
+        'Android video view: no aplica.',
+        textAlign: textAlign,
+      );
+    }
+    return FutureBuilder<AndroidMediaCapabilities?>(
+      future: loadAndroidMediaCapabilities(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return _SettingsStatusText(
+            'Android video view: detectando...',
+            textAlign: textAlign,
+          );
+        }
+        final capabilities = snapshot.data;
+        if (capabilities == null) {
+          return _SettingsStatusText(
+            'Android video view: no disponible.',
+            textAlign: textAlign,
+          );
+        }
+        final viewType = androidVideoViewTypeForCapabilities(
+          capabilities,
+          mode: mode,
+        );
+        final viewLabel = viewType.name == 'platformView'
+            ? 'SurfaceView (platformView)'
+            : 'TextureView';
+        final modeLabel =
+            mode == AndroidVideoViewMode.automatic ? 'auto' : 'forzado';
+        return _SettingsStatusText(
+          'Android video view: $viewLabel ($modeLabel)\n'
+          'Detectado: ${capabilities.deviceClassLabel} - '
+          '${capabilities.manufacturer} ${capabilities.model}',
+          textAlign: textAlign,
+        );
+      },
+    );
+  }
+}
+
+class _AndroidVideoViewModeSetting extends StatelessWidget {
+  const _AndroidVideoViewModeSetting({required this.controller});
+
+  final AppController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!io.Platform.isAndroid) {
+      return const SizedBox.shrink();
+    }
+    final current = controller.state.androidVideoViewMode;
+    return Padding(
+      padding: const EdgeInsets.only(top: 8, bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Android video view',
+            style: TextStyle(
+              color: Color(0xFFD8E1EB),
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (final mode in AndroidVideoViewMode.values)
+                _SettingsChoiceButton(
+                  label: switch (mode) {
+                    AndroidVideoViewMode.automatic => 'Auto',
+                    AndroidVideoViewMode.texture => 'TextureView',
+                    AndroidVideoViewMode.surface => 'SurfaceView',
+                  },
+                  selected: current == mode,
+                  onPressed: () =>
+                      unawaited(controller.setAndroidVideoViewMode(mode)),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SettingsChoiceButton extends StatelessWidget {
+  const _SettingsChoiceButton({
+    required this.label,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return OutlinedButton(
+      onPressed: onPressed,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: selected ? Colors.black : TanukiColors.text,
+        backgroundColor: selected ? TanukiColors.orange : Colors.transparent,
+        side: BorderSide(
+          color: selected ? TanukiColors.orangeHot : const Color(0x668A939E),
+          width: 2,
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      ),
+      child: Text(label),
     );
   }
 }
@@ -8898,11 +9540,12 @@ void _ensureFocusedShelfVisible(
         return;
       }
     }
+    final phoneUi = _HomePhoneUi.enabledOf(context);
     Scrollable.ensureVisible(
       context,
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
-      alignment: shelfChanged ? 0.76 : 0.72,
+      alignment: shelfChanged ? (phoneUi ? 0.86 : 0.76) : 0.72,
       alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
     );
   });
