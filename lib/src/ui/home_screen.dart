@@ -8887,7 +8887,7 @@ void _ensureFocusedShelfVisible(
       context,
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
-      alignment: shelfChanged ? 0.58 : 0.72,
+      alignment: shelfChanged ? 0.76 : 0.72,
       alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
     );
   });
