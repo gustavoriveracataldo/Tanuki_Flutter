@@ -302,6 +302,187 @@ Solo en la oscuridad, la luz.
     expect(args, contains('--clock-jitter=0'));
   });
 
+  test('runs deferred resume for stable AnimeAV1 HLS after warmup', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'http://127.0.0.1:44519/playlist.m3u8',
+      playbackKind: 'hls',
+      pageUrl:
+          'https://player.zilla-networks.com/play/6a91a9fceb2dc7ac9385520de35977b3',
+      provider: RemoteProvider.animeAv1,
+      httpHeaders: {
+        'X-Tanuki-Upstream-Url':
+            'https://player.zilla-networks.com/m3u8/6a91a9fceb2dc7ac9385520de35977b3',
+      },
+    );
+
+    expect(
+      shouldRunDesktopVlcDeferredResumeSeek(
+        stream: stream,
+        hasVideoFrame: false,
+        warmingUp: true,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldRunDesktopVlcDeferredResumeSeek(
+        stream: stream,
+        hasVideoFrame: false,
+        warmingUp: false,
+      ),
+      isTrue,
+    );
+  });
+
+  test('reports playback frame jank beyond monitor thresholds', () {
+    expect(
+      shouldReportPlaybackFrameJank(
+        totalSpan: const Duration(milliseconds: 121),
+        buildDuration: const Duration(milliseconds: 4),
+        rasterDuration: const Duration(milliseconds: 8),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldReportPlaybackFrameJank(
+        totalSpan: const Duration(milliseconds: 16),
+        buildDuration: const Duration(milliseconds: 4),
+        rasterDuration: const Duration(milliseconds: 81),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldReportPlaybackFrameJank(
+        totalSpan: const Duration(milliseconds: 16),
+        buildDuration: const Duration(milliseconds: 4),
+        rasterDuration: const Duration(milliseconds: 8),
+      ),
+      isFalse,
+    );
+  });
+
+  test('reports ExoPlayer listener gaps when playback clock advances', () {
+    expect(
+      shouldReportAndroidExoListenerGap(
+        wallGap: const Duration(milliseconds: 1300),
+        positionDelta: const Duration(milliseconds: 1000),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldReportAndroidExoListenerGap(
+        wallGap: const Duration(milliseconds: 1300),
+        positionDelta: const Duration(milliseconds: 100),
+      ),
+      isFalse,
+    );
+  });
+
+  test('reports ExoPlayer heartbeat stalls when playback position stops', () {
+    expect(
+      shouldReportAndroidExoPositionStall(
+        wallGap: const Duration(milliseconds: 1200),
+        positionDelta: const Duration(milliseconds: 100),
+      ),
+      isTrue,
+    );
+    expect(
+      shouldReportAndroidExoPositionStall(
+        wallGap: const Duration(milliseconds: 1200),
+        positionDelta: const Duration(milliseconds: 500),
+      ),
+      isFalse,
+    );
+  });
+
+  test('parses Android AV1 hardware decoder capabilities', () {
+    final capabilities = AndroidMediaCapabilities.fromChannelData({
+      'sdkInt': 33,
+      'manufacturer': 'Xiaomi',
+      'model': '2201117TG',
+      'device': 'spes',
+      'hasHardwareAv1Decoder': false,
+      'av1Decoders': [
+        {
+          'name': 'c2.android.av1-dav1d.decoder',
+          'hardwareAccelerated': false,
+          'softwareOnly': true,
+          'vendor': false,
+        },
+      ],
+    });
+
+    expect(capabilities, isNotNull);
+    expect(capabilities!.hasHardwareAv1Decoder, isFalse);
+    expect(capabilities.av1Decoders.single.softwareOnly, isTrue);
+    expect(capabilities.summaryLabel, contains('hardwareAv1=false'));
+    expect(capabilities.summaryLabel, contains('c2.android.av1-dav1d.decoder'));
+  });
+
+  test('rebuilds Android Exo progress only for visible UI needs', () {
+    expect(
+      shouldRebuildAndroidExoProgress(
+        overlaysVisible: false,
+        controlsFocused: false,
+        dialogOpen: false,
+        subtitlesEnabled: true,
+        captionText: '',
+      ),
+      isFalse,
+    );
+    expect(
+      shouldRebuildAndroidExoProgress(
+        overlaysVisible: true,
+        controlsFocused: false,
+        dialogOpen: false,
+        subtitlesEnabled: false,
+        captionText: '',
+      ),
+      isTrue,
+    );
+    expect(
+      shouldRebuildAndroidExoProgress(
+        overlaysVisible: false,
+        controlsFocused: false,
+        dialogOpen: false,
+        subtitlesEnabled: true,
+        captionText: 'caption',
+      ),
+      isTrue,
+    );
+  });
+
+  test('uses small then larger keyboard seek steps for held progress keys', () {
+    expect(
+      playerProgressKeyboardSeekStep(repeatCount: 0),
+      const Duration(seconds: 10),
+    );
+    expect(
+      playerProgressKeyboardSeekStep(repeatCount: 1),
+      const Duration(seconds: 20),
+    );
+    expect(
+      playerProgressKeyboardSeekStep(repeatCount: 5),
+      const Duration(seconds: 30),
+    );
+  });
+
+  test('clamps keyboard seek targets inside playback duration', () {
+    expect(
+      clampPlayerProgressSeekTarget(
+        const Duration(seconds: -10),
+        const Duration(minutes: 2),
+      ),
+      Duration.zero,
+    );
+    expect(
+      clampPlayerProgressSeekTarget(
+        const Duration(minutes: 3),
+        const Duration(minutes: 2),
+      ),
+      const Duration(minutes: 2),
+    );
+  });
+
   test('calculates buffered time ahead of the current position', () {
     final ahead = bufferedAheadForPosition(
       position: const Duration(seconds: 12),

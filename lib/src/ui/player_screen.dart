@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:dart_vlc/dart_vlc.dart' as vlc;
 import 'package:flutter/foundation.dart';
@@ -39,16 +40,27 @@ const _stableRemoteAv1VlcCacheMs = 20000;
 const _stableRemoteAv1InitialBufferWarmup = Duration(seconds: 10);
 const _stableRemoteAv1StartupBufferTarget = Duration(seconds: 10);
 const _stableRemoteAv1StartupBufferMaxWait = Duration(seconds: 25);
+const _playbackFrameJankThreshold = Duration(milliseconds: 120);
+const _playbackRenderJankThreshold = Duration(milliseconds: 80);
+const _playbackMonitorReportThrottle = Duration(seconds: 2);
+const _androidExoListenerGapThreshold = Duration(milliseconds: 1200);
+const _androidExoListenerPositionAdvanceThreshold = Duration(milliseconds: 900);
+const _playbackHeartbeatInterval = Duration(milliseconds: 500);
+const _androidExoPositionStallThreshold = Duration(milliseconds: 1100);
+const _androidExoPositionStallTolerance = Duration(milliseconds: 250);
+const _playerProgressKeyboardSeekCommitDelay = Duration(seconds: 1);
 const _animeSkipPromptLead = Duration(seconds: 1);
 const _animeSkipSeekEndOffset = Duration(milliseconds: 500);
 const _playerPointerOverlayRefreshInterval = Duration(milliseconds: 250);
 const _mediaKitMaxVolume = 100.0;
 const _normalizedMaxVolume = 1.0;
 const _youtubeMaxVolume = 100;
+const _mediaCapabilitiesChannel = MethodChannel('tanuki/media_capabilities');
 int _nextDesktopVlcPlayerId = 1;
 const _androidHardwareDecoderCodecs = 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1';
 const _androidHardwareDecoderCodecsWithoutAv1 =
     'h264,hevc,mpeg4,mpeg2video,vp8,vp9';
+Future<AndroidMediaCapabilities?>? _androidMediaCapabilitiesFuture;
 
 enum PlayerLaunchMode {
   normal,
@@ -195,6 +207,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   Timer? _upcomingCardStartTimer;
   Timer? _upcomingCardSequenceTimer;
   Timer? _playerRemoteBackHoldTimer;
+  Timer? _playbackHeartbeatTimer;
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<Duration>? _durationSubscription;
   StreamSubscription<bool>? _completedSubscription;
@@ -245,11 +258,22 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _startUpcomingCardsShown = false;
   bool _endUpcomingCardsShown = false;
   int _upcomingCardTicket = 0;
+  DateTime _lastPlaybackMonitorReportAt =
+      DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _lastAndroidExoValueAt;
+  Duration? _lastAndroidExoValuePosition;
+  DateTime? _lastAndroidExoHeartbeatAt;
+  Duration? _lastAndroidExoHeartbeatPosition;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addTimingsCallback(_handlePlaybackFrameTimings);
+    _playbackHeartbeatTimer = Timer.periodic(
+      _playbackHeartbeatInterval,
+      (_) => _monitorPlaybackHeartbeat(),
+    );
     unawaited(_setPlaybackWakelock(enabled: true));
     _videoScaleMode =
         widget.controller.videoScaleModeForEpisode(widget.episode);
@@ -277,6 +301,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    WidgetsBinding.instance.removeTimingsCallback(_handlePlaybackFrameTimings);
     _desktopSubtitleLoadTicket += 1;
     _schedulePlaybackFinalizationAfterDispose();
     _simklPauseDebounceTimer?.cancel();
@@ -287,6 +312,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _upcomingCardStartTimer?.cancel();
     _upcomingCardSequenceTimer?.cancel();
     _playerRemoteBackHoldTimer?.cancel();
+    _playbackHeartbeatTimer?.cancel();
     _playerControlsRootFocusNode.dispose();
     _playerBackButtonFocusNode.dispose();
     _playerPreviousButtonFocusNode.dispose();
@@ -420,6 +446,160 @@ class _PlayerScreenState extends State<PlayerScreen>
       debugPrint('PlayerScreen: $message');
       return true;
     }());
+  }
+
+  void _handlePlaybackFrameTimings(List<ui.FrameTiming> timings) {
+    if (!_playbackMonitorActive) {
+      return;
+    }
+    for (final timing in timings) {
+      if (!shouldReportPlaybackFrameJank(
+        totalSpan: timing.totalSpan,
+        buildDuration: timing.buildDuration,
+        rasterDuration: timing.rasterDuration,
+      )) {
+        continue;
+      }
+      _reportPlaybackMonitorIssue(
+        'frame-jank',
+        'total=${timing.totalSpan.inMilliseconds}ms '
+            'build=${timing.buildDuration.inMilliseconds}ms '
+            'raster=${timing.rasterDuration.inMilliseconds}ms',
+      );
+    }
+  }
+
+  bool get _playbackMonitorActive {
+    if (!_openedMedia || _leavingPlayer) {
+      return false;
+    }
+    final android = _androidExoController;
+    if (android != null) {
+      final value = android.value;
+      return value.isInitialized && value.isPlaying && !value.isBuffering;
+    }
+    final player = _player;
+    if (player != null) {
+      return player.state.playing && !player.state.buffering;
+    }
+    if (_desktopVlcPlayer != null) {
+      return _desktopVlcIsPlaying && !_playerBuffering;
+    }
+    return _youtubeWebPlaying;
+  }
+
+  void _reportPlaybackMonitorIssue(String kind, String details) {
+    final now = DateTime.now();
+    if (now.difference(_lastPlaybackMonitorReportAt) <
+        _playbackMonitorReportThrottle) {
+      return;
+    }
+    _lastPlaybackMonitorReportAt = now;
+    final message = '$kind ${_playbackMonitorContext()} $details';
+    _debugPlayerEvent('PlaybackMonitor: $message');
+    assert(() {
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: PlaybackMonitorException(message),
+          stack: StackTrace.current,
+          library: 'Tanuki player monitor',
+          context: ErrorDescription('while monitoring video playback'),
+        ),
+      );
+      return true;
+    }());
+  }
+
+  String _playbackMonitorContext() {
+    final stream = _currentResolvedStream;
+    final provider =
+        stream?.provider?.id ?? widget.episode.provider?.id ?? 'unknown';
+    final kind = stream?.playbackKind ?? 'unknown';
+    final server = stream?.server.trim() ?? '';
+    return 'provider=$provider kind=$kind '
+        'server=${server.isEmpty ? 'none' : server} '
+        'pos=${_formatPlaybackTime(_lastPosition)} '
+        'duration=${_formatPlaybackTime(_lastDuration)}';
+  }
+
+  void _monitorPlaybackHeartbeat() {
+    final android = _androidExoController;
+    if (android == null) {
+      _resetAndroidExoHeartbeat();
+      return;
+    }
+    final value = android.value;
+    if (!_openedMedia ||
+        !value.isInitialized ||
+        !value.isPlaying ||
+        value.isBuffering) {
+      _resetAndroidExoHeartbeat();
+      return;
+    }
+
+    final now = DateTime.now();
+    final previousAt = _lastAndroidExoHeartbeatAt;
+    final previousPosition = _lastAndroidExoHeartbeatPosition;
+    _lastAndroidExoHeartbeatAt = now;
+    _lastAndroidExoHeartbeatPosition = value.position;
+    if (previousAt == null || previousPosition == null) {
+      return;
+    }
+
+    final wallGap = now.difference(previousAt);
+    final positionDelta = value.position - previousPosition;
+    if (!shouldReportAndroidExoPositionStall(
+      wallGap: wallGap,
+      positionDelta: positionDelta,
+    )) {
+      return;
+    }
+    _reportPlaybackMonitorIssue(
+      'exo-position-stall',
+      'wall=${wallGap.inMilliseconds}ms '
+          'positionDelta=${positionDelta.inMilliseconds}ms '
+          'buffered=${value.buffered.length}',
+    );
+  }
+
+  void _resetAndroidExoHeartbeat() {
+    _lastAndroidExoHeartbeatAt = null;
+    _lastAndroidExoHeartbeatPosition = null;
+  }
+
+  Future<void> _logAndroidMediaCapabilitiesIfNeeded() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    final capabilities = await loadAndroidMediaCapabilities();
+    if (capabilities == null) {
+      _debugPlayerEvent('Android media capabilities unavailable');
+      return;
+    }
+    _debugPlayerEvent(
+      'Android media capabilities ${capabilities.summaryLabel}',
+    );
+    if (_isAnimeAv1ZillaHlsPlayback &&
+        !capabilities.hasHardwareAv1Decoder &&
+        capabilities.av1Decoders.isNotEmpty) {
+      _debugPlayerEvent(
+        'PlaybackMonitor: android-av1-software-risk '
+        '${_playbackMonitorContext()} ${capabilities.av1DecoderLabel}',
+      );
+    }
+  }
+
+  bool get _isAnimeAv1ZillaHlsPlayback {
+    final stream = _currentResolvedStream;
+    if (stream == null || stream.provider != RemoteProvider.animeAv1) {
+      return false;
+    }
+    final playbackUrl = stream.playbackUrl.toLowerCase();
+    final upstreamUrl =
+        stream.httpHeaders['X-Tanuki-Upstream-Url']?.toLowerCase().trim() ?? '';
+    return stream.playbackKind.toLowerCase() == 'hls' &&
+        (playbackUrl.contains('player.zilla-networks.com') ||
+            upstreamUrl.contains('player.zilla-networks.com'));
   }
 
   void _commitCurrentEntryAfterOpen() {
@@ -767,6 +947,10 @@ class _PlayerScreenState extends State<PlayerScreen>
     _androidExoDeferredResumeSeekHandled = false;
     _androidExoRebufferHoldActive = false;
     _handlingAndroidExoError = false;
+    _lastAndroidExoValueAt = null;
+    _lastAndroidExoValuePosition = null;
+    _resetAndroidExoHeartbeat();
+    await _logAndroidMediaCapabilitiesIfNeeded();
 
     final headers = _remoteMediaHeaders(path) ?? const <String, String>{};
     final playbackKind = _currentResolvedStream?.playbackKind.toLowerCase();
@@ -1025,9 +1209,10 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (!mounted || _desktopVlcPlayer != player) {
         return;
       }
-      _remoteVideoWidth = dimensions.width;
-      _remoteVideoHeight = dimensions.height;
-      if (dimensions.width > 0 && dimensions.height > 0) {
+      final hasDimensions = dimensions.width > 0 && dimensions.height > 0;
+      if (hasDimensions) {
+        _remoteVideoWidth = dimensions.width;
+        _remoteVideoHeight = dimensions.height;
         if (_shouldWatchAnimeAv1VideoFrame()) {
           _markRemoteVideoFrameReady();
         }
@@ -1207,12 +1392,11 @@ class _PlayerScreenState extends State<PlayerScreen>
       return;
     }
     _desktopVlcDeferredResumeSeekTarget = resumePosition;
-    _desktopVlcDeferredResumeSeekReadyAt =
-        DateTime.now().add(_stableRemoteAv1InitialBufferWarmup);
+    final warmup = deferredResumeSeekWarmup(_currentResolvedStream);
+    _desktopVlcDeferredResumeSeekReadyAt = DateTime.now().add(warmup);
     _debugPlayerEvent(
       'VLC deferred resume seek warming target='
-      '${_formatPlaybackTime(resumePosition)} warmup='
-      '${_stableRemoteAv1InitialBufferWarmup.inSeconds}s',
+      '${_formatPlaybackTime(resumePosition)} warmup=${warmup.inSeconds}s',
     );
     _maybeRunDesktopVlcDeferredResumeSeek(player);
     _watchDesktopVlcDeferredResumeSeek(player);
@@ -1221,12 +1405,16 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _maybeRunDesktopVlcDeferredResumeSeek(vlc.Player player) {
     final target = _desktopVlcDeferredResumeSeekTarget;
     final readyAt = _desktopVlcDeferredResumeSeekReadyAt;
+    final warmingUp = readyAt != null && DateTime.now().isBefore(readyAt);
     if (_desktopVlcDeferredResumeSeekHandled ||
         target == null ||
         !mounted ||
         _desktopVlcPlayer != player ||
-        !_hasRemoteVideoFrame ||
-        (readyAt != null && DateTime.now().isBefore(readyAt))) {
+        !shouldRunDesktopVlcDeferredResumeSeek(
+          stream: _currentResolvedStream,
+          hasVideoFrame: _hasRemoteVideoFrame,
+          warmingUp: warmingUp,
+        )) {
       return;
     }
     _desktopVlcDeferredResumeSeekHandled = true;
@@ -1258,7 +1446,11 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
       final readyAt = _desktopVlcDeferredResumeSeekReadyAt;
       final warmingUp = readyAt != null && DateTime.now().isBefore(readyAt);
-      if (_hasRemoteVideoFrame && !warmingUp) {
+      if (shouldRunDesktopVlcDeferredResumeSeek(
+        stream: _currentResolvedStream,
+        hasVideoFrame: _hasRemoteVideoFrame,
+        warmingUp: warmingUp,
+      )) {
         _maybeRunDesktopVlcDeferredResumeSeek(player);
         return;
       }
@@ -1911,6 +2103,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!value.isInitialized) {
       return;
     }
+    _monitorAndroidExoValue(value);
     _setPlayerBuffering(value.isBuffering);
     final previous = _lastPosition;
     _lastPosition = value.position;
@@ -1946,11 +2139,47 @@ class _PlayerScreenState extends State<PlayerScreen>
 
     final now = DateTime.now();
     if (mounted &&
+        shouldRebuildAndroidExoProgress(
+          overlaysVisible: _playerOverlaysVisible,
+          controlsFocused: _playerControlsFocused,
+          dialogOpen: _playerDialogOpen,
+          subtitlesEnabled: _subtitlesEnabled,
+          captionText: value.caption.text,
+        ) &&
         now.difference(_lastAndroidExoRebuild) >=
             const Duration(milliseconds: 250)) {
       _lastAndroidExoRebuild = now;
       setState(() {});
     }
+  }
+
+  void _monitorAndroidExoValue(vp.VideoPlayerValue value) {
+    final now = DateTime.now();
+    final previousAt = _lastAndroidExoValueAt;
+    final previousPosition = _lastAndroidExoValuePosition;
+    _lastAndroidExoValueAt = now;
+    _lastAndroidExoValuePosition = value.position;
+    if (!_openedMedia ||
+        !value.isPlaying ||
+        value.isBuffering ||
+        previousAt == null ||
+        previousPosition == null) {
+      return;
+    }
+    final wallGap = now.difference(previousAt);
+    final positionDelta = value.position - previousPosition;
+    if (!shouldReportAndroidExoListenerGap(
+      wallGap: wallGap,
+      positionDelta: positionDelta,
+    )) {
+      return;
+    }
+    _reportPlaybackMonitorIssue(
+      'exo-listener-gap',
+      'wall=${wallGap.inMilliseconds}ms '
+          'positionDelta=${positionDelta.inMilliseconds}ms '
+          'buffered=${value.buffered.length}',
+    );
   }
 
   Future<void> _handleAndroidExoError(String error) async {
@@ -1978,11 +2207,12 @@ class _PlayerScreenState extends State<PlayerScreen>
         !shouldDeferAndroidExoInitialSeek(_currentResolvedStream)) {
       return;
     }
+    final warmup = deferredResumeSeekWarmup(_currentResolvedStream);
     _debugPlayerEvent(
       'ExoPlayer deferred resume seek warming target='
-      '${_formatPlaybackTime(resumePosition)}',
+      '${_formatPlaybackTime(resumePosition)} warmup=${warmup.inSeconds}s',
     );
-    unawaited(Future<void>.delayed(_stableRemoteAv1InitialBufferWarmup, () {
+    unawaited(Future<void>.delayed(warmup, () {
       if (_androidExoDeferredResumeSeekHandled ||
           !mounted ||
           _androidExoController != controller ||
@@ -2582,7 +2812,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   bool get _hasRemoteVideoFrame {
-    return (_remoteVideoWidth ?? 0) > 0 && (_remoteVideoHeight ?? 0) > 0;
+    return _remoteVideoFrameReady ||
+        ((_remoteVideoWidth ?? 0) > 0 && (_remoteVideoHeight ?? 0) > 0);
   }
 
   void _markRemoteVideoFrameReady() {
@@ -2959,12 +3190,13 @@ class _PlayerScreenState extends State<PlayerScreen>
       return;
     }
     _lastPlaybackSave = now;
-    unawaited(_persistPlayback());
+    unawaited(_persistPlayback(notify: false));
   }
 
   Future<void> _persistPlayback({
     bool force = false,
     bool completed = false,
+    bool notify = true,
   }) async {
     if (!_openedMedia && !force && !completed) {
       return;
@@ -2979,6 +3211,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       position: _lastPosition,
       duration: _lastDuration,
       completed: completed,
+      notify: notify,
     );
   }
 
@@ -6393,23 +6626,38 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
   double? _dragPositionMs;
   Timer? _keyboardSeekTimer;
   Duration? _pendingKeyboardSeek;
+  LogicalKeyboardKey? _keyboardSeekKey;
+  int _keyboardSeekRepeatCount = 0;
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) {
+    if (!isPlayerProgressSeekKeyEvent(event)) {
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
-    if (key != LogicalKeyboardKey.arrowLeft &&
-        key != LogicalKeyboardKey.arrowRight) {
+    if (!isPlayerProgressSeekKey(key)) {
       return KeyEventResult.ignored;
     }
     final direction = key == LogicalKeyboardKey.arrowRight ? 1 : -1;
-    final target = position + Duration(seconds: 10 * direction);
-    final clamped = Duration(
-      milliseconds: target.inMilliseconds
-          .clamp(0, max(1, duration.inMilliseconds))
-          .toInt(),
+    final continuingSeek =
+        _pendingKeyboardSeek != null && _keyboardSeekKey == key;
+    if (!continuingSeek) {
+      _keyboardSeekKey = key;
+      _keyboardSeekRepeatCount = 0;
+    } else {
+      _keyboardSeekRepeatCount += 1;
+    }
+    final step = playerProgressKeyboardSeekStep(
+      repeatCount: _keyboardSeekRepeatCount,
+    );
+    final basePosition = _pendingKeyboardSeek ??
+        (_dragPositionMs == null
+            ? position
+            : Duration(milliseconds: _dragPositionMs!.round()));
+    final target = basePosition + step * direction;
+    final clamped = clampPlayerProgressSeekTarget(
+      target,
+      duration,
     );
     setState(() {
       _dragPositionMs = clamped.inMilliseconds.toDouble();
@@ -6421,9 +6669,11 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
   void _scheduleKeyboardSeek(Duration target) {
     _pendingKeyboardSeek = target;
     _keyboardSeekTimer?.cancel();
-    _keyboardSeekTimer = Timer(const Duration(milliseconds: 260), () {
+    _keyboardSeekTimer = Timer(_playerProgressKeyboardSeekCommitDelay, () {
       final pending = _pendingKeyboardSeek;
       _pendingKeyboardSeek = null;
+      _keyboardSeekKey = null;
+      _keyboardSeekRepeatCount = 0;
       if (pending == null) {
         return;
       }
@@ -6519,6 +6769,8 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
                         onChangeEnd: (position) {
                           _keyboardSeekTimer?.cancel();
                           _pendingKeyboardSeek = null;
+                          _keyboardSeekKey = null;
+                          _keyboardSeekRepeatCount = 0;
                           setState(() {
                             _dragPositionMs = null;
                           });
@@ -6746,26 +6998,38 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
   double? _dragPositionMs;
   Timer? _keyboardSeekTimer;
   Duration? _pendingKeyboardSeek;
+  LogicalKeyboardKey? _keyboardSeekKey;
+  int _keyboardSeekRepeatCount = 0;
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) {
+    if (!isPlayerProgressSeekKeyEvent(event)) {
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
-    if (key != LogicalKeyboardKey.arrowLeft &&
-        key != LogicalKeyboardKey.arrowRight) {
+    if (!isPlayerProgressSeekKey(key)) {
       return KeyEventResult.ignored;
     }
     final direction = key == LogicalKeyboardKey.arrowRight ? 1 : -1;
-    final target = position + Duration(seconds: 10 * direction);
-    final clamped = Duration(
-      milliseconds: target.inMilliseconds
-          .clamp(
-            0,
-            duration.inMilliseconds,
-          )
-          .toInt(),
+    final continuingSeek =
+        _pendingKeyboardSeek != null && _keyboardSeekKey == key;
+    if (!continuingSeek) {
+      _keyboardSeekKey = key;
+      _keyboardSeekRepeatCount = 0;
+    } else {
+      _keyboardSeekRepeatCount += 1;
+    }
+    final step = playerProgressKeyboardSeekStep(
+      repeatCount: _keyboardSeekRepeatCount,
+    );
+    final basePosition = _pendingKeyboardSeek ??
+        (_dragPositionMs == null
+            ? position
+            : Duration(milliseconds: _dragPositionMs!.round()));
+    final target = basePosition + step * direction;
+    final clamped = clampPlayerProgressSeekTarget(
+      target,
+      duration,
     );
     setState(() {
       _dragPositionMs = clamped.inMilliseconds.toDouble();
@@ -6777,9 +7041,11 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
   void _scheduleKeyboardSeek(Duration target) {
     _pendingKeyboardSeek = target;
     _keyboardSeekTimer?.cancel();
-    _keyboardSeekTimer = Timer(const Duration(milliseconds: 260), () {
+    _keyboardSeekTimer = Timer(_playerProgressKeyboardSeekCommitDelay, () {
       final pending = _pendingKeyboardSeek;
       _pendingKeyboardSeek = null;
+      _keyboardSeekKey = null;
+      _keyboardSeekRepeatCount = 0;
       if (pending == null) {
         return;
       }
@@ -6876,6 +7142,8 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
                         onChangeEnd: (position) {
                           _keyboardSeekTimer?.cancel();
                           _pendingKeyboardSeek = null;
+                          _keyboardSeekKey = null;
+                          _keyboardSeekRepeatCount = 0;
                           setState(() {
                             _dragPositionMs = null;
                           });
@@ -6937,27 +7205,39 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
   double? _dragPositionMs;
   Timer? _keyboardSeekTimer;
   Duration? _pendingKeyboardSeek;
+  LogicalKeyboardKey? _keyboardSeekKey;
+  int _keyboardSeekRepeatCount = 0;
   DateTime _lastUiRefresh = DateTime.fromMillisecondsSinceEpoch(0);
 
   KeyEventResult _handleProgressKey(
       Duration position, Duration duration, FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) {
+    if (!isPlayerProgressSeekKeyEvent(event)) {
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
-    if (key != LogicalKeyboardKey.arrowLeft &&
-        key != LogicalKeyboardKey.arrowRight) {
+    if (!isPlayerProgressSeekKey(key)) {
       return KeyEventResult.ignored;
     }
     final direction = key == LogicalKeyboardKey.arrowRight ? 1 : -1;
-    final target = position + Duration(seconds: 10 * direction);
-    final clamped = Duration(
-      milliseconds: target.inMilliseconds
-          .clamp(
-            0,
-            duration.inMilliseconds,
-          )
-          .toInt(),
+    final continuingSeek =
+        _pendingKeyboardSeek != null && _keyboardSeekKey == key;
+    if (!continuingSeek) {
+      _keyboardSeekKey = key;
+      _keyboardSeekRepeatCount = 0;
+    } else {
+      _keyboardSeekRepeatCount += 1;
+    }
+    final step = playerProgressKeyboardSeekStep(
+      repeatCount: _keyboardSeekRepeatCount,
+    );
+    final basePosition = _pendingKeyboardSeek ??
+        (_dragPositionMs == null
+            ? position
+            : Duration(milliseconds: _dragPositionMs!.round()));
+    final target = basePosition + step * direction;
+    final clamped = clampPlayerProgressSeekTarget(
+      target,
+      duration,
     );
     setState(() {
       _dragPositionMs = clamped.inMilliseconds.toDouble();
@@ -6969,9 +7249,11 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
   void _scheduleKeyboardSeek(Duration target) {
     _pendingKeyboardSeek = target;
     _keyboardSeekTimer?.cancel();
-    _keyboardSeekTimer = Timer(const Duration(milliseconds: 260), () {
+    _keyboardSeekTimer = Timer(_playerProgressKeyboardSeekCommitDelay, () {
       final pending = _pendingKeyboardSeek;
       _pendingKeyboardSeek = null;
+      _keyboardSeekKey = null;
+      _keyboardSeekRepeatCount = 0;
       if (pending == null) {
         return;
       }
@@ -7107,6 +7389,8 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
                         onChangeEnd: (value) {
                           _keyboardSeekTimer?.cancel();
                           _pendingKeyboardSeek = null;
+                          _keyboardSeekKey = null;
+                          _keyboardSeekRepeatCount = 0;
                           setState(() {
                             _dragPositionMs = null;
                           });
@@ -8276,6 +8560,225 @@ bool shouldDeferRemoteHlsInitialSeek(RemoteDirectStream? stream) {
 bool shouldDeferDesktopVlcInitialSeek(RemoteDirectStream? stream) {
   return shouldUseStableRemoteAv1PlaybackProfile(stream) ||
       shouldDeferRemoteHlsInitialSeek(stream);
+}
+
+bool shouldRunDesktopVlcDeferredResumeSeek({
+  required RemoteDirectStream? stream,
+  required bool hasVideoFrame,
+  required bool warmingUp,
+}) {
+  if (warmingUp) {
+    return false;
+  }
+  if (hasVideoFrame) {
+    return true;
+  }
+  return shouldUseStableRemoteAv1PlaybackProfile(stream);
+}
+
+bool shouldReportPlaybackFrameJank({
+  required Duration totalSpan,
+  required Duration buildDuration,
+  required Duration rasterDuration,
+}) {
+  return totalSpan >= _playbackFrameJankThreshold ||
+      buildDuration >= _playbackRenderJankThreshold ||
+      rasterDuration >= _playbackRenderJankThreshold;
+}
+
+bool shouldReportAndroidExoListenerGap({
+  required Duration wallGap,
+  required Duration positionDelta,
+}) {
+  return wallGap >= _androidExoListenerGapThreshold &&
+      positionDelta >= _androidExoListenerPositionAdvanceThreshold;
+}
+
+bool shouldReportAndroidExoPositionStall({
+  required Duration wallGap,
+  required Duration positionDelta,
+}) {
+  return wallGap >= _androidExoPositionStallThreshold &&
+      positionDelta <= _androidExoPositionStallTolerance;
+}
+
+bool shouldRebuildAndroidExoProgress({
+  required bool overlaysVisible,
+  required bool controlsFocused,
+  required bool dialogOpen,
+  required bool subtitlesEnabled,
+  required String captionText,
+}) {
+  return overlaysVisible ||
+      controlsFocused ||
+      dialogOpen ||
+      (subtitlesEnabled && captionText.trim().isNotEmpty);
+}
+
+bool isPlayerProgressSeekKey(LogicalKeyboardKey key) {
+  return key == LogicalKeyboardKey.arrowLeft ||
+      key == LogicalKeyboardKey.arrowRight;
+}
+
+bool isPlayerProgressSeekKeyEvent(KeyEvent event) {
+  return event is KeyDownEvent || event is KeyRepeatEvent;
+}
+
+Duration playerProgressKeyboardSeekStep({required int repeatCount}) {
+  if (repeatCount <= 0) {
+    return const Duration(seconds: 10);
+  }
+  if (repeatCount < 5) {
+    return const Duration(seconds: 20);
+  }
+  return const Duration(seconds: 30);
+}
+
+Duration clampPlayerProgressSeekTarget(Duration target, Duration duration) {
+  final maxPositionMs = max(0, duration.inMilliseconds);
+  return Duration(
+    milliseconds: target.inMilliseconds.clamp(0, maxPositionMs).toInt(),
+  );
+}
+
+Future<AndroidMediaCapabilities?> loadAndroidMediaCapabilities({
+  MethodChannel channel = _mediaCapabilitiesChannel,
+}) {
+  if (!Platform.isAndroid) {
+    return Future<AndroidMediaCapabilities?>.value();
+  }
+  return _androidMediaCapabilitiesFuture ??= () async {
+    try {
+      final data = await channel.invokeMethod<Object?>(
+        'androidMediaCapabilities',
+      );
+      return AndroidMediaCapabilities.fromChannelData(data);
+    } catch (error) {
+      debugPrint('PlayerScreen: Android media capabilities failed: $error');
+      return null;
+    }
+  }();
+}
+
+class AndroidMediaCapabilities {
+  const AndroidMediaCapabilities({
+    required this.sdkInt,
+    required this.manufacturer,
+    required this.model,
+    required this.device,
+    required this.hasHardwareAv1Decoder,
+    required this.av1Decoders,
+  });
+
+  final int sdkInt;
+  final String manufacturer;
+  final String model;
+  final String device;
+  final bool hasHardwareAv1Decoder;
+  final List<AndroidCodecDecoder> av1Decoders;
+
+  String get summaryLabel {
+    return 'sdk=$sdkInt device="$manufacturer $model/$device" '
+        'hardwareAv1=$hasHardwareAv1Decoder $av1DecoderLabel';
+  }
+
+  String get av1DecoderLabel {
+    if (av1Decoders.isEmpty) {
+      return 'av1Decoders=none';
+    }
+    return 'av1Decoders=['
+        '${av1Decoders.map((decoder) => decoder.summaryLabel).join('; ')}'
+        ']';
+  }
+
+  static AndroidMediaCapabilities? fromChannelData(Object? data) {
+    if (data is! Map) {
+      return null;
+    }
+    final decoders = <AndroidCodecDecoder>[];
+    final rawDecoders = data['av1Decoders'];
+    if (rawDecoders is Iterable) {
+      for (final rawDecoder in rawDecoders) {
+        final decoder = AndroidCodecDecoder.fromChannelData(rawDecoder);
+        if (decoder != null) {
+          decoders.add(decoder);
+        }
+      }
+    }
+    return AndroidMediaCapabilities(
+      sdkInt: _readInt(data['sdkInt']),
+      manufacturer: _readString(data['manufacturer']),
+      model: _readString(data['model']),
+      device: _readString(data['device']),
+      hasHardwareAv1Decoder: data['hasHardwareAv1Decoder'] == true,
+      av1Decoders: List.unmodifiable(decoders),
+    );
+  }
+}
+
+class AndroidCodecDecoder {
+  const AndroidCodecDecoder({
+    required this.name,
+    required this.hardwareAccelerated,
+    required this.softwareOnly,
+    required this.vendor,
+  });
+
+  final String name;
+  final bool hardwareAccelerated;
+  final bool softwareOnly;
+  final bool? vendor;
+
+  String get summaryLabel {
+    return '$name hw=$hardwareAccelerated sw=$softwareOnly '
+        'vendor=${vendor ?? 'unknown'}';
+  }
+
+  static AndroidCodecDecoder? fromChannelData(Object? data) {
+    if (data is! Map) {
+      return null;
+    }
+    final name = _readString(data['name']);
+    if (name.isEmpty) {
+      return null;
+    }
+    return AndroidCodecDecoder(
+      name: name,
+      hardwareAccelerated: data['hardwareAccelerated'] == true,
+      softwareOnly: data['softwareOnly'] == true,
+      vendor: data['vendor'] is bool ? data['vendor'] as bool : null,
+    );
+  }
+}
+
+int _readInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.round();
+  }
+  return int.tryParse('$value') ?? 0;
+}
+
+String _readString(Object? value) {
+  return value is String ? value.trim() : '';
+}
+
+Duration deferredResumeSeekWarmup(RemoteDirectStream? stream) {
+  if (shouldUseStableRemoteAv1PlaybackProfile(stream)) {
+    return Duration.zero;
+  }
+  return _stableRemoteAv1InitialBufferWarmup;
+}
+
+class PlaybackMonitorException implements Exception {
+  const PlaybackMonitorException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'PlaybackMonitorException: $message';
 }
 
 bool shouldDeferAndroidExoInitialSeek(RemoteDirectStream? stream) {

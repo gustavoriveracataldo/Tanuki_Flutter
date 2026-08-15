@@ -1,6 +1,9 @@
 package com.toonami.tanuki
 
 import android.content.Intent
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -11,6 +14,7 @@ class MainActivity : FlutterActivity() {
     private val deepLinksChannelName = "tanuki/deep_links"
     private val remoteWebResolverChannelName = "tanuki/remote_web_resolver"
     private val trailerPlayerChannelName = "tanuki/trailer_player"
+    private val mediaCapabilitiesChannelName = "tanuki/media_capabilities"
     private var deepLinksChannel: MethodChannel? = null
     private var remoteWebResolver: RemoteWebResolver? = null
     private var pendingLink: String? = null
@@ -70,6 +74,15 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            mediaCapabilitiesChannelName,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "androidMediaCapabilities" -> result.success(androidMediaCapabilities())
+                else -> result.notImplemented()
+            }
+        }
         dispatchDeepLink(intent)
     }
 
@@ -110,7 +123,62 @@ class MainActivity : FlutterActivity() {
         return (value as? String)?.trim().orEmpty()
     }
 
+    private fun androidMediaCapabilities(): Map<String, Any?> {
+        val av1Decoders = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+            .filter { codec ->
+                !codec.isEncoder &&
+                    codec.supportedTypes.any { type -> type.equals(AV1_MIME_TYPE, ignoreCase = true) }
+            }
+            .map { codec -> codecInfoMap(codec) }
+        return mapOf(
+            "sdkInt" to Build.VERSION.SDK_INT,
+            "manufacturer" to Build.MANUFACTURER,
+            "model" to Build.MODEL,
+            "device" to Build.DEVICE,
+            "hasHardwareAv1Decoder" to av1Decoders.any { it["hardwareAccelerated"] == true },
+            "av1Decoders" to av1Decoders,
+        )
+    }
+
+    private fun codecInfoMap(codec: MediaCodecInfo): Map<String, Any?> {
+        val softwareOnly = isSoftwareOnly(codec)
+        val hardwareAccelerated = isHardwareAccelerated(codec, softwareOnly)
+        return mapOf(
+            "name" to codec.name,
+            "hardwareAccelerated" to hardwareAccelerated,
+            "softwareOnly" to softwareOnly,
+            "vendor" to isVendor(codec),
+        )
+    }
+
+    private fun isHardwareAccelerated(codec: MediaCodecInfo, softwareOnly: Boolean): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return codec.isHardwareAccelerated
+        }
+        return !softwareOnly && !codec.name.lowercase().startsWith("omx.google.")
+    }
+
+    private fun isSoftwareOnly(codec: MediaCodecInfo): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return codec.isSoftwareOnly
+        }
+        val name = codec.name.lowercase()
+        return name.startsWith("omx.google.") ||
+            name.startsWith("c2.android.") ||
+            name.startsWith("c2.google.") ||
+            ".sw." in name ||
+            "software" in name
+    }
+
+    private fun isVendor(codec: MediaCodecInfo): Boolean? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return codec.isVendor
+        }
+        return null
+    }
+
     companion object {
+        private const val AV1_MIME_TYPE = "video/av01"
         const val EXTRA_INTERNAL_DEEP_LINK = "com.toonami.tanuki.extra.INTERNAL_DEEP_LINK"
     }
 }

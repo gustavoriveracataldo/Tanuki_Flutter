@@ -3488,6 +3488,11 @@ class AppController extends ChangeNotifier {
     } else if (!nextCompleted.contains(key) && !nextAbandoned.contains(key)) {
       nextWatching.add(key);
     }
+    final currentEntry = profile.currentEntry;
+    final clearCurrentEntry = currentEntry != null &&
+        (currentEntry.seriesStateKey == key ||
+            normalizeSeriesKey(currentEntry.seriesName) ==
+                normalizeSeriesKey(series.name));
     profile = profile.copyWith(
       watchlistSeries: nextWatchlist,
       watchingSeries: nextWatching,
@@ -3495,7 +3500,7 @@ class AppController extends ChangeNotifier {
       completedSeries: nextCompleted,
       externalNoStatusSeries: nextExternalNoStatus,
       episodePlayback: nextPlayback,
-      currentEntry: targetEpisode,
+      clearCurrentEntry: clearCurrentEntry,
     );
 
     _state = _state.copyWith(profile: profile);
@@ -3511,6 +3516,7 @@ class AppController extends ChangeNotifier {
     required Duration position,
     required Duration duration,
     bool completed = false,
+    bool notify = true,
   }) async {
     final aliases = _expandedEpisodePlaybackAliases(episode);
     if (aliases.isEmpty) {
@@ -3565,8 +3571,10 @@ class AppController extends ChangeNotifier {
       profile = updatedProfile;
     }
     _state = _state.copyWith(profile: profile);
-    await _save();
-    notifyListeners();
+    await _save(notify: notify);
+    if (notify) {
+      notifyListeners();
+    }
     if (shouldSyncSeriesState) {
       unawaited(_syncEpisodeSeriesStateExternal(episode));
     }
@@ -4498,6 +4506,9 @@ class AppController extends ChangeNotifier {
       if (remote.simklId > 0) {
         nextMappings[seriesKey] = remote.simklId;
       }
+      if (profile.externalNoStatusSeries.contains(seriesKey)) {
+        continue;
+      }
       if (!malOwnsSpace) {
         switch (_spaceStatusFromSimkl(remote.status, remote.watchedEpisodes)) {
           case 'want_to_watch':
@@ -4567,6 +4578,9 @@ class AppController extends ChangeNotifier {
         entry,
       );
       if (seriesKey.isEmpty || entry.episodeNumber <= 0) {
+        continue;
+      }
+      if (profile.externalNoStatusSeries.contains(seriesKey)) {
         continue;
       }
       final progressPercent = entry.progressPercent.clamp(0, 100).toDouble();
@@ -5430,7 +5444,11 @@ class AppController extends ChangeNotifier {
     return null;
   }
 
-  Future<void> _save() async {
+  Future<void> _save({bool notify = true}) async {
+    if (!notify) {
+      await _store.save(_state);
+      return;
+    }
     _isSaving = true;
     notifyListeners();
     try {

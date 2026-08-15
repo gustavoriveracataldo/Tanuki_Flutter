@@ -19,6 +19,7 @@ void main() {
             request.url.path == '/sync/remove-from-list' ||
             request.url.path == '/sync/history' ||
             request.url.path == '/sync/playback/episodes' ||
+            request.url.path.startsWith('/sync/playback/') ||
             request.url.path == '/scrobble/start') {
           expect(request.headers['simkl-api-key'], 'client');
         }
@@ -87,6 +88,18 @@ void main() {
                     'ids': {'simkl': 654, 'mal': 321},
                   },
                 },
+                {
+                  'id': 67890,
+                  'progress': 8,
+                  'paused_at': '2026-07-15T12:45:00Z',
+                  'type': 'episode',
+                  'episode': {'season': 1, 'number': 2},
+                  'anime': {
+                    'title': 'Remove Demo',
+                    'year': 2026,
+                    'ids': {'mal': 456},
+                  },
+                },
               ]),
               200,
               request: request,
@@ -104,6 +117,11 @@ void main() {
           'POST /sync/remove-from-list' => http.Response(
               jsonEncode({'result': 'OK'}),
               200,
+              request: request,
+            ),
+          'DELETE /sync/playback/67890' => http.Response(
+              '',
+              204,
               request: request,
             ),
           'POST /scrobble/start' => http.Response(
@@ -192,11 +210,14 @@ void main() {
     expect(user.userName, 'SIMKL User');
     expect(sync.remoteEntries.single.title, 'Remote Demo');
     expect(sync.remoteEntries.single.watchedEpisodes, 3);
-    expect(episodeProgress, hasLength(1));
-    expect(episodeProgress.single.simklId, 654);
-    expect(episodeProgress.single.malId, 321);
-    expect(episodeProgress.single.episodeNumber, 4);
-    expect(episodeProgress.single.progressPercent, 42.5);
+    expect(episodeProgress, hasLength(2));
+    final remoteProgress = episodeProgress.firstWhere(
+      (entry) => entry.simklId == 654,
+    );
+    expect(remoteProgress.playbackId, 12345);
+    expect(remoteProgress.malId, 321);
+    expect(remoteProgress.episodeNumber, 4);
+    expect(remoteProgress.progressPercent, 42.5);
     expect(push.pushedCount, 1);
     expect(planPush.pushedCount, 1);
     expect(removePush.pushedCount, 1);
@@ -218,6 +239,10 @@ void main() {
     expect(
       postedBodies['/sync/remove-from-list']['anime'].single['ids']['mal'],
       456,
+    );
+    expect(
+      requests,
+      contains(startsWith('DELETE https://api.simkl.com/sync/playback/67890')),
     );
     expect(postedBodies['/scrobble/start']['anime']['ids']['simkl'], 654);
     expect(postedBodies['/scrobble/start']['anime']['ids']['mal'], 321);

@@ -14,8 +14,19 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
-const _appVersionLabel = '1.6.55';
+const _appVersionLabel = '1.7.3';
 String? _lastFocusedHomeShelfId;
+DateTime _suppressHomeActivationUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+void _suppressHomeActivation([
+  Duration duration = const Duration(milliseconds: 700),
+]) {
+  _suppressHomeActivationUntil = DateTime.now().add(duration);
+}
+
+bool _homeActivationSuppressed() {
+  return DateTime.now().isBefore(_suppressHomeActivationUntil);
+}
 
 enum _Section {
   anime,
@@ -5210,6 +5221,7 @@ class _DetailEpisodesColumnState extends State<_DetailEpisodesColumn> {
     if (action == null || !context.mounted) {
       return;
     }
+    _suppressHomeActivation();
     switch (action) {
       case _DetailEpisodeAction.markCompleted:
         await controller.markEpisodePlayed(episode);
@@ -6464,6 +6476,9 @@ class _ContinueWatchingPosterCard extends StatelessWidget {
         );
       },
     );
+    if (selected != null) {
+      _suppressHomeActivation();
+    }
     if (selected == _ContinueWatchingAction.goToSeries) {
       onGoToSeries?.call();
     } else if (selected == _ContinueWatchingAction.stopWatching) {
@@ -9531,6 +9546,9 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
     }
 
     if (event is KeyDownEvent) {
+      if (_homeActivationSuppressed()) {
+        return KeyEventResult.handled;
+      }
       if (_remoteKeyDown) {
         return KeyEventResult.handled;
       }
@@ -9549,6 +9567,9 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
       _remoteLongPressTimer = null;
       if (_remoteLongPressTriggered) {
         _remoteLongPressTriggered = false;
+        return KeyEventResult.handled;
+      }
+      if (_homeActivationSuppressed()) {
         return KeyEventResult.handled;
       }
       widget.onTap();
@@ -9593,6 +9614,9 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
             child: InkWell(
               canRequestFocus: false,
               onTap: () {
+                if (_homeActivationSuppressed()) {
+                  return;
+                }
                 if (_remoteLongPressTriggered) {
                   _remoteLongPressTriggered = false;
                   return;
@@ -9698,6 +9722,9 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
     }
 
     if (event is KeyDownEvent) {
+      if (_homeActivationSuppressed()) {
+        return KeyEventResult.handled;
+      }
       if (_remoteKeyDown) {
         return KeyEventResult.handled;
       }
@@ -9716,6 +9743,9 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
       _remoteLongPressTimer = null;
       if (_remoteLongPressTriggered) {
         _remoteLongPressTriggered = false;
+        return KeyEventResult.handled;
+      }
+      if (_homeActivationSuppressed()) {
         return KeyEventResult.handled;
       }
       widget.onTap?.call();
@@ -9761,6 +9791,9 @@ class _FocusableEpisodeSurfaceState extends State<_FocusableEpisodeSurface> {
               canRequestFocus: false,
               onTap: () {
                 if (!widget.enabled) {
+                  return;
+                }
+                if (_homeActivationSuppressed()) {
                   return;
                 }
                 if (_remoteLongPressTriggered) {

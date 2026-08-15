@@ -422,6 +422,43 @@ void main() {
     );
   });
 
+  test('does not rehydrate SIMKL progress removed from continue watching',
+      () async {
+    final simkl = _FakeSimklService(
+      progressEntries: const [
+        SimklRemoteEpisodeProgress(
+          playbackId: 12345,
+          simklId: 654,
+          malId: 321,
+          episodeNumber: 2,
+          progressPercent: 50,
+        ),
+      ],
+    );
+    final store = _MemoryAppStore(
+      const AppState(
+        simklClientId: 'client',
+        profiles: [
+          UserProfileState(
+            simklAuth: SimklAuthState(accessToken: 'simkl-access', userId: 99),
+            externalNoStatusSeries: {'catalog:321'},
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(store: store, simklService: simkl);
+    await controller.initialize();
+
+    await controller.recordSimklSyncAttempt();
+
+    final profile = store.state.profile;
+    expect(profile.watchingSeries, isNot(contains('catalog:321')));
+    expect(profile.activePlaylist.progress, isNot(contains('catalog:321')));
+    expect(profile.episodePlayback, isEmpty);
+    expect(simkl.pushedUpdates, hasLength(1));
+    expect(simkl.pushedUpdates.single.removeFromList, isTrue);
+  });
+
   test('pushes local SIMKL status and watched progress', () async {
     final simkl = _FakeSimklService(remoteEntries: const []);
     final store = _MemoryAppStore(
@@ -957,6 +994,89 @@ void main() {
       );
     },
   );
+
+  test('can save playback progress silently without notifying listeners',
+      () async {
+    final store = _MemoryAppStore(AppState.initial());
+    final controller = AppController(store: store);
+    await controller.initialize();
+    var notifications = 0;
+    controller.addListener(() {
+      notifications += 1;
+    });
+    final episode = _episode();
+
+    await controller.saveEpisodePlayback(
+      episode,
+      position: const Duration(minutes: 3),
+      duration: const Duration(minutes: 24),
+      notify: false,
+    );
+
+    expect(notifications, 0);
+    expect(
+      controller.resumePositionForEpisode(episode),
+      const Duration(minutes: 3),
+    );
+    expect(store.state.profile.episodePlayback, isNotEmpty);
+  });
+
+  test('clears current entry when manually completing through an episode',
+      () async {
+    const firstEpisode = EpisodeItem(
+      seriesName: 'Demo',
+      seriesStateKey: 'demo',
+      episodeIndex: 0,
+      episodeNumber: 1,
+      displayName: 'Demo - Capitulo 1',
+      relativePath: 'Demo / Capitulo 1',
+      filePath: '/tmp/demo-1.mp4',
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.jkAnime,
+      slug: 'demo',
+      watchUrl: 'https://jkanime.net/demo/1/',
+    );
+    const secondEpisode = EpisodeItem(
+      seriesName: 'Demo',
+      seriesStateKey: 'demo',
+      episodeIndex: 1,
+      episodeNumber: 2,
+      displayName: 'Demo - Capitulo 2',
+      relativePath: 'Demo / Capitulo 2',
+      filePath: '/tmp/demo-2.mp4',
+      sourceType: SourceType.remote,
+      provider: RemoteProvider.jkAnime,
+      slug: 'demo',
+      watchUrl: 'https://jkanime.net/demo/2/',
+    );
+    const series = SeriesItem(
+      name: 'Demo',
+      seriesStateKey: 'demo',
+      sourceType: SourceType.remote,
+      episodeCount: 2,
+      episodes: [firstEpisode, secondEpisode],
+    );
+    final store = _MemoryAppStore(
+      const AppState(
+        remoteLibrary: [series],
+        profiles: [
+          UserProfileState(
+            currentEntry: firstEpisode,
+            watchingSeries: {'demo'},
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(store: store);
+    await controller.initialize();
+
+    await controller.markSeriesPlayedThrough(series, firstEpisode);
+
+    expect(store.state.profile.currentEntry, isNull);
+    expect(store.state.activePlaylist.progress['demo'], 1);
+    expect(store.state.profile.watchingSeries, contains('demo'));
+    expect(store.state.profile.completedSeries, isNot(contains('demo')));
+  });
 
   test('persists per-series playback preferences', () async {
     final store = _MemoryAppStore(AppState.initial());

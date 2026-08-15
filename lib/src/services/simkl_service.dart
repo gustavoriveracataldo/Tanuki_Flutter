@@ -194,6 +194,7 @@ class SimklService {
       }
       progress.add(
         SimklRemoteEpisodeProgress(
+          playbackId: _readInt(playback['id']),
           simklId: simklId,
           malId: malId,
           title: title,
@@ -214,6 +215,7 @@ class SimklService {
   }) async {
     var pushed = 0;
     final unresolved = <String>[];
+    List<SimklRemoteEpisodeProgress>? playbackSessions;
     for (final update in updates) {
       final itemPayload = _buildItemPayload(update);
       if (itemPayload == null) {
@@ -226,6 +228,16 @@ class SimklService {
           accessToken: accessToken,
           clientId: clientId,
           itemPayload: itemPayload,
+        );
+        playbackSessions ??= await fetchRemoteEpisodeProgress(
+          accessToken: accessToken,
+          clientId: clientId,
+        );
+        await _removePlaybackSessionsForUpdate(
+          update: update,
+          sessions: playbackSessions,
+          accessToken: accessToken,
+          clientId: clientId,
         );
         didPush = true;
       } else if (update.watchedEpisodes > 0) {
@@ -407,6 +419,67 @@ class SimklService {
     }
   }
 
+  Future<void> _removePlaybackSessionsForUpdate({
+    required SimklLocalAnimeUpdate update,
+    required List<SimklRemoteEpisodeProgress> sessions,
+    required String accessToken,
+    required String clientId,
+  }) async {
+    final playbackIds = sessions
+        .where((session) => _playbackSessionMatchesUpdate(session, update))
+        .map((session) => session.playbackId)
+        .where((id) => id > 0)
+        .toSet();
+    for (final playbackId in playbackIds) {
+      await _deletePlaybackSession(
+        accessToken: accessToken,
+        clientId: clientId,
+        playbackId: playbackId,
+      );
+    }
+  }
+
+  bool _playbackSessionMatchesUpdate(
+    SimklRemoteEpisodeProgress session,
+    SimklLocalAnimeUpdate update,
+  ) {
+    if (update.simklId > 0 && session.simklId == update.simklId) {
+      return true;
+    }
+    if (update.malId > 0 && session.malId == update.malId) {
+      return true;
+    }
+    final sessionTitle = _normalizeTitle(session.title);
+    final updateTitle = _normalizeTitle(update.title);
+    if (sessionTitle.isEmpty || sessionTitle != updateTitle) {
+      return false;
+    }
+    return update.year <= 0 ||
+        session.year <= 0 ||
+        (session.year - update.year).abs() <= 1;
+  }
+
+  Future<void> _deletePlaybackSession({
+    required String accessToken,
+    required String clientId,
+    required int playbackId,
+  }) async {
+    if (playbackId <= 0) {
+      return;
+    }
+    final response = await _delete(
+      '/sync/playback/$playbackId',
+      clientId: clientId,
+      accessToken: accessToken,
+    );
+    if (_isOk(response) || response.statusCode == 404) {
+      return;
+    }
+    throw SimklException(
+      _extractApiError(_decodeJsonObject(response.body), response.statusCode),
+    );
+  }
+
   Future<void> _addHistory({
     required String accessToken,
     required String clientId,
@@ -467,6 +540,19 @@ class SimklService {
             'Content-Type': 'application/json',
           },
           body: jsonEncode(body ?? const {}),
+        )
+        .timeout(const Duration(seconds: 20));
+  }
+
+  Future<http.Response> _delete(
+    String path, {
+    required String clientId,
+    required String accessToken,
+  }) {
+    return _client
+        .delete(
+          _uri(path, _requestQuery(const {}, clientId)),
+          headers: _headers(clientId: clientId, accessToken: accessToken),
         )
         .timeout(const Duration(seconds: 20));
   }
@@ -549,6 +635,10 @@ class SimklService {
               '',
         ) ??
         0;
+  }
+
+  String _normalizeTitle(String value) {
+    return value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
   }
 }
 
@@ -638,6 +728,7 @@ class SimklRemoteAnimeEntry {
 
 class SimklRemoteEpisodeProgress {
   const SimklRemoteEpisodeProgress({
+    this.playbackId = 0,
     this.simklId = 0,
     this.malId = 0,
     this.title = '',
@@ -647,6 +738,7 @@ class SimklRemoteEpisodeProgress {
     this.updatedAtMs = 0,
   });
 
+  final int playbackId;
   final int simklId;
   final int malId;
   final String title;
