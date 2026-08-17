@@ -38,8 +38,10 @@ const _remoteOpeningRecoveryMaxAttempts = 1;
 const _desktopVlcAudioRecoveryMaxAttempts = 10;
 const _stableRemoteAv1VlcCacheMs = 20000;
 const _stableRemoteAv1InitialBufferWarmup = Duration(seconds: 10);
+const _jkanimeInitialSeekWarmup = Duration(seconds: 2);
 const _stableRemoteAv1StartupBufferTarget = Duration(seconds: 10);
 const _stableRemoteAv1StartupBufferMaxWait = Duration(seconds: 25);
+const _stableRemoteAv1AutomaticFallbackSuppressAfter = Duration(minutes: 2);
 const _playbackFrameJankThreshold = Duration(milliseconds: 120);
 const _playbackRenderJankThreshold = Duration(milliseconds: 80);
 const _playbackMonitorReportThrottle = Duration(seconds: 2);
@@ -56,6 +58,7 @@ const _mediaKitMaxVolume = 100.0;
 const _normalizedMaxVolume = 1.0;
 const _youtubeMaxVolume = 100;
 const _mediaCapabilitiesChannel = MethodChannel('tanuki/media_capabilities');
+const _playbackPowerChannel = MethodChannel('tanuki/playback_power');
 int _nextDesktopVlcPlayerId = 1;
 const _androidHardwareDecoderCodecs = 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1';
 const _androidHardwareDecoderCodecsWithoutAv1 =
@@ -116,7 +119,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   vlc.Player? _desktopVlcPlayer;
   String _desktopVlcSourcePath = '';
   List<RemoteCaptionCue> _desktopVlcSubtitleCues = const [];
-  int _desktopSubtitleLoadTicket = 0;
+  List<RemoteCaptionCue> _remoteSubtitleCues = const [];
+  int _remoteSubtitleLoadTicket = 0;
   int _lastDesktopSubtitleCueIndex = -2;
   WebViewController? _youtubeWebController;
   StreamSubscription<vlc.PositionState>? _desktopVlcPositionSubscription;
@@ -147,6 +151,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _playerBuffering = false;
   bool _playerVolumeSliderVisible = false;
   bool _suppressNextPlayerActivationKeyUp = false;
+  double _subtitleTimingOffsetSeconds = 0.0;
+  double _subtitleFontScale = 1.0;
   double _playerVolume = 1.0;
   double _playerVolumeBeforeMute = 1.0;
   final FocusNode _playerControlsRootFocusNode =
@@ -179,6 +185,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   RemoteDirectStream? _currentResolvedStream;
   RemoteProvider? _automaticResolvingProvider;
   String _selectedRemoteSubtitleTrackKey = '';
+  final Map<RemoteProvider, Set<String>> _remoteServerOptionCache =
+      <RemoteProvider, Set<String>>{};
   final Set<RemoteProvider> _failedRemoteProviders = <RemoteProvider>{};
   final Set<String> _failedRemoteServers = <String>{};
   RemoteProvider? _serverFallbackProvider;
@@ -322,7 +330,6 @@ class _PlayerScreenState extends State<PlayerScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     WidgetsBinding.instance.removeTimingsCallback(_handlePlaybackFrameTimings);
-    _desktopSubtitleLoadTicket += 1;
     _schedulePlaybackFinalizationAfterDispose();
     _simklPauseDebounceTimer?.cancel();
     _playerOverlayHideTimer?.cancel();
@@ -432,6 +439,20 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
     } catch (error) {
       debugPrint('PlayerScreen: wakelock failed enabled=$enabled error=$error');
+    }
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      await _playbackPowerChannel.invokeMethod<bool>(
+        'setPlaybackKeepScreenOn',
+        {'enabled': enabled},
+      );
+    } catch (error) {
+      debugPrint(
+        'PlayerScreen: native keep-screen-on failed '
+        'enabled=$enabled error=$error',
+      );
     }
   }
 
@@ -727,8 +748,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     await _disposeYoutubeWebPlayer();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
-    _desktopSubtitleLoadTicket += 1;
+    _remoteSubtitleLoadTicket += 1;
     _desktopVlcSubtitleCues = const [];
+    _remoteSubtitleCues = const [];
     _lastDesktopSubtitleCueIndex = -2;
     _openedNativeYoutubePlayer = false;
     _remotePlaybackAccepted = false;
@@ -772,6 +794,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _automaticResolvingProvider = null;
       if (resolved != null && resolved.playbackUrl.isNotEmpty) {
         _currentResolvedStream = resolved;
+        _rememberRemoteServerOptions(resolved);
         _reconcileRemoteSubtitleSelection(resolved);
         unawaited(widget.controller.rememberResolvedPlaybackForEpisode(
           widget.episode,
@@ -1141,11 +1164,14 @@ class _PlayerScreenState extends State<PlayerScreen>
     final headers =
         _remoteMediaHeaders(playbackPath) ?? const <String, String>{};
     final referer = headers['Referer']?.trim() ?? '';
+    final userAgent =
+        (headers['User-Agent'] ?? _remotePlaybackUserAgent).trim();
     final audioSlave = _desktopVlcAudioSlave();
     final vlcArguments = desktopVlcCommandlineArguments(
       stream: _currentResolvedStream,
       audioSlave: audioSlave,
       referer: referer,
+      userAgent: userAgent,
     );
     final player = vlc.Player(
       id: _nextDesktopVlcPlayerId++,
@@ -1154,7 +1180,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _desktopVlcPlayer = player;
     _activeDesktopVlcPlayers.add(player);
     _desktopVlcSourcePath = path;
-    player.setUserAgent(headers['User-Agent'] ?? _remotePlaybackUserAgent);
+    player.setUserAgent(userAgent);
     player.setVolume(_playerVolume);
     _desktopVlcPositionSubscription = player.positionStream.listen((state) {
       if (_desktopVlcPlayer != player) {
@@ -1245,7 +1271,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (hasDimensions) {
         _remoteVideoWidth = dimensions.width;
         _remoteVideoHeight = dimensions.height;
-        if (_shouldWatchAnimeAv1VideoFrame()) {
+        if (_shouldWatchRemoteVideoFrame()) {
           _markRemoteVideoFrameReady();
         }
         _setPlayerBuffering(false);
@@ -1735,6 +1761,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     int openTicket,
   ) async {
     if (_currentResolvedStream?.provider != RemoteProvider.youtube ||
+        _currentResolvedStream?.playbackKind.trim().toLowerCase() !=
+            'webview' ||
         _openedNativeYoutubePlayer) {
       return false;
     }
@@ -2176,7 +2204,9 @@ class _PlayerScreenState extends State<PlayerScreen>
           controlsFocused: _playerControlsFocused,
           dialogOpen: _playerDialogOpen,
           subtitlesEnabled: _subtitlesEnabled,
-          captionText: value.caption.text,
+          captionText: _activeRemoteSubtitleCaption.isNotEmpty
+              ? _activeRemoteSubtitleCaption
+              : value.caption.text,
         ) &&
         now.difference(_lastAndroidExoRebuild) >=
             const Duration(milliseconds: 250)) {
@@ -2479,6 +2509,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
     if (!_subtitlesEnabled) {
       await controller.setClosedCaptionFile(null);
+      if (mounted) {
+        setState(() => _remoteSubtitleCues = const []);
+      }
       return;
     }
     _reconcileRemoteSubtitleSelection(_currentResolvedStream);
@@ -2488,31 +2521,14 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
     if (track == null) {
       await controller.setClosedCaptionFile(null);
+      if (mounted) {
+        setState(() => _remoteSubtitleCues = const []);
+      }
       return;
     }
     _selectedRemoteSubtitleTrackKey = remoteSubtitleTrackKey(track);
-    await controller.setClosedCaptionFile(_loadAndroidExoCaption(track));
-  }
-
-  Future<vp.ClosedCaptionFile> _loadAndroidExoCaption(
-    RemoteSubtitleTrack track,
-  ) async {
-    final response = await http.get(
-      Uri.parse(track.url),
-      headers: _remoteMediaHeaders(track.url),
-    );
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpException(
-        'Subtitle HTTP ${response.statusCode}',
-        uri: Uri.parse(track.url),
-      );
-    }
-    final body = utf8.decode(response.bodyBytes, allowMalformed: true);
-    if (track.url.toLowerCase().contains('.vtt') ||
-        body.trimLeft().startsWith('WEBVTT')) {
-      return vp.WebVTTCaptionFile(body);
-    }
-    return vp.SubRipCaptionFile(body);
+    await controller.setClosedCaptionFile(null);
+    await _loadRemoteSubtitleCuesForSelectedTrack(source: 'android subtitle');
   }
 
   void _attachPlaybackErrorFallback(Player player) {
@@ -2580,6 +2596,21 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
     if (!mounted || !widget.episode.isRemote) {
       return false;
+    }
+    if (_shouldSuppressStableRemoteAv1AutomaticFallback()) {
+      _debugPlayerEvent(
+        'fallback suppressed for established AnimeAV1 HLS '
+        'reason="${_debugShortText(reason)}" '
+        'position=${_formatPlaybackTime(_lastPosition)}',
+      );
+      _setPlayerBuffering(true);
+      if (mounted) {
+        setState(() {
+          _error = '';
+          _status = 'Recuperando AnimeAV1 HLS...';
+        });
+      }
+      return true;
     }
     if (_shouldKeepCurrentRemoteSource()) {
       _debugPlayerEvent('fallback skipped because current source is accepted');
@@ -2692,6 +2723,21 @@ class _PlayerScreenState extends State<PlayerScreen>
       'server fallback check provider=${provider.id} server=$server '
       'reason="${_debugShortText(reason)}"',
     );
+    if (_shouldSuppressStableRemoteAv1AutomaticFallback()) {
+      _debugPlayerEvent(
+        'server fallback suppressed for established AnimeAV1 HLS '
+        'reason="${_debugShortText(reason)}" '
+        'position=${_formatPlaybackTime(_lastPosition)}',
+      );
+      _setPlayerBuffering(true);
+      if (mounted) {
+        setState(() {
+          _error = '';
+          _status = 'Recuperando AnimeAV1 HLS...';
+        });
+      }
+      return true;
+    }
     if (!_supportsRemoteServerFallback(provider) ||
         server.isEmpty ||
         !_failedRemoteServers.add(server)) {
@@ -2725,7 +2771,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   void _attachRemoteVideoFrameWatchdog(Player player) {
     _cancelRemoteVideoFrameWatchdog();
-    if (!_shouldWatchAnimeAv1VideoFrame()) {
+    if (!_shouldWatchRemoteVideoFrame()) {
       return;
     }
     _remoteVideoWidth = player.state.width;
@@ -2774,7 +2820,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!mounted ||
         _desktopVlcPlayer != player ||
         _remoteVideoFrameFallbackHandled ||
-        !_shouldWatchAnimeAv1VideoFrame()) {
+        !_shouldWatchRemoteVideoFrame()) {
       return;
     }
     if (!shouldRetryMissingVideoFrame(
@@ -2792,13 +2838,13 @@ class _PlayerScreenState extends State<PlayerScreen>
       '${_remoteVideoHeight ?? 0}',
     );
     _remoteVideoFrameFallbackHandled = true;
-    unawaited(_retryRemoteFallback('AnimeAV1 reprodujo audio pero no video'));
+    unawaited(_retryRemoteFallback(_missingVideoFallbackReason()));
   }
 
   void _armRemoteVideoFrameWatchdog(Player player) {
     if (_remoteVideoFrameReady ||
         _remoteVideoFrameFallbackHandled ||
-        !_shouldWatchAnimeAv1VideoFrame()) {
+        !_shouldWatchRemoteVideoFrame()) {
       return;
     }
     if (_shouldKeepCurrentRemoteSource()) {
@@ -2811,7 +2857,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (!mounted ||
             _remoteVideoFrameReady ||
             _remoteVideoFrameFallbackHandled ||
-            !_shouldWatchAnimeAv1VideoFrame()) {
+            !_shouldWatchRemoteVideoFrame()) {
           return;
         }
         if (_hasRemoteVideoFrame) {
@@ -2837,7 +2883,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         );
         _remoteVideoFrameFallbackHandled = true;
         unawaited(
-          _retryRemoteFallback('AnimeAV1 reprodujo audio pero no video'),
+          _retryRemoteFallback(_missingVideoFallbackReason()),
         );
       },
     );
@@ -2862,12 +2908,21 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   bool _shouldKeepCurrentRemoteSource() {
-    if (_shouldWatchAnimeAv1VideoFrame() && !_hasRemoteVideoFrame) {
+    if (_shouldWatchRemoteVideoFrame() && !_hasRemoteVideoFrame) {
       return false;
     }
     return _remotePlaybackAccepted ||
         _remoteVideoFrameReady ||
         _hasRemoteVideoFrame;
+  }
+
+  bool _shouldSuppressStableRemoteAv1AutomaticFallback() {
+    return shouldSuppressStableRemoteAv1AutomaticFallback(
+      stream: _currentResolvedStream,
+      position: _lastPosition,
+      remotePlaybackAccepted: _remotePlaybackAccepted,
+      hasVideoFrame: _hasRemoteVideoFrame,
+    );
   }
 
   void _cancelRemoteVideoFrameWatchdog() {
@@ -2936,7 +2991,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (!mounted ||
             pendingError.trim().isEmpty ||
             currentPlayer == null ||
-            !_shouldWatchAnimeAv1VideoFrame() ||
+            !_shouldWatchRemoteVideoFrame() ||
             !shouldRetryDeferredAnimeAv1PlaybackError(
               isPlaying: currentPlayer.state.playing,
               isBuffering: currentPlayer.state.buffering,
@@ -2961,10 +3016,20 @@ class _PlayerScreenState extends State<PlayerScreen>
     _deferredAnimeAv1PlaybackError = '';
   }
 
-  bool _shouldWatchAnimeAv1VideoFrame() {
+  bool _shouldWatchRemoteVideoFrame() {
     final provider =
         _currentResolvedStream?.provider ?? widget.episode.provider;
-    return shouldWatchAnimeAv1VideoFrame(provider, _currentResolvedStream);
+    return shouldWatchRemoteVideoFrame(provider, _currentResolvedStream);
+  }
+
+  String _missingVideoFallbackReason() {
+    final provider =
+        _currentResolvedStream?.provider ?? widget.episode.provider;
+    if (provider == RemoteProvider.aniPm) {
+      return '${remoteServerLabel(_currentResolvedStream?.server ?? '')} '
+          'reprodujo audio pero no video';
+    }
+    return 'AnimeAV1 reprodujo audio pero no video';
   }
 
   bool _supportsRemoteServerFallback(RemoteProvider provider) {
@@ -3122,6 +3187,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       _maybeScheduleUpcomingCards(position);
       _maybeUpdateAnimeSkipPrompt(position);
       _persistPlaybackThrottled();
+      if (mounted && _remoteSubtitleCues.isNotEmpty) {
+        setState(() {});
+      }
     });
     _durationSubscription = player.stream.duration.listen((duration) {
       _lastDuration = duration;
@@ -4148,7 +4216,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                       ? _AndroidExoVideoSurface(
                           controller: _androidExoController!,
                           fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                          subtitlesEnabled: _subtitlesEnabled,
+                          subtitlesEnabled:
+                              _subtitlesEnabled && _remoteSubtitleCues.isEmpty,
                         )
                       : _openedMedia && _youtubeWebController != null
                           ? _YoutubeWebVideoSurface(
@@ -4169,7 +4238,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                                             _videoScaleMode),
                                         subtitleViewConfiguration:
                                             SubtitleViewConfiguration(
-                                          visible: _subtitlesEnabled,
+                                          visible: _subtitlesEnabled &&
+                                              _remoteSubtitleCues.isEmpty,
                                         ),
                                       ),
                                     )
@@ -4185,31 +4255,16 @@ class _PlayerScreenState extends State<PlayerScreen>
                   onTap: _togglePlayerOverlaysFromPointer,
                 ),
               ),
-              if (_openedMedia &&
-                  _desktopVlcPlayer != null &&
-                  _activeDesktopVlcCaption.isNotEmpty)
+              if (_openedMedia && _activeRemoteSubtitleCaption.isNotEmpty)
                 Positioned(
                   left: 32,
                   right: 32,
                   bottom: 72,
                   child: IgnorePointer(
                     child: Text(
-                      _activeDesktopVlcCaption,
+                      _activeRemoteSubtitleCaption,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        height: 1.25,
-                        fontWeight: FontWeight.w700,
-                        shadows: [
-                          Shadow(color: Colors.black, blurRadius: 4),
-                          Shadow(
-                            color: Colors.black,
-                            blurRadius: 2,
-                            offset: Offset(2, 2),
-                          ),
-                        ],
-                      ),
+                      style: _subtitleOverlayTextStyle,
                     ),
                   ),
                 ),
@@ -4832,7 +4887,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     required Duration? start,
   }) async {
     final stabilizeAndroidAv1 =
-        Platform.isAndroid && _shouldWatchAnimeAv1VideoFrame();
+        Platform.isAndroid && _shouldWatchRemoteVideoFrame();
     final videoReady = stabilizeAndroidAv1
         ? player.stream.videoParams
             .firstWhere(
@@ -4908,7 +4963,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
     if (target == null ||
         target <= Duration.zero ||
-        !_shouldWatchAnimeAv1VideoFrame()) {
+        !_shouldWatchRemoteVideoFrame()) {
       return;
     }
     _debugPlayerEvent(
@@ -4920,7 +4975,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           player == null ||
           !_openedMedia ||
           !widget.episode.isRemote ||
-          !_shouldWatchAnimeAv1VideoFrame()) {
+          !_shouldWatchRemoteVideoFrame()) {
         return;
       }
       if (!shouldRecoverRemoteOpeningStall(
@@ -5057,14 +5112,25 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _loadDesktopVlcSubtitleCues() async {
-    final loadTicket = ++_desktopSubtitleLoadTicket;
+    await _loadRemoteSubtitleCuesForSelectedTrack(source: 'desktop subtitle');
+  }
+
+  Future<void> _loadRemoteSubtitleCuesForSelectedTrack({
+    required String source,
+  }) async {
+    final loadTicket = ++_remoteSubtitleLoadTicket;
     _debugPlayerEvent(
-      'desktop subtitle load requested enabled=$_subtitlesEnabled '
+      '$source load requested enabled=$_subtitlesEnabled '
       'tracks=${_currentResolvedStream?.subtitleTracks.length ?? 0} '
       'selected=${_selectedRemoteSubtitleTrackKey.isEmpty ? "default" : _selectedRemoteSubtitleTrackKey}',
     );
     if (!_subtitlesEnabled) {
-      if (mounted) setState(() => _desktopVlcSubtitleCues = const []);
+      if (mounted) {
+        setState(() {
+          _remoteSubtitleCues = const [];
+          _desktopVlcSubtitleCues = const [];
+        });
+      }
       return;
     }
     _reconcileRemoteSubtitleSelection(_currentResolvedStream);
@@ -5073,14 +5139,19 @@ class _PlayerScreenState extends State<PlayerScreen>
       selectedKey: _selectedRemoteSubtitleTrackKey,
     );
     if (track == null) {
-      _debugPlayerEvent('desktop subtitle: no selected track');
-      if (mounted) setState(() => _desktopVlcSubtitleCues = const []);
+      _debugPlayerEvent('$source: no selected track');
+      if (mounted) {
+        setState(() {
+          _remoteSubtitleCues = const [];
+          _desktopVlcSubtitleCues = const [];
+        });
+      }
       return;
     }
     final trackKey = remoteSubtitleTrackKey(track);
     try {
       _debugPlayerEvent(
-        'desktop subtitle download start '
+        '$source download start '
         'track="${remoteSubtitleTrackLabel(track)}" '
         'url=${_debugMediaLabel(track.url)} '
         'headers=${_debugHeadersLabel(_remoteMediaHeaders(track.url) ?? const {})}',
@@ -5095,18 +5166,19 @@ class _PlayerScreenState extends State<PlayerScreen>
       final body = utf8.decode(response.bodyBytes, allowMalformed: true);
       final cues = parseRemoteCaptionCues(body);
       _debugPlayerEvent(
-        'desktop subtitle download HTTP ${response.statusCode} '
+        '$source download HTTP ${response.statusCode} '
         'bytes=${response.bodyBytes.length} cues=${cues.length} '
         'first=${cues.isEmpty ? "none" : _formatPlaybackTime(cues.first.start)} '
         'last=${cues.isEmpty ? "none" : _formatPlaybackTime(cues.last.end)}',
       );
       if (!mounted ||
-          loadTicket != _desktopSubtitleLoadTicket ||
+          loadTicket != _remoteSubtitleLoadTicket ||
           trackKey != _selectedRemoteSubtitleTrackKey) {
-        _debugPlayerEvent('desktop subtitle download discarded stale result');
+        _debugPlayerEvent('$source download discarded stale result');
         return;
       }
       setState(() {
+        _remoteSubtitleCues = cues;
         _desktopVlcSubtitleCues = cues;
         _lastDesktopSubtitleCueIndex = -2;
         _status = cues.isEmpty
@@ -5114,34 +5186,67 @@ class _PlayerScreenState extends State<PlayerScreen>
             : 'Subtitulos: ${remoteSubtitleTrackLabel(track)}';
       });
     } catch (error) {
-      if (!mounted || loadTicket != _desktopSubtitleLoadTicket) return;
+      if (!mounted || loadTicket != _remoteSubtitleLoadTicket) return;
       setState(() {
+        _remoteSubtitleCues = const [];
         _desktopVlcSubtitleCues = const [];
         _status = 'No se pudo cargar subtitulos';
       });
-      _debugPlayerEvent('desktop subtitle load failed: $error');
+      _debugPlayerEvent('$source load failed: $error');
     }
   }
 
-  String get _activeDesktopVlcCaption {
-    if (!_subtitlesEnabled || _desktopVlcSubtitleCues.isEmpty) return '';
-    for (final cue in _desktopVlcSubtitleCues) {
-      if (_lastPosition >= cue.start && _lastPosition < cue.end) {
+  String get _activeRemoteSubtitleCaption {
+    if (!_subtitlesEnabled) return '';
+    final cues = _remoteSubtitleCues.isNotEmpty
+        ? _remoteSubtitleCues
+        : _desktopVlcSubtitleCues;
+    if (cues.isEmpty) return '';
+    final offset = Duration(
+      milliseconds: (_subtitleTimingOffsetSeconds * 1000).round(),
+    );
+    final adjustedPosition = _lastPosition - offset;
+    for (final cue in cues) {
+      if (adjustedPosition >= cue.start && adjustedPosition < cue.end) {
         return cue.text;
       }
     }
     return '';
   }
 
+  TextStyle get _subtitleOverlayTextStyle {
+    return TextStyle(
+      color: Colors.white,
+      fontSize: 22 * _subtitleFontScale,
+      height: 1.25,
+      fontWeight: FontWeight.w700,
+      shadows: const [
+        Shadow(color: Colors.black, blurRadius: 4),
+        Shadow(
+          color: Colors.black,
+          blurRadius: 2,
+          offset: Offset(2, 2),
+        ),
+      ],
+    );
+  }
+
   void _logDesktopSubtitleCueAtPosition() {
-    if (_desktopVlcSubtitleCues.isEmpty) return;
-    final index = _desktopVlcSubtitleCues.indexWhere(
-      (cue) => _lastPosition >= cue.start && _lastPosition < cue.end,
+    final cues = _remoteSubtitleCues.isNotEmpty
+        ? _remoteSubtitleCues
+        : _desktopVlcSubtitleCues;
+    if (cues.isEmpty) return;
+    final offset = Duration(
+      milliseconds: (_subtitleTimingOffsetSeconds * 1000).round(),
+    );
+    final adjustedPosition = _lastPosition - offset;
+    final index = cues.indexWhere(
+      (cue) => adjustedPosition >= cue.start && adjustedPosition < cue.end,
     );
     if (index == _lastDesktopSubtitleCueIndex) return;
     _lastDesktopSubtitleCueIndex = index;
     if (index >= 0) {
-      final cue = _desktopVlcSubtitleCues[index];
+      final cue = cues[index];
       _debugPlayerEvent(
         'desktop subtitle visible cue=$index '
         'at=${_formatPlaybackTime(_lastPosition)} '
@@ -5156,6 +5261,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (!_subtitlesEnabled) {
         _debugPlayerEvent('subtitle disabled: selecting no subtitle track');
         await player.setSubtitleTrack(SubtitleTrack.no());
+        if (mounted) {
+          setState(() => _remoteSubtitleCues = const []);
+        }
         return;
       }
       _reconcileRemoteSubtitleSelection(_currentResolvedStream);
@@ -5169,6 +5277,9 @@ class _PlayerScreenState extends State<PlayerScreen>
           await player.setSubtitleTrack(SubtitleTrack.auto());
         }
         _debugPlayerEvent('subtitle no remote track selected');
+        if (mounted) {
+          setState(() => _remoteSubtitleCues = const []);
+        }
         return;
       }
       _selectedRemoteSubtitleTrackKey = remoteSubtitleTrackKey(track);
@@ -5176,14 +5287,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         'subtitle selected ${remoteSubtitleTrackLabel(track)} '
         'url=${_debugMediaLabel(track.url)}',
       );
-      await player.setSubtitleTrack(
-        SubtitleTrack.uri(
-          track.url,
-          title: track.label.trim().isEmpty ? 'Subtitulos' : track.label.trim(),
-          language:
-              track.language.trim().isEmpty ? null : track.language.trim(),
-        ),
-      );
+      await player.setSubtitleTrack(SubtitleTrack.no());
+      await _loadRemoteSubtitleCuesForSelectedTrack(
+          source: 'media_kit subtitle');
     } catch (error) {
       if (!mounted) {
         return;
@@ -5219,8 +5325,9 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _showSubtitleTrackDialog() async {
-    final tracks =
-        _currentResolvedStream?.subtitleTracks ?? const <RemoteSubtitleTrack>[];
+    final tracks = preferredRemoteSubtitleTracks(
+      _currentResolvedStream?.subtitleTracks ?? const <RemoteSubtitleTrack>[],
+    );
     if (tracks.isEmpty) {
       if (mounted) {
         setState(() {
@@ -5289,8 +5396,189 @@ class _PlayerScreenState extends State<PlayerScreen>
     await _applyRemoteSubtitleTrackIfReady();
   }
 
+  Future<void> _showSubtitleAdjustDialog() async {
+    _showPlayerOverlays();
+    await showDialog<void>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (context) {
+        return _PlayerDialogScale(
+          scale: _playerDialogScale,
+          child: StatefulBuilder(
+            builder: (context, setDialogState) {
+              void updateTiming(double delta) {
+                final next = ((_subtitleTimingOffsetSeconds + delta) * 10)
+                        .roundToDouble() /
+                    10;
+                setState(() {
+                  _subtitleTimingOffsetSeconds = next;
+                  _lastDesktopSubtitleCueIndex = -2;
+                });
+                setDialogState(() {});
+              }
+
+              void updateFontScale(double delta) {
+                final next =
+                    (_subtitleFontScale + delta).clamp(0.6, 2.4).toDouble();
+                setState(() => _subtitleFontScale = next);
+                setDialogState(() {});
+              }
+
+              return Dialog(
+                backgroundColor: TanukiColors.panelSolid,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: const BorderSide(color: TanukiColors.panelStroke),
+                ),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.tune, color: TanukiColors.orange),
+                            const SizedBox(width: 10),
+                            const Expanded(
+                              child: Text(
+                                'Ajustar subtitulos',
+                                style: TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Cerrar',
+                              onPressed: () => Navigator.pop(context),
+                              icon: const Icon(Icons.close),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 18),
+                        const _PlayerDialogSectionTitle('Timing'),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            _SubtitleAdjustButton(
+                              icon: Icons.remove,
+                              tooltip: 'Retrasar 0.1',
+                              onPressed: () => updateTiming(-0.1),
+                            ),
+                            Expanded(
+                              child: Text(
+                                _subtitleTimingOffsetSeconds.toStringAsFixed(1),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.w900,
+                                  fontFeatures: [FontFeature.tabularFigures()],
+                                ),
+                              ),
+                            ),
+                            _SubtitleAdjustButton(
+                              icon: Icons.add,
+                              tooltip: 'Adelantar 0.1',
+                              onPressed: () => updateTiming(0.1),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 18),
+                        const _PlayerDialogSectionTitle('Tamano'),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            _SubtitleAdjustButton(
+                              icon: Icons.text_decrease,
+                              tooltip: 'Disminuir fuente',
+                              onPressed: () => updateFontScale(-0.1),
+                            ),
+                            Expanded(
+                              child: Text(
+                                '${(_subtitleFontScale * 100).round()}%',
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  fontSize: 24,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            _SubtitleAdjustButton(
+                              icon: Icons.text_increase,
+                              tooltip: 'Agrandar fuente',
+                              onPressed: () => updateFontScale(0.1),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 18),
+                        Center(
+                          child: _SubtitleAdjustButton(
+                            icon: _isCurrentPlaybackPlaying()
+                                ? Icons.pause
+                                : Icons.play_arrow,
+                            tooltip: _isCurrentPlaybackPlaying()
+                                ? 'Pausar'
+                                : 'Reproducir',
+                            onPressed: () {
+                              _toggleCurrentPlayback();
+                              if (mounted) {
+                                setState(() {});
+                                setDialogState(() {});
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  bool _isCurrentPlaybackPlaying() {
+    final android = _androidExoController;
+    if (android != null && android.value.isInitialized) {
+      return android.value.isPlaying;
+    }
+    final vlcPlayer = _desktopVlcPlayer;
+    if (vlcPlayer != null) {
+      return _desktopVlcIsPlaying;
+    }
+    final youtubeController = _youtubeWebController;
+    if (youtubeController != null && _usesDesktopYoutubeWebControls) {
+      return _youtubeWebPlaying;
+    }
+    final mediaKit = _player;
+    if (mediaKit != null) {
+      return mediaKit.state.playing;
+    }
+    return false;
+  }
+
   Future<void> _cycleVideoScaleMode() async {
     await _setVideoScaleMode(_videoScaleMode.next);
+  }
+
+  String _currentSubtitleSelectionLabel() {
+    if (!_subtitlesEnabled) {
+      return 'Seleccionado: desactivados';
+    }
+    final track = selectRemoteSubtitleTrack(
+      _currentResolvedStream,
+      selectedKey: _selectedRemoteSubtitleTrackKey,
+    );
+    if (track == null) {
+      return 'Seleccionado: automatico';
+    }
+    return 'Seleccionado: ${remoteSubtitleTrackCompactLabel(track)}';
   }
 
   Future<void> _setVideoScaleMode(VideoScaleMode mode) async {
@@ -5394,6 +5682,20 @@ class _PlayerScreenState extends State<PlayerScreen>
     _showPlayerOverlays();
     var preference =
         widget.controller.playbackPreferenceForEpisode(widget.episode);
+    final sourceOptionFocusNodes = <RemoteProvider, FocusNode>{
+      for (final provider in RemoteProvider.values)
+        provider: FocusNode(
+          debugLabel: 'player-settings-${provider.id}-first-option',
+        ),
+    };
+    final sourceServerFocusNodes = <RemoteProvider, FocusNode>{
+      RemoteProvider.justAnime: FocusNode(
+        debugLabel: 'player-settings-justanime-first-server',
+      ),
+      RemoteProvider.aniPm: FocusNode(
+        debugLabel: 'player-settings-anipm-first-server',
+      ),
+    };
     try {
       await showDialog<void>(
         context: context,
@@ -5443,11 +5745,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                     : justAnimeServerPreferenceFromId(
                         preference.justAnimeServer);
                 final aniPmMode = aniPmPlaybackModeFromId(preference.aniPmMode);
-                final aniPmServer = _currentResolvedStream?.provider ==
-                            RemoteProvider.aniPm &&
-                        _currentResolvedStream?.server.trim().isNotEmpty == true
-                    ? _currentResolvedStream!.server.trim().toLowerCase()
-                    : preference.aniPmServer.trim().toLowerCase();
+                final aniPmServer = preference.aniPmServer.trim().toLowerCase();
                 final facebookMode =
                     facebookPlaybackModeFromId(preference.facebookMode);
                 final facebookOption =
@@ -5480,22 +5778,80 @@ class _PlayerScreenState extends State<PlayerScreen>
                   }
                 }
 
+                bool providerHasFocusableSourceOptions(
+                  RemoteProvider provider,
+                ) {
+                  return switch (provider) {
+                    RemoteProvider.animeAv1 ||
+                    RemoteProvider.jkAnime ||
+                    RemoteProvider.latAnime ||
+                    RemoteProvider.justAnime ||
+                    RemoteProvider.aniPm ||
+                    RemoteProvider.facebook ||
+                    RemoteProvider.youtube =>
+                      true,
+                    _ => false,
+                  };
+                }
+
+                FocusNode? firstSourceOptionFocusNode(
+                  RemoteProvider provider,
+                  int index,
+                ) {
+                  return index == 0 ? sourceOptionFocusNodes[provider] : null;
+                }
+
+                FocusNode? firstSourceServerFocusNode(
+                  RemoteProvider provider,
+                  int index,
+                ) {
+                  return index == 0 ? sourceServerFocusNodes[provider] : null;
+                }
+
+                void focusPlayerDialogNode(FocusNode? node) {
+                  if (node == null) {
+                    return;
+                  }
+                  node.requestFocus();
+                  final optionContext = node.context;
+                  if (optionContext == null) {
+                    return;
+                  }
+                  Scrollable.ensureVisible(
+                    optionContext,
+                    alignment: 0.5,
+                    duration: const Duration(milliseconds: 120),
+                    curve: Curves.easeOutCubic,
+                  );
+                }
+
+                void focusFirstSourceOption(RemoteProvider provider) {
+                  focusPlayerDialogNode(sourceOptionFocusNodes[provider]);
+                }
+
+                void focusFirstSourceServer(RemoteProvider provider) {
+                  focusPlayerDialogNode(sourceServerFocusNodes[provider]);
+                }
+
                 Widget sourceOptions(RemoteProvider? provider) {
                   if (provider == RemoteProvider.animeAv1) {
                     return Wrap(
                       spacing: 8,
                       runSpacing: 8,
                       children: [
-                        for (final mode in AnimeAv1PlaybackMode.values)
+                        for (final entry
+                            in AnimeAv1PlaybackMode.values.asMap().entries)
                           _PlayerDialogRadioButton(
-                            label: mode.dialogLabel,
-                            active: animeAv1Mode == mode,
+                            focusNode: firstSourceOptionFocusNode(
+                                RemoteProvider.animeAv1, entry.key),
+                            label: entry.value.dialogLabel,
+                            active: animeAv1Mode == entry.value,
                             onPressed: () => unawaited(
                               savePreference(
                                 () =>
                                     widget.controller.setAnimeAv1ModeForEpisode(
                                   widget.episode,
-                                  mode,
+                                  entry.value,
                                 ),
                               ),
                             ),
@@ -5507,16 +5863,18 @@ class _PlayerScreenState extends State<PlayerScreen>
                     final availableServers = _availableJkAnimeServers();
                     return _PlayerDialogScrollableRadioColumn(
                       children: [
-                        for (final server in availableServers)
+                        for (final entry in availableServers.asMap().entries)
                           _PlayerDialogRadioButton(
-                            label: server.label,
-                            active: jkAnimeServer == server,
+                            focusNode: firstSourceOptionFocusNode(
+                                RemoteProvider.jkAnime, entry.key),
+                            label: entry.value.label,
+                            active: jkAnimeServer == entry.value,
                             onPressed: () => unawaited(
                               savePreference(
                                 () => widget.controller
                                     .setJkAnimeServerForEpisode(
                                   widget.episode,
-                                  server,
+                                  entry.value,
                                 ),
                               ),
                             ),
@@ -5527,16 +5885,19 @@ class _PlayerScreenState extends State<PlayerScreen>
                   if (provider == RemoteProvider.latAnime) {
                     return _PlayerDialogScrollableRadioColumn(
                       children: [
-                        for (final server in LatAnimeServerPreference.values)
+                        for (final entry
+                            in LatAnimeServerPreference.values.asMap().entries)
                           _PlayerDialogRadioButton(
-                            label: server.label,
-                            active: latAnimeServer == server,
+                            focusNode: firstSourceOptionFocusNode(
+                                RemoteProvider.latAnime, entry.key),
+                            label: entry.value.label,
+                            active: latAnimeServer == entry.value,
                             onPressed: () => unawaited(
                               savePreference(
                                 () => widget.controller
                                     .setLatAnimeServerForEpisode(
                                   widget.episode,
-                                  server,
+                                  entry.value,
                                 ),
                               ),
                             ),
@@ -5554,14 +5915,20 @@ class _PlayerScreenState extends State<PlayerScreen>
                           spacing: 8,
                           runSpacing: 8,
                           children: [
-                            for (final mode in JustAnimePlaybackMode.values)
+                            for (final entry
+                                in JustAnimePlaybackMode.values.asMap().entries)
                               _PlayerDialogRadioButton(
-                                label: mode.buttonLabel,
-                                active: justAnimeMode == mode,
+                                focusNode: firstSourceOptionFocusNode(
+                                    RemoteProvider.justAnime, entry.key),
+                                label: entry.value.buttonLabel,
+                                active: justAnimeMode == entry.value,
+                                onArrowDown: () => focusFirstSourceServer(
+                                  RemoteProvider.justAnime,
+                                ),
                                 onPressed: () => unawaited(savePreference(
                                   () => widget.controller
                                       .setJustAnimeModeForEpisode(
-                                          widget.episode, mode),
+                                          widget.episode, entry.value),
                                 )),
                               ),
                           ],
@@ -5571,16 +5938,21 @@ class _PlayerScreenState extends State<PlayerScreen>
                         const SizedBox(height: 8),
                         _PlayerDialogScrollableRadioColumn(
                           children: [
-                            for (final server
-                                in JustAnimeServerPreference.values)
+                            for (final entry in JustAnimeServerPreference.values
+                                .asMap()
+                                .entries)
                               _PlayerDialogRadioButton(
-                                label: server.label,
-                                active: justAnimeServer == server,
+                                focusNode: firstSourceServerFocusNode(
+                                  RemoteProvider.justAnime,
+                                  entry.key,
+                                ),
+                                label: entry.value.label,
+                                active: justAnimeServer == entry.value,
                                 onPressed: () => unawaited(savePreference(
                                   () => widget.controller
                                       .setJustAnimeServerForEpisode(
                                     widget.episode,
-                                    server,
+                                    entry.value,
                                   ),
                                 )),
                               ),
@@ -5590,14 +5962,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                     );
                   }
                   if (provider == RemoteProvider.aniPm) {
-                    final resolvedServers = <String>[
-                      if (_currentResolvedStream?.provider ==
-                          RemoteProvider.aniPm)
-                        ..._currentResolvedStream!.availableModes,
-                    ];
-                    resolvedServers.sort((left, right) =>
-                        remoteServerLabel(left)
-                            .compareTo(remoteServerLabel(right)));
+                    final resolvedServers =
+                        _remoteServerOptionsFor(RemoteProvider.aniPm).toList();
+                    resolvedServers.sort(compareAniPmServerMenuOrder);
                     final servers = <String>{
                       if (aniPmServer.isNotEmpty) aniPmServer,
                       ...resolvedServers,
@@ -5611,14 +5978,20 @@ class _PlayerScreenState extends State<PlayerScreen>
                           spacing: 8,
                           runSpacing: 8,
                           children: [
-                            for (final mode in AniPmPlaybackMode.values)
+                            for (final entry
+                                in AniPmPlaybackMode.values.asMap().entries)
                               _PlayerDialogRadioButton(
-                                label: mode.buttonLabel,
-                                active: aniPmMode == mode,
+                                focusNode: firstSourceOptionFocusNode(
+                                    RemoteProvider.aniPm, entry.key),
+                                label: entry.value.buttonLabel,
+                                active: aniPmMode == entry.value,
+                                onArrowDown: () => focusFirstSourceServer(
+                                  RemoteProvider.aniPm,
+                                ),
                                 onPressed: () => unawaited(savePreference(
                                   () => widget.controller
                                       .setAniPmModeForEpisode(
-                                          widget.episode, mode),
+                                          widget.episode, entry.value),
                                 )),
                               ),
                           ],
@@ -5629,6 +6002,10 @@ class _PlayerScreenState extends State<PlayerScreen>
                         _PlayerDialogScrollableRadioColumn(
                           children: [
                             _PlayerDialogRadioButton(
+                              focusNode: firstSourceServerFocusNode(
+                                RemoteProvider.aniPm,
+                                0,
+                              ),
                               label: 'Automatico',
                               active: aniPmServer.isEmpty,
                               onPressed: () => unawaited(savePreference(
@@ -5667,16 +6044,19 @@ class _PlayerScreenState extends State<PlayerScreen>
                           spacing: 8,
                           runSpacing: 8,
                           children: [
-                            for (final mode in FacebookPlaybackMode.values)
+                            for (final entry
+                                in FacebookPlaybackMode.values.asMap().entries)
                               _PlayerDialogRadioButton(
-                                label: mode.dialogLabel,
-                                active: facebookMode == mode,
+                                focusNode: firstSourceOptionFocusNode(
+                                    RemoteProvider.facebook, entry.key),
+                                label: entry.value.dialogLabel,
+                                active: facebookMode == entry.value,
                                 onPressed: () => unawaited(
                                   savePreference(
                                     () => widget.controller
                                         .setFacebookModeForEpisode(
                                       widget.episode,
-                                      mode,
+                                      entry.value,
                                     ),
                                   ),
                                 ),
@@ -5727,16 +6107,19 @@ class _PlayerScreenState extends State<PlayerScreen>
                           spacing: 8,
                           runSpacing: 8,
                           children: [
-                            for (final mode in YoutubePlaybackMode.values)
+                            for (final entry
+                                in YoutubePlaybackMode.values.asMap().entries)
                               _PlayerDialogRadioButton(
-                                label: mode.buttonLabel,
-                                active: youtubeMode == mode,
+                                focusNode: firstSourceOptionFocusNode(
+                                    RemoteProvider.youtube, entry.key),
+                                label: entry.value.buttonLabel,
+                                active: youtubeMode == entry.value,
                                 onPressed: () => unawaited(
                                   savePreference(
                                     () => widget.controller
                                         .setYoutubeModeForEpisode(
                                       widget.episode,
-                                      mode,
+                                      entry.value,
                                     ),
                                   ),
                                 ),
@@ -5943,6 +6326,36 @@ class _PlayerScreenState extends State<PlayerScreen>
                                       ),
                                     ],
                                   ),
+                                  const SizedBox(height: 8),
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: _PlayerDialogButton(
+                                      label: _currentSubtitleSelectionLabel(),
+                                      active: false,
+                                      onPressed: () {
+                                        Navigator.of(dialogContext).pop();
+                                        Future<void>.delayed(
+                                          const Duration(milliseconds: 120),
+                                          _showSubtitleTrackDialog,
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: _PlayerDialogButton(
+                                      label: 'Ajustar',
+                                      active: false,
+                                      onPressed: () {
+                                        Navigator.of(dialogContext).pop();
+                                        Future<void>.delayed(
+                                          const Duration(milliseconds: 120),
+                                          _showSubtitleAdjustDialog,
+                                        );
+                                      },
+                                    ),
+                                  ),
                                 ],
                               )
                             else
@@ -5967,6 +6380,13 @@ class _PlayerScreenState extends State<PlayerScreen>
                                     _PlayerDialogButton(
                                       label: provider.label,
                                       active: selectedProvider == provider,
+                                      onArrowDown: activeProvider == provider &&
+                                              providerHasFocusableSourceOptions(
+                                                provider,
+                                              )
+                                          ? () =>
+                                              focusFirstSourceOption(provider)
+                                          : null,
                                       onPressed: () => unawaited(
                                         savePreference(
                                           () => widget.controller
@@ -6001,16 +6421,19 @@ class _PlayerScreenState extends State<PlayerScreen>
         },
       );
     } finally {
+      for (final node in sourceOptionFocusNodes.values) {
+        node.dispose();
+      }
+      for (final node in sourceServerFocusNodes.values) {
+        node.dispose();
+      }
       _playerDialogOpen = false;
       _suppressPlayerDialogReopen();
     }
   }
 
   List<JkAnimeServerPreference> _availableJkAnimeServers() {
-    final discovered =
-        _currentResolvedStream?.provider == RemoteProvider.jkAnime
-            ? _currentResolvedStream?.availableServers ?? const <String>{}
-            : const <String>{};
+    final discovered = _remoteServerOptionsFor(RemoteProvider.jkAnime);
     if (discovered.isEmpty) {
       return JkAnimeServerPreference.values;
     }
@@ -6018,6 +6441,46 @@ class _PlayerScreenState extends State<PlayerScreen>
         .where((server) => discovered.contains(server.id))
         .toList(growable: false);
     return servers.isEmpty ? JkAnimeServerPreference.values : servers;
+  }
+
+  void _rememberRemoteServerOptions(RemoteDirectStream stream) {
+    final provider = stream.provider;
+    if (provider == null) {
+      return;
+    }
+    final servers = <String>{
+      ...stream.availableModes.map((server) => server.trim().toLowerCase()),
+      ...stream.availableServers.map((server) => server.trim().toLowerCase()),
+      if (stream.server.trim().isNotEmpty) stream.server.trim().toLowerCase(),
+    }..removeWhere((server) => server.isEmpty);
+    if (servers.isEmpty) {
+      return;
+    }
+    _remoteServerOptionCache.update(
+      provider,
+      (existing) => <String>{...existing, ...servers},
+      ifAbsent: () => servers,
+    );
+  }
+
+  Set<String> _remoteServerOptionsFor(RemoteProvider provider) {
+    final servers = <String>{
+      ...?_remoteServerOptionCache[provider],
+    };
+    final stream = _currentResolvedStream;
+    if (stream?.provider == provider) {
+      servers
+        ..addAll(
+            stream!.availableModes.map((server) => server.trim().toLowerCase()))
+        ..addAll(stream.availableServers
+            .map((server) => server.trim().toLowerCase()));
+      final selected = stream.server.trim().toLowerCase();
+      if (selected.isNotEmpty) {
+        servers.add(selected);
+      }
+    }
+    servers.removeWhere((server) => server.isEmpty);
+    return servers;
   }
 
   Future<void> _playPrevious() async {
@@ -6828,12 +7291,15 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
                 ),
               ),
               SizedBox(
-                width: 54 * scale,
+                width: 72 * scale,
                 child: Text(
                   widget.formatTime(
                     Duration(milliseconds: currentMs.round()),
                   ),
                   textAlign: TextAlign.center,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
                   style: timeTextStyle,
                 ),
               ),
@@ -6895,10 +7361,13 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
                 ),
               ),
               SizedBox(
-                width: 54 * scale,
+                width: 72 * scale,
                 child: Text(
                   widget.formatTime(widget.duration),
                   textAlign: TextAlign.center,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
                   style: durationTextStyle,
                 ),
               ),
@@ -6960,6 +7429,66 @@ class _AndroidExoVideoSurface extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+class _SubtitleAdjustButton extends StatelessWidget {
+  const _SubtitleAdjustButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox(
+        width: 58,
+        height: 52,
+        child: FilledButton(
+          style: ButtonStyle(
+            padding: WidgetStateProperty.all(EdgeInsets.zero),
+            backgroundColor: WidgetStateProperty.resolveWith((states) {
+              if (states.contains(WidgetState.focused)) {
+                return TanukiColors.orangeHot;
+              }
+              if (states.contains(WidgetState.pressed)) {
+                return TanukiColors.orange;
+              }
+              return TanukiColors.orange.withValues(alpha: .78);
+            }),
+            foregroundColor: WidgetStateProperty.all(Colors.black),
+            side: WidgetStateProperty.resolveWith((states) {
+              if (states.contains(WidgetState.focused)) {
+                return const BorderSide(color: Colors.white, width: 3);
+              }
+              return BorderSide(
+                color: Colors.black.withValues(alpha: .24),
+                width: 1,
+              );
+            }),
+            elevation: WidgetStateProperty.resolveWith((states) {
+              return states.contains(WidgetState.focused) ? 12 : 3;
+            }),
+            shadowColor: WidgetStateProperty.all(
+              TanukiColors.orangeHot.withValues(alpha: .65),
+            ),
+            shape: WidgetStateProperty.all(
+              RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+          onPressed: onPressed,
+          child: Icon(icon, size: 26),
+        ),
+      ),
     );
   }
 }
@@ -7208,12 +7737,15 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
                 ),
               ),
               SizedBox(
-                width: 54 * scale,
+                width: 72 * scale,
                 child: Text(
                   widget.formatTime(
                     Duration(milliseconds: currentMs.round()),
                   ),
                   textAlign: TextAlign.center,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
                   style: timeTextStyle,
                 ),
               ),
@@ -7274,10 +7806,13 @@ class _AndroidExoControlsState extends State<_AndroidExoControls> {
                 ),
               ),
               SizedBox(
-                width: 54 * scale,
+                width: 72 * scale,
                 child: Text(
                   widget.formatTime(value.duration),
                   textAlign: TextAlign.center,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
                   style: durationTextStyle,
                 ),
               ),
@@ -7462,12 +7997,15 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
                 ),
               ),
               SizedBox(
-                width: 54 * scale,
+                width: 72 * scale,
                 child: Text(
                   widget.formatTime(
                     Duration(milliseconds: currentMs.round()),
                   ),
                   textAlign: TextAlign.center,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
                   style: timeTextStyle,
                 ),
               ),
@@ -7528,10 +8066,13 @@ class _DesktopVlcControlsState extends State<_DesktopVlcControls> {
                 ),
               ),
               SizedBox(
-                width: 54 * scale,
+                width: 72 * scale,
                 child: Text(
                   widget.formatTime(duration),
                   textAlign: TextAlign.center,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.visible,
                   style: durationTextStyle,
                 ),
               ),
@@ -8063,16 +8604,18 @@ class _PlayerDialogButton extends StatelessWidget {
     required this.label,
     required this.active,
     required this.onPressed,
+    this.onArrowDown,
   });
 
   final String label;
   final bool active;
   final VoidCallback onPressed;
+  final VoidCallback? onArrowDown;
 
   @override
   Widget build(BuildContext context) {
     final scale = _PlayerDialogScale.of(context);
-    return SizedBox(
+    final button = SizedBox(
       height: 40 * scale,
       child: OutlinedButton(
         onPressed: onPressed,
@@ -8096,7 +8639,33 @@ class _PlayerDialogButton extends StatelessWidget {
         ),
       ),
     );
+    final downAction = onArrowDown;
+    if (downAction == null) {
+      return button;
+    }
+    return Shortcuts(
+      shortcuts: const {
+        SingleActivator(LogicalKeyboardKey.arrowDown):
+            _PlayerDialogFocusSourceOptionsIntent(),
+      },
+      child: Actions(
+        actions: {
+          _PlayerDialogFocusSourceOptionsIntent:
+              CallbackAction<_PlayerDialogFocusSourceOptionsIntent>(
+            onInvoke: (_) {
+              downAction();
+              return null;
+            },
+          ),
+        },
+        child: button,
+      ),
+    );
   }
+}
+
+class _PlayerDialogFocusSourceOptionsIntent extends Intent {
+  const _PlayerDialogFocusSourceOptionsIntent();
 }
 
 class _PlayerDialogRadioButton extends StatelessWidget {
@@ -8104,48 +8673,110 @@ class _PlayerDialogRadioButton extends StatelessWidget {
     required this.label,
     required this.active,
     required this.onPressed,
+    this.focusNode,
+    this.onArrowDown,
   });
 
   final String label;
   final bool active;
   final VoidCallback onPressed;
+  final FocusNode? focusNode;
+  final VoidCallback? onArrowDown;
 
   @override
   Widget build(BuildContext context) {
     final scale = _PlayerDialogScale.of(context);
-    return Material(
-      color: Colors.transparent,
-      borderRadius: BorderRadius.circular(8 * scale),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8 * scale),
-        onTap: onPressed,
-        child: SizedBox(
-          height: 40 * scale,
-          child: Padding(
-            padding: EdgeInsets.symmetric(horizontal: 4 * scale),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  active ? Icons.radio_button_checked : Icons.radio_button_off,
-                  size: 17 * scale,
-                  color: active ? TanukiColors.orange : TanukiColors.muted,
-                ),
-                SizedBox(width: 7 * scale),
-                Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: active ? TanukiColors.text : const Color(0xFFD8E1EB),
-                    fontSize: 12 * scale,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ],
-            ),
+    final button = OutlinedButton(
+      focusNode: focusNode,
+      onPressed: onPressed,
+      onFocusChange: (focused) {
+        if (!focused) return;
+        Scrollable.ensureVisible(
+          context,
+          alignment: 0.5,
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.easeOutCubic,
+        );
+      },
+      style: ButtonStyle(
+        minimumSize: WidgetStateProperty.all(Size(0, 40 * scale)),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        padding: WidgetStateProperty.all(
+          EdgeInsets.symmetric(horizontal: 8 * scale),
+        ),
+        backgroundColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.focused)) {
+            return const Color(0x333CA7FF);
+          }
+          return active ? const Color(0x332A170B) : Colors.transparent;
+        }),
+        foregroundColor: WidgetStateProperty.resolveWith((states) {
+          if (active || states.contains(WidgetState.focused)) {
+            return TanukiColors.text;
+          }
+          return const Color(0xFFD8E1EB);
+        }),
+        side: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.focused)) {
+            return BorderSide(
+              color: TanukiColors.orangeHot,
+              width: 2 * scale,
+            );
+          }
+          return BorderSide(
+            color: active ? TanukiColors.orange : Colors.transparent,
+            width: 1 * scale,
+          );
+        }),
+        shape: WidgetStateProperty.all(
+          RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(8 * scale),
           ),
         ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            active ? Icons.radio_button_checked : Icons.radio_button_off,
+            size: 17 * scale,
+            color: active ? TanukiColors.orange : TanukiColors.muted,
+          ),
+          SizedBox(width: 7 * scale),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12 * scale,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    final downAction = onArrowDown;
+    if (downAction == null) {
+      return button;
+    }
+    return Shortcuts(
+      shortcuts: const {
+        SingleActivator(LogicalKeyboardKey.arrowDown):
+            _PlayerDialogFocusSourceOptionsIntent(),
+      },
+      child: Actions(
+        actions: {
+          _PlayerDialogFocusSourceOptionsIntent:
+              CallbackAction<_PlayerDialogFocusSourceOptionsIntent>(
+            onInvoke: (_) {
+              downAction();
+              return null;
+            },
+          ),
+        },
+        child: button,
       ),
     );
   }
@@ -8176,24 +8807,37 @@ class _PlayerDialogScrollableRadioColumnState
   @override
   Widget build(BuildContext context) {
     final scale = _PlayerDialogScale.of(context);
-    return ConstrainedBox(
-      constraints: BoxConstraints(maxHeight: 178 * scale),
-      child: Scrollbar(
-        controller: _controller,
-        thumbVisibility: widget.children.length > 4,
-        child: SingleChildScrollView(
-          controller: _controller,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (var index = 0; index < widget.children.length; index += 1)
-                Padding(
-                  padding: EdgeInsets.only(
-                    bottom: index == widget.children.length - 1 ? 0 : 6 * scale,
-                  ),
-                  child: widget.children[index],
-                ),
-            ],
+    return Shortcuts(
+      shortcuts: const {
+        SingleActivator(LogicalKeyboardKey.arrowDown): NextFocusIntent(),
+        SingleActivator(LogicalKeyboardKey.arrowUp): PreviousFocusIntent(),
+      },
+      child: FocusTraversalGroup(
+        policy: WidgetOrderTraversalPolicy(),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: 178 * scale),
+          child: Scrollbar(
+            controller: _controller,
+            thumbVisibility: widget.children.length > 4,
+            interactive: false,
+            child: SingleChildScrollView(
+              controller: _controller,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (var index = 0;
+                      index < widget.children.length;
+                      index += 1)
+                    Padding(
+                      padding: EdgeInsets.only(
+                        bottom:
+                            index == widget.children.length - 1 ? 0 : 6 * scale,
+                      ),
+                      child: widget.children[index],
+                    ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
@@ -8728,6 +9372,25 @@ bool shouldWatchAnimeAv1VideoFrame(
   return false;
 }
 
+bool shouldWatchAniPmHeliosVideoFrame(
+  RemoteProvider? provider,
+  RemoteDirectStream? stream,
+) {
+  if (provider != RemoteProvider.aniPm || stream == null) {
+    return false;
+  }
+  return stream.server.trim().toLowerCase().startsWith('helios-') &&
+      stream.playbackKind.toLowerCase() == 'hls';
+}
+
+bool shouldWatchRemoteVideoFrame(
+  RemoteProvider? provider,
+  RemoteDirectStream? stream,
+) {
+  return shouldWatchAnimeAv1VideoFrame(provider, stream) ||
+      shouldWatchAniPmHeliosVideoFrame(provider, stream);
+}
+
 bool shouldUseStableRemoteAv1PlaybackProfile(RemoteDirectStream? stream) {
   if (stream == null || stream.provider != RemoteProvider.animeAv1) {
     return false;
@@ -8744,15 +9407,35 @@ bool shouldUseStableRemoteAv1PlaybackProfile(RemoteDirectStream? stream) {
       (source.contains('mp4upload') || source.contains('127.0.0.1'));
 }
 
+bool shouldSuppressStableRemoteAv1AutomaticFallback({
+  required RemoteDirectStream? stream,
+  required Duration position,
+  required bool remotePlaybackAccepted,
+  required bool hasVideoFrame,
+}) {
+  if (stream == null ||
+      stream.provider != RemoteProvider.animeAv1 ||
+      stream.playbackKind.toLowerCase() != 'hls' ||
+      !shouldUseStableRemoteAv1PlaybackProfile(stream)) {
+    return false;
+  }
+  if (position < _stableRemoteAv1AutomaticFallbackSuppressAfter) {
+    return false;
+  }
+  return remotePlaybackAccepted || hasVideoFrame;
+}
+
 bool shouldDeferRemoteHlsInitialSeek(RemoteDirectStream? stream) {
   if (stream == null || stream.playbackKind.toLowerCase() != 'hls') {
     return false;
   }
-  if (stream.provider == RemoteProvider.aniPm) {
-    return true;
-  }
-  return stream.provider == RemoteProvider.jkAnime &&
-      stream.server.trim().toLowerCase() == 'magi';
+  return stream.provider == RemoteProvider.aniPm || isJkAnimeHls(stream);
+}
+
+bool isJkAnimeHls(RemoteDirectStream? stream) {
+  return stream != null &&
+      stream.provider == RemoteProvider.jkAnime &&
+      stream.playbackKind.toLowerCase() == 'hls';
 }
 
 bool shouldDeferDesktopVlcInitialSeek(RemoteDirectStream? stream) {
@@ -9057,6 +9740,9 @@ Duration deferredResumeSeekWarmup(RemoteDirectStream? stream) {
   if (shouldUseStableRemoteAv1PlaybackProfile(stream)) {
     return Duration.zero;
   }
+  if (isJkAnimeHls(stream)) {
+    return _jkanimeInitialSeekWarmup;
+  }
   return _stableRemoteAv1InitialBufferWarmup;
 }
 
@@ -9108,6 +9794,7 @@ List<String> desktopVlcCommandlineArguments({
   required RemoteDirectStream? stream,
   required String audioSlave,
   required String referer,
+  required String userAgent,
 }) {
   final stableAv1 = shouldUseStableRemoteAv1PlaybackProfile(stream);
   final args = <String>[
@@ -9124,6 +9811,7 @@ List<String> desktopVlcCommandlineArguments({
     ],
     if (audioSlave.isNotEmpty) '--input-slave=$audioSlave',
     if (referer.isNotEmpty) '--http-referrer=$referer',
+    if (userAgent.trim().isNotEmpty) '--http-user-agent=${userAgent.trim()}',
   ];
   return args;
 }
@@ -9345,7 +10033,9 @@ RemoteSubtitleTrack? selectRemoteSubtitleTrack(
   RemoteDirectStream? stream, {
   String selectedKey = '',
 }) {
-  final tracks = stream?.subtitleTracks ?? const <RemoteSubtitleTrack>[];
+  final tracks = preferredRemoteSubtitleTracks(
+    stream?.subtitleTracks ?? const <RemoteSubtitleTrack>[],
+  );
   if (tracks.isEmpty) {
     return null;
   }
@@ -9357,10 +10047,72 @@ RemoteSubtitleTrack? selectRemoteSubtitleTrack(
       }
     }
   }
-  return tracks.firstWhere(
-    (track) => track.isDefault,
-    orElse: () => tracks.first,
-  );
+  return tracks.first;
+}
+
+List<RemoteSubtitleTrack> preferredRemoteSubtitleTracks(
+  List<RemoteSubtitleTrack> tracks,
+) {
+  final ordered = [...tracks];
+  ordered.sort((left, right) {
+    final score = _remoteSubtitlePreferenceScore(right)
+        .compareTo(_remoteSubtitlePreferenceScore(left));
+    if (score != 0) return score;
+    return remoteSubtitleTrackLabel(left)
+        .toLowerCase()
+        .compareTo(remoteSubtitleTrackLabel(right).toLowerCase());
+  });
+  return ordered;
+}
+
+int _remoteSubtitlePreferenceScore(RemoteSubtitleTrack track) {
+  final text = '${track.label} ${track.language}'.toLowerCase();
+  var score = track.isDefault ? 100 : 0;
+  if (_looksLikeLatinAmericanSpanish(text)) {
+    score += 4000;
+  } else if (_looksLikeSpanish(text)) {
+    score += 3000;
+  } else if (_looksLikeEnglish(text)) {
+    score += 2000;
+  }
+  return score;
+}
+
+bool _looksLikeLatinAmericanSpanish(String text) {
+  final normalized = _normalizeSubtitleLanguageText(text);
+  return _looksLikeSpanish(normalized) &&
+      (normalized.contains('latin american') ||
+          normalized.contains('latin america') ||
+          normalized.contains('latino') ||
+          normalized.contains('latam') ||
+          normalized.contains('es-419') ||
+          normalized.contains('es 419'));
+}
+
+bool _looksLikeSpanish(String text) {
+  final normalized = _normalizeSubtitleLanguageText(text);
+  return normalized.contains('spanish') ||
+      normalized.contains('espanol') ||
+      normalized.contains('castellano') ||
+      RegExp(r'(^|[^a-z])es($|[^a-z])').hasMatch(normalized);
+}
+
+bool _looksLikeEnglish(String text) {
+  final normalized = _normalizeSubtitleLanguageText(text);
+  return normalized.contains('english') ||
+      RegExp(r'(^|[^a-z])en(g)?($|[^a-z])').hasMatch(normalized);
+}
+
+String _normalizeSubtitleLanguageText(String value) {
+  return value
+      .toLowerCase()
+      .replaceAll('á', 'a')
+      .replaceAll('é', 'e')
+      .replaceAll('í', 'i')
+      .replaceAll('ó', 'o')
+      .replaceAll('ú', 'u')
+      .replaceAll('ñ', 'n')
+      .replaceAll(RegExp(r'[_\[\]\(\)]+'), ' ');
 }
 
 String remoteSubtitleTrackKey(RemoteSubtitleTrack track) {
@@ -9373,6 +10125,46 @@ String remoteSubtitleTrackLabel(RemoteSubtitleTrack track) {
   final label = track.label.trim().isEmpty ? 'Subtitulos' : track.label.trim();
   final language = track.language.trim();
   return language.isEmpty ? label : '$label [${language.toUpperCase()}]';
+}
+
+String remoteSubtitleTrackCompactLabel(RemoteSubtitleTrack track) {
+  final label = track.label.trim().isEmpty ? 'Subtitulos' : track.label.trim();
+  if (track.language.trim().isEmpty ||
+      track.language.trim().toLowerCase() == label.toLowerCase()) {
+    return label;
+  }
+  return remoteSubtitleTrackLabel(track);
+}
+
+int compareAniPmServerMenuOrder(String left, String right) {
+  final score = _aniPmServerMenuOrderScore(left)
+      .compareTo(_aniPmServerMenuOrderScore(right));
+  if (score != 0) return score;
+  return remoteServerLabel(left)
+      .toLowerCase()
+      .compareTo(remoteServerLabel(right).toLowerCase());
+}
+
+int _aniPmServerMenuOrderScore(String server) {
+  final normalized = server.trim().toLowerCase();
+  final parts = normalized.split('-');
+  final family =
+      normalized == 'ani-pm' || parts.isEmpty ? normalized : parts.first;
+  return switch (family) {
+    'ani-pm' => 0,
+    'helios' => 10,
+    'zephyr' => 20,
+    'drift' => 30,
+    'pulse' => 40,
+    'lyra' => 50,
+    'halo' => 60,
+    'comet' => 70,
+    'onyx' => 80,
+    'quasar' => 90,
+    'astra' => 100,
+    'orion' => 110,
+    _ => 1000,
+  };
 }
 
 String remoteServerLabel(String server) {
@@ -9392,6 +10184,13 @@ String remoteServerLabel(String server) {
     'stape' => 'Stape',
     'netu' => 'Netu',
     'archive-direct' => 'Directo',
+    'ani-pm' => 'Ani.pm Direct',
+    'helios' => 'Helios',
+    'zephyr' => 'Zephyr',
+    'drift' => 'Drift',
+    'astra' => 'Astra',
+    'onyx' => 'Onyx',
+    'quasar' => 'Quasar',
     'bilibili-1' => 'BiliBili 1',
     'bilibili-2' => 'BiliBili 2',
     'youtube-sub-1' => 'SUB Opcion 1',
@@ -9399,12 +10198,16 @@ String remoteServerLabel(String server) {
     'youtube-dub-1' => 'DUB Opcion 1',
     'youtube-dub-2' => 'DUB Opcion 2',
     String value
-        when RegExp(r'^(nova|pulse|halo|orion|lyra)-\d+$').hasMatch(value) =>
+        when RegExp(
+                r'^(nova|pulse|halo|orion|lyra|helios|zephyr|drift|astra|onyx|quasar|comet)(?:-[a-z0-9]+)+$')
+            .hasMatch(value) =>
       value
           .split('-')
           .map((part) => part.length == 1
               ? part
-              : '${part.substring(0, 1).toUpperCase()}${part.substring(1)}')
+              : part == 'hd'
+                  ? 'HD'
+                  : '${part.substring(0, 1).toUpperCase()}${part.substring(1)}')
           .join(' '),
     String value when value.isNotEmpty => value,
     _ => 'servidor',

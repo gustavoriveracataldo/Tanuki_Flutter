@@ -5305,6 +5305,8 @@ class _DetailSimilarCarousel extends StatelessWidget {
                     padding: const EdgeInsets.fromLTRB(0, 2, 18, 6),
                     itemBuilder: (context, index) {
                       final candidate = candidates[index];
+                      final importedSeries =
+                          controller.findRemoteSeriesForCandidate(candidate);
                       return _CandidateFadeIn(
                         key: ValueKey(
                           'detail-similar-${_homeCandidateKey(candidate)}-${candidate.relationLabel}',
@@ -5315,10 +5317,9 @@ class _DetailSimilarCarousel extends StatelessWidget {
                           height: posterHeight,
                           child: _SearchResultPosterCard(
                             candidate: candidate,
-                            imported: controller.findRemoteSeriesForCandidate(
-                                  candidate,
-                                ) !=
-                                null,
+                            spaceStatus: importedSeries == null
+                                ? ''
+                                : controller.spaceStatusFor(importedSeries),
                             onTap: () => onCandidateSelected(candidate),
                             onArrowRightEdge: () {
                               if (!episodeListFocusNode.canRequestFocus) {
@@ -5416,6 +5417,8 @@ class _SimilarPanel extends StatelessWidget {
                         itemCount: candidates.length,
                         itemBuilder: (context, index) {
                           final candidate = candidates[index];
+                          final importedSeries = controller
+                              .findRemoteSeriesForCandidate(candidate);
                           return _CandidateFadeIn(
                             key: ValueKey(
                               'similar-panel-${_homeCandidateKey(candidate)}-${candidate.relationLabel}',
@@ -5423,9 +5426,9 @@ class _SimilarPanel extends StatelessWidget {
                             index: index,
                             child: _SearchResultPosterCard(
                               candidate: candidate,
-                              imported: controller.findRemoteSeriesForCandidate(
-                                      candidate) !=
-                                  null,
+                              spaceStatus: importedSeries == null
+                                  ? ''
+                                  : controller.spaceStatusFor(importedSeries),
                               onTap: () => onRemoteCandidateSelected(candidate),
                             ),
                           );
@@ -6300,6 +6303,8 @@ class _TrendingPosterShelf extends StatelessWidget {
                     padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
                     itemBuilder: (context, index) {
                       final candidate = visibleCandidates[index];
+                      final importedSeries =
+                          controller.findRemoteSeriesForCandidate(candidate);
                       return _RemotePosterCard(
                         key: ValueKey(
                           'trending-${_homeCandidateKey(candidate)}',
@@ -6308,10 +6313,9 @@ class _TrendingPosterShelf extends StatelessWidget {
                         height: posterHeight,
                         candidate: candidate,
                         focusNode: index == 0 ? firstFocusNode : null,
-                        imported: controller.findRemoteSeriesForCandidate(
-                              candidate,
-                            ) !=
-                            null,
+                        spaceStatus: importedSeries == null
+                            ? ''
+                            : controller.spaceStatusFor(importedSeries),
                         onTap: () => onCandidateSelected(candidate),
                         onFocused: () => focusCandidate(candidate),
                         showScheduleChip: showScheduleChip,
@@ -6333,7 +6337,7 @@ class _RemotePosterCard extends StatelessWidget {
     required this.width,
     required this.height,
     required this.candidate,
-    required this.imported,
+    required this.spaceStatus,
     required this.onTap,
     required this.onFocused,
     this.focusNode,
@@ -6343,7 +6347,7 @@ class _RemotePosterCard extends StatelessWidget {
   final double width;
   final double height;
   final RemoteSearchCandidate candidate;
-  final bool imported;
+  final String spaceStatus;
   final VoidCallback onTap;
   final VoidCallback onFocused;
   final FocusNode? focusNode;
@@ -6356,7 +6360,7 @@ class _RemotePosterCard extends StatelessWidget {
       height: height,
       child: _SearchResultPosterCard(
         candidate: candidate,
-        imported: imported,
+        spaceStatus: spaceStatus,
         focusNode: focusNode,
         onTap: onTap,
         onFocused: onFocused,
@@ -6453,6 +6457,8 @@ class _UpcomingPosterShelf extends StatelessWidget {
                       padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
                       itemBuilder: (context, index) {
                         final candidate = candidates[index];
+                        final importedSeries =
+                            controller.findRemoteSeriesForCandidate(candidate);
                         return _RemotePosterCard(
                           key: ValueKey(
                             '${title.toLowerCase()}-${_homeCandidateKey(candidate)}',
@@ -6460,10 +6466,9 @@ class _UpcomingPosterShelf extends StatelessWidget {
                           width: posterWidth,
                           height: posterHeight,
                           candidate: candidate,
-                          imported: controller.findRemoteSeriesForCandidate(
-                                candidate,
-                              ) !=
-                              null,
+                          spaceStatus: importedSeries == null
+                              ? ''
+                              : controller.spaceStatusFor(importedSeries),
                           onTap: () => onCandidateSelected(candidate),
                           onFocused: () => focusCandidate(candidate),
                           showScheduleChip: showScheduleChip,
@@ -7489,21 +7494,25 @@ class _SearchPanelState extends State<_SearchPanel> {
                     children: [
                       for (final entry
                           in controller.remoteResults.asMap().entries)
-                        SizedBox(
-                          width: cardWidth,
-                          height: 208,
-                          child: _SearchResultPosterCard(
-                            candidate: entry.value,
-                            imported: controller.findRemoteSeriesForCandidate(
-                                    entry.value) !=
-                                null,
-                            onTap: () =>
-                                widget.onRemoteCandidateSelected(entry.value),
-                            onArrowUp: entry.key < columns
-                                ? _handleFirstResultRowKey
-                                : null,
-                          ),
-                        ),
+                        Builder(builder: (context) {
+                          final importedSeries = controller
+                              .findRemoteSeriesForCandidate(entry.value);
+                          return SizedBox(
+                            width: cardWidth,
+                            height: 208,
+                            child: _SearchResultPosterCard(
+                              candidate: entry.value,
+                              spaceStatus: importedSeries == null
+                                  ? ''
+                                  : controller.spaceStatusFor(importedSeries),
+                              onTap: () =>
+                                  widget.onRemoteCandidateSelected(entry.value),
+                              onArrowUp: entry.key < columns
+                                  ? _handleFirstResultRowKey
+                                  : null,
+                            ),
+                          );
+                        }),
                     ],
                   );
                 },
@@ -7605,11 +7614,11 @@ class _CandidateFadeIn extends StatelessWidget {
   }
 }
 
-class _SearchResultPosterCard extends StatelessWidget {
+class _SearchResultPosterCard extends StatefulWidget {
   const _SearchResultPosterCard({
     required this.candidate,
-    required this.imported,
     required this.onTap,
+    this.spaceStatus = '',
     this.focusNode,
     this.onFocused,
     this.onLongPress,
@@ -7619,7 +7628,7 @@ class _SearchResultPosterCard extends StatelessWidget {
   });
 
   final RemoteSearchCandidate candidate;
-  final bool imported;
+  final String spaceStatus;
   final VoidCallback onTap;
   final FocusNode? focusNode;
   final VoidCallback? onFocused;
@@ -7629,21 +7638,38 @@ class _SearchResultPosterCard extends StatelessWidget {
   final bool showScheduleChip;
 
   @override
+  State<_SearchResultPosterCard> createState() =>
+      _SearchResultPosterCardState();
+}
+
+class _SearchResultPosterCardState extends State<_SearchResultPosterCard> {
+  bool _focused = false;
+
+  @override
   Widget build(BuildContext context) {
-    final scheduleLabel = _candidateScheduleChipLabel(candidate);
-    final relationLabel = candidate.relationLabel.trim();
+    final scheduleLabel = _candidateScheduleChipLabel(widget.candidate);
+    final relationLabel = widget.candidate.relationLabel.trim();
+    final spaceStatus = widget.spaceStatus.trim();
     return _FocusablePosterSurface(
-      focusNode: focusNode,
-      onTap: onTap,
-      onFocused: onFocused,
-      onLongPress: onLongPress,
-      onArrowUp: onArrowUp,
-      onArrowRightEdge: onArrowRightEdge,
+      focusNode: widget.focusNode,
+      onTap: widget.onTap,
+      onFocused: widget.onFocused,
+      onLongPress: widget.onLongPress,
+      onArrowUp: widget.onArrowUp,
+      onArrowRightEdge: widget.onArrowRightEdge,
+      onFocusChanged: (value) {
+        if (_focused != value) {
+          setState(() => _focused = value);
+        }
+      },
       elevation: 8,
       child: Stack(
         fit: StackFit.expand,
         children: [
-          _Poster(imageUrl: candidate.imageUrl, title: candidate.title),
+          _Poster(
+            imageUrl: widget.candidate.imageUrl,
+            title: widget.candidate.title,
+          ),
           Positioned(
             left: 5,
             top: 5,
@@ -7657,7 +7683,9 @@ class _SearchResultPosterCard extends StatelessWidget {
                 border: Border.all(color: TanukiColors.orangeHot, width: 2),
               ),
               child: Text(
-                candidate.episodeCount > 0 ? '${candidate.episodeCount}' : '?',
+                widget.candidate.episodeCount > 0
+                    ? '${widget.candidate.episodeCount}'
+                    : '?',
                 maxLines: 1,
                 overflow: TextOverflow.fade,
                 style: const TextStyle(
@@ -7668,25 +7696,24 @@ class _SearchResultPosterCard extends StatelessWidget {
               ),
             ),
           ),
+          if (spaceStatus.isNotEmpty)
+            Positioned(
+              left: 5,
+              top: 37,
+              child: _PosterSpaceStatusBadge(status: spaceStatus),
+            ),
           Positioned(
             right: 6,
-            top: 6,
+            top: 5,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                if (imported) ...[
-                  const Icon(
-                    Icons.check_circle,
-                    color: TanukiColors.orangeHot,
-                    size: 20,
-                  ),
-                  const SizedBox(height: 4),
-                ],
-                if (showScheduleChip && scheduleLabel.isNotEmpty)
+                if (widget.showScheduleChip && scheduleLabel.isNotEmpty)
                   _ScheduleChip(text: scheduleLabel),
                 if (relationLabel.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  _RelationChip(text: relationLabel),
+                  if (widget.showScheduleChip && scheduleLabel.isNotEmpty)
+                    const SizedBox(height: 4),
+                  _RelationChip(text: relationLabel, focused: _focused),
                 ],
               ],
             ),
@@ -7703,7 +7730,7 @@ class _SearchResultPosterCard extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    candidate.title,
+                    widget.candidate.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -7714,7 +7741,7 @@ class _SearchResultPosterCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    _formatCandidateMeta(candidate),
+                    _formatCandidateMeta(widget.candidate),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -8978,22 +9005,31 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
 
   for (final series in controller.library) {
     final spaceStatus = controller.spaceStatusFor(series);
-    if (spaceStatus == 'abandoned' || spaceStatus == 'completed') {
+    if (spaceStatus == 'abandoned') {
       continue;
     }
+    final rewatchFromStart = spaceStatus == 'completed';
     final seriesKey = series.stableKey;
     final titleKey = _seriesTitleDedupeKey(series.name);
     final watched = controller.watchedCountFor(series);
+    final minimumEpisodeIndex = rewatchFromStart ? 0 : watched;
+    final currentPlayback = current == null
+        ? null
+        : currentSeriesKey == series.stableKey
+            ? controller.playbackForEpisode(current)
+            : null;
     final currentForSeries = current != null &&
         currentSeriesKey == series.stableKey &&
-        current.episodeIndex >= watched;
+        current.episodeIndex >= minimumEpisodeIndex &&
+        (!rewatchFromStart || _isPartialPlayback(currentPlayback));
     final partialEpisode = _partialPlaybackEpisode(
       controller,
       series,
-      minimumEpisodeIndex: watched,
+      minimumEpisodeIndex: minimumEpisodeIndex,
     );
-    final shouldInclude =
-        currentForSeries || partialEpisode != null || watched > 0;
+    final shouldInclude = currentForSeries ||
+        partialEpisode != null ||
+        (!rewatchFromStart && watched > 0);
     if (!shouldInclude) {
       continue;
     }
@@ -9055,7 +9091,8 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
       currentSeries == null ? '' : controller.spaceStatusFor(currentSeries);
   if (current != null &&
       currentSpaceStatus != 'abandoned' &&
-      currentSpaceStatus != 'completed' &&
+      (currentSpaceStatus != 'completed' ||
+          _isPartialPlayback(controller.playbackForEpisode(current))) &&
       !seenKeys.contains(currentSeriesKey) &&
       (currentTitleKey.isEmpty || !seenTitleKeys.contains(currentTitleKey))) {
     final playback = controller.playbackForEpisode(current);
@@ -9199,11 +9236,15 @@ EpisodeItem? _partialPlaybackEpisode(
       continue;
     }
     final playback = controller.playbackForEpisode(episode);
-    if (playback != null && !playback.completed && playback.positionMs > 1000) {
+    if (_isPartialPlayback(playback)) {
       return episode;
     }
   }
   return null;
+}
+
+bool _isPartialPlayback(EpisodePlaybackRecord? playback) {
+  return playback != null && !playback.completed && playback.positionMs > 1000;
 }
 
 EpisodeItem? _continueWatchingEpisodeForSeries(
@@ -10121,6 +10162,7 @@ class _FocusablePosterSurface extends StatefulWidget {
     required this.onTap,
     this.focusNode,
     this.onFocused,
+    this.onFocusChanged,
     this.onLongPress,
     this.onArrowUp,
     this.onArrowRightEdge,
@@ -10131,6 +10173,7 @@ class _FocusablePosterSurface extends StatefulWidget {
   final VoidCallback onTap;
   final FocusNode? focusNode;
   final VoidCallback? onFocused;
+  final ValueChanged<bool>? onFocusChanged;
   final VoidCallback? onLongPress;
   final FocusOnKeyEventCallback? onArrowUp;
   final KeyEventResult Function()? onArrowRightEdge;
@@ -10287,6 +10330,7 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
         if (_focused != value) {
           setState(() => _focused = value);
         }
+        widget.onFocusChanged?.call(value);
         if (value) {
           widget.onFocused?.call();
           _ensureFocusableVisible(context, alignment: 0.54);
@@ -10795,17 +10839,23 @@ class _ScheduleChip extends StatelessWidget {
 }
 
 class _RelationChip extends StatelessWidget {
-  const _RelationChip({required this.text});
+  const _RelationChip({required this.text, required this.focused});
 
   final String text;
+  final bool focused;
 
   @override
   Widget build(BuildContext context) {
     final horizontalPadding = _homeResponsiveValue(context, 8, min: 6, max: 10);
     final verticalPadding = _homeResponsiveValue(context, 4, min: 3, max: 6);
     final fontSize = _homeResponsiveValue(context, 10, min: 9, max: 13);
+    final style = TextStyle(
+      color: const Color(0xFFF2ECFF),
+      fontSize: fontSize,
+      fontWeight: FontWeight.w900,
+    );
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 118),
+      constraints: const BoxConstraints(maxWidth: 128),
       child: Container(
         padding: EdgeInsets.symmetric(
           horizontal: horizontalPadding,
@@ -10816,19 +10866,123 @@ class _RelationChip extends StatelessWidget {
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: const Color(0x88BDA7FF)),
         ),
-        child: Text(
+        child: _AutoScrollingChipText(
           text,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: const Color(0xFFF2ECFF),
-            fontSize: fontSize,
-            fontWeight: FontWeight.w900,
-          ),
+          active: focused,
+          style: style,
         ),
       ),
     );
   }
+}
+
+class _AutoScrollingChipText extends StatelessWidget {
+  const _AutoScrollingChipText(
+    this.text, {
+    required this.active,
+    required this.style,
+  });
+
+  final String text;
+  final bool active;
+  final TextStyle style;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final painter = TextPainter(
+          text: TextSpan(text: text, style: style),
+          maxLines: 1,
+          textDirection: TextDirection.ltr,
+        )..layout();
+        final maxWidth = constraints.maxWidth;
+        final overflow = painter.width > maxWidth && maxWidth.isFinite;
+        if (!active || !overflow) {
+          return Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: style,
+          );
+        }
+        final distance = painter.width - maxWidth + 14;
+        final duration = Duration(
+          milliseconds: (900 + distance * 28).clamp(1100, 3600).round(),
+        );
+        return ClipRect(
+          child: TweenAnimationBuilder<double>(
+            key: ValueKey('chip-scroll-$text-${maxWidth.round()}'),
+            tween: Tween(begin: 0, end: distance),
+            duration: duration,
+            curve: Curves.easeInOutCubic,
+            builder: (context, value, child) {
+              return Transform.translate(
+                offset: Offset(-value, 0),
+                child: child,
+              );
+            },
+            child: Text(
+              text,
+              maxLines: 1,
+              softWrap: false,
+              overflow: TextOverflow.visible,
+              style: style,
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _PosterSpaceStatusBadge extends StatelessWidget {
+  const _PosterSpaceStatusBadge({required this.status});
+
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _posterSpaceStatusColor(status);
+    return Tooltip(
+      message: _posterSpaceStatusTooltip(status),
+      child: Icon(
+        _posterSpaceStatusIcon(status),
+        size: 28,
+        color: color,
+      ),
+    );
+  }
+}
+
+IconData _posterSpaceStatusIcon(String status) {
+  return switch (status) {
+    'want_to_watch' => Icons.bookmark_add,
+    'watching' => Icons.visibility,
+    'abandoned' => Icons.visibility_off,
+    'completed' => Icons.check_circle,
+    _ => Icons.assignment_ind,
+  };
+}
+
+Color _posterSpaceStatusColor(String status) {
+  return switch (status) {
+    'want_to_watch' => const Color(0xFF6FC2FF),
+    'watching' => TanukiColors.orange,
+    'abandoned' => const Color(0xFFFF8F9D),
+    'completed' => const Color(0xFF72E0A0),
+    _ => TanukiColors.text,
+  };
+}
+
+String _posterSpaceStatusTooltip(String status) {
+  return switch (status) {
+    'want_to_watch' => 'Mi espacio: Quiero ver',
+    'watching' => 'Mi espacio: Viendo',
+    'abandoned' => 'Mi espacio: Abandonada',
+    'completed' => 'Mi espacio: Completada',
+    _ => 'Mi espacio',
+  };
 }
 
 class _HeroRatingPill extends StatelessWidget {

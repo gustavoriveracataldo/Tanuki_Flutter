@@ -38,6 +38,87 @@ void main() {
         'https://cdn.example.test/prologue.jpg');
   });
 
+  test('imports all AnimeAV1 episodes when only first links are rendered',
+      () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(
+          request.url.toString(),
+          'https://animeav1.com/media/long-related-demo',
+        );
+        final visibleLinks = List.generate(
+          50,
+          (index) => '<a href="/media/long-related-demo/${index + 1}">Ep</a>',
+        ).join();
+        return http.Response(
+          '''
+          <html>
+            <h1>Long Related Demo</h1>
+            $visibleLinks
+            <script>const data = { episodesCount:76 };</script>
+          </html>
+          ''',
+          200,
+          request: request,
+        );
+      }),
+    );
+
+    final series = await service.buildImportSeries(
+      const RemoteSearchCandidate(
+        provider: RemoteProvider.animeAv1,
+        slug: 'long-related-demo',
+        title: 'Long Related Demo',
+        seriesUrl: 'https://animeav1.com/media/long-related-demo',
+      ),
+      existingNames: const [],
+    );
+
+    expect(series.episodes, hasLength(76));
+    expect(series.episodes.last.episodeNumber, 76);
+  });
+
+  test('repairs mojibake relation labels from AnimeAV1', () async {
+    final service = RemoteCatalogService(
+      client: MockClient((request) async {
+        expect(
+          request.url.toString(),
+          'https://animeav1.com/media/base-demo',
+        );
+        return http.Response(
+          '''
+          <html>
+            <h2>Relacionados</h2>
+            <div class="group/item">
+              <a href="/media/alternate-demo">
+                <img src="https://cdn.example.test/alt.jpg">
+                <h3>Alternate Demo</h3>
+                <span>VersiÃ³n Alternativa</span>
+              </a>
+            </div>
+            <h2>Episodios</h2>
+          </html>
+          ''',
+          200,
+          request: request,
+        );
+      }),
+    );
+
+    final relations = await service.fetchAnimeAv1RelationsForSeries(
+      const SeriesItem(
+        name: 'Base Demo',
+        sourceType: SourceType.remote,
+        episodeCount: 0,
+        provider: RemoteProvider.animeAv1,
+        slug: 'base-demo',
+        episodes: [],
+      ),
+    );
+
+    expect(relations.single.relationLabel, 'Versión Alternativa');
+  });
+
   test('fetches a supported random Jikan anime candidate', () async {
     var calls = 0;
     final service = RemoteCatalogService(

@@ -2,7 +2,7 @@
 
 Port Flutter de la shell Android TV nativa de Tanuki para Android, Windows y Linux.
 
-Version actual: `1.6.55`.
+Version actual: `1.7.6`.
 
 ## Que mantiene de la app Android
 
@@ -267,9 +267,9 @@ El build Linux no exige `libmpv-dev` para correr, pero si quieres que el reprodu
 
 El repo incluye `.github/workflows/release.yml`. Al subir un tag `v*`, GitHub Actions compila en paralelo:
 
-- Android: `tanuki-android-v1.6.55.apk`
-- Linux x64: `tanuki-linux-x64-v1.6.55.tar.gz`
-- Windows x64: `tanuki-windows-x64-v1.6.55.zip`
+- Android: `tanuki-android-v1.7.6.apk`
+- Linux x64: `tanuki-linux-x64-v1.7.6.tar.gz`
+- Windows x64: `tanuki-windows-x64-v1.7.6.zip`
 
 Despues, el job `GitHub Release` descarga los tres artefactos y los adjunta al release del tag.
 
@@ -278,9 +278,9 @@ Los artefactos temporales de Actions se guardan solo 1 dia (`retention-days: 1`)
 Para publicar esta version:
 
 ```sh
-git tag v1.6.55
+git tag v1.7.6
 git push origin main
-git push origin v1.6.55
+git push origin v1.7.6
 ```
 
 Tambien puede ejecutarse manualmente desde la pestana Actions usando `workflow_dispatch`; en ese caso usara la version de `pubspec.yaml`.

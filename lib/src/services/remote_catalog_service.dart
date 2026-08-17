@@ -1490,10 +1490,7 @@ $airingScheduleFields
             ? _readString(titles['english'])
             : _readString(titles['romaji']),
       );
-      final slug = title
-          .toLowerCase()
-          .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
-          .replaceAll(RegExp(r'^-+|-+$'), '');
+      final slug = _buildJustAnimeSeriesSlug(title);
       final seriesUrl = '$_justAnimeBaseUrl/anime/$id/$slug';
       return RemoteSearchCandidate(
         provider: RemoteProvider.justAnime,
@@ -1514,6 +1511,14 @@ $airingScheduleFields
     }).toList(growable: false);
   }
 
+  String _buildJustAnimeSeriesSlug(String title) {
+    return title
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^\x00-\x7F]+'), '')
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+  }
+
   Future<List<RemoteSearchCandidate>> searchAniPm(String query,
       {int releaseYear = 0}) async {
     final normalized = query.trim();
@@ -1530,36 +1535,38 @@ $airingScheduleFields
     final decoded = jsonDecode(response.body);
     final items = decoded is Map ? decoded['items'] : null;
     if (items is! List) return const [];
-    return items
-        .whereType<Map>()
-        .map((raw) {
-          final entry = Map<String, dynamic>.from(raw);
-          final id = _readInt(entry['id']);
-          final source = _readString(entry['source']).toLowerCase();
-          final route = source == 'anilist' ? 'ani' : 'anime';
-          final title = _cleanRemoteText(_readString(entry['title']));
-          return RemoteSearchCandidate(
-            provider: RemoteProvider.aniPm,
-            slug: '$route:$id',
-            title: title,
-            seriesUrl: '$_aniPmBaseUrl/$route/$id',
-            watchUrl: '$_aniPmBaseUrl/$route/$id',
-            imageUrl: _readString(entry['poster']),
-            backgroundUrl: _readString(entry['banner']),
-            description: _readString(entry['synopsis']),
-            rating: _readString(entry['score']),
-            episodeCount: _readInt(entry['episodeCount']),
-            format: _readString(entry['type']),
-            japaneseTitle: _cleanRemoteText(_readString(entry['native'])),
-            releaseYear: _readInt(entry['year']),
-            catalogId: _readInt(entry['anilistId']),
-          );
-        })
-        .where((candidate) =>
-            candidate.slug.split(':').last != '0' &&
-            candidate.title.isNotEmpty &&
-            (releaseYear <= 0 || candidate.releaseYear == releaseYear))
-        .toList(growable: false);
+    return items.whereType<Map>().map((raw) {
+      final entry = Map<String, dynamic>.from(raw);
+      final id = _readInt(entry['id']);
+      final source = _readString(entry['source']).toLowerCase();
+      final route = source == 'anilist' ? 'ani' : 'anime';
+      final title = _cleanRemoteText(_readString(entry['title']));
+      return RemoteSearchCandidate(
+        provider: RemoteProvider.aniPm,
+        slug: '$route:$id',
+        title: title,
+        seriesUrl: '$_aniPmBaseUrl/$route/$id',
+        watchUrl: '$_aniPmBaseUrl/$route/$id',
+        imageUrl: _readString(entry['poster']),
+        backgroundUrl: _readString(entry['banner']),
+        description: _readString(entry['synopsis']),
+        rating: _readString(entry['score']),
+        episodeCount: _readInt(entry['episodeCount']),
+        format: _readString(entry['type']),
+        japaneseTitle: _cleanRemoteText(_readString(entry['native'])),
+        releaseYear: _readInt(entry['year']),
+        catalogId: _readInt(entry['anilistId']),
+      );
+    }).where((candidate) {
+      final yearDifference = releaseYear > 0 && candidate.releaseYear > 0
+          ? (releaseYear - candidate.releaseYear).abs()
+          : 0;
+      return candidate.slug.split(':').last != '0' &&
+          candidate.title.isNotEmpty &&
+          (releaseYear <= 0 ||
+              candidate.releaseYear <= 0 ||
+              yearDifference <= 1);
+    }).toList(growable: false);
   }
 
   Future<List<RemoteSearchCandidate>> searchLatAnime(String query,
@@ -3821,11 +3828,22 @@ $airingScheduleFields
     if (animeId <= 0) return null;
     final episode = entry.episodeNumber < 1 ? 1 : entry.episodeNumber;
     final language = justAnimePlaybackModeFromId(preferredMode).id;
-    final requestedServer = justAnimeServerPreferenceFromId(preferredServer);
+    final requestedServer = preferredServer.trim().isEmpty
+        ? null
+        : justAnimeServerPreferenceFromId(preferredServer);
     final servers = <JustAnimeServerPreference>[
-      requestedServer,
+      if (requestedServer != null) requestedServer,
       ...JustAnimeServerPreference.values
-          .where((item) => item != requestedServer),
+          .where((item) => item != requestedServer)
+          .toList()
+        ..sort((left, right) {
+          const order = {
+            JustAnimeServerPreference.gigi: 0,
+            JustAnimeServerPreference.neko: 1,
+            JustAnimeServerPreference.momo: 2,
+          };
+          return (order[left] ?? 99).compareTo(order[right] ?? 99);
+        }),
     ];
     final subtitles = await _fetchJustAnimeMomoSubtitles(
       animeId,
@@ -3855,6 +3873,8 @@ $airingScheduleFields
       if (selected == null || selected['sources'] is! List) continue;
       final sources = (selected['sources'] as List).whereType<Map>().toList();
       if (sources.isEmpty) continue;
+      sources.sort((left, right) =>
+          _justAnimeSourceScore(right).compareTo(_justAnimeSourceScore(left)));
       final source = Map<String, dynamic>.from(sources.first);
       final rawUrl = _readString(source['url']);
       if (rawUrl.isEmpty) continue;
@@ -3878,6 +3898,23 @@ $airingScheduleFields
           'https://momo.justanime.to/proxy',
           rawUrl,
           _readHeaderMap(selected['headers'] ?? response['headers']),
+        );
+      } else if (server == JustAnimeServerPreference.gigi && !isHls) {
+        final proxyHeaders = {
+          'Referer': 'https://www.animegg.org/',
+          'User-Agent': _defaultFetchUserAgent,
+        };
+        final proxy = await _DirectMediaProxy.start(
+          client: _client,
+          upstreamUrl: rawUrl,
+          headers: proxyHeaders,
+          userAgent: _defaultFetchUserAgent,
+        );
+        _directMediaProxies.add(proxy);
+        playbackUrl = proxy.playbackUrl;
+        _debugResolver(
+          'justanime gigi proxy upstream=${_debugUrlLabel(rawUrl)} '
+          'local=${_debugUrlLabel(playbackUrl)}',
         );
       }
       final ownTracks = _parseJustAnimeSubtitleTracks(
@@ -3909,13 +3946,28 @@ $airingScheduleFields
               'User-Agent': _defaultFetchUserAgent
             },
           JustAnimeServerPreference.gigi => const {
-              'Referer': 'https://www.animegg.org/',
               'User-Agent': _defaultFetchUserAgent,
             },
         },
       );
     }
     return null;
+  }
+
+  int _justAnimeSourceScore(Map<dynamic, dynamic> source) {
+    final quality = _readString(source['quality']);
+    final qualityHeight =
+        int.tryParse(RegExp(r'\d+').firstMatch(quality)?.group(0) ?? '') ?? 0;
+    final height = _readInt(source['height'], fallback: qualityHeight);
+    final url = _readString(source['url']).toLowerCase();
+    var score = height;
+    if (source['isM3U8'] == true || url.contains('.m3u8')) {
+      score += 50;
+    }
+    if (url.isEmpty) {
+      score -= 100000;
+    }
+    return score;
   }
 
   String _buildJustAnimeProxyUrl(
@@ -3975,23 +4027,78 @@ $airingScheduleFields
     final query = <String, String>{
       'title': title,
       'ep': '$episode',
+      'direct': '1',
+      'phase': 'all',
+      'channel': 'all',
       if (_readInt(detail['year']) > 0) 'year': '${_readInt(detail['year'])}',
       if (_readString(detail['anilistId']).isNotEmpty)
         'anilistId': _readString(detail['anilistId']),
       if (_readString(detail['malId']).isNotEmpty)
         'malId': _readString(detail['malId']),
     };
-    final servers = await _getAniPmJson(
-      Uri.parse('$_aniPmBaseUrl/api/anime/src/servers')
-          .replace(queryParameters: query)
-          .toString(),
-      absolute: true,
-    );
-    if (servers == null) return null;
     final mode = aniPmPlaybackModeFromId(preferredMode).id;
-    final rawServers = servers[mode];
-    if (rawServers is! List || rawServers.isEmpty) return null;
-    final candidates = rawServers
+    final preferred = preferredServer.trim().toLowerCase();
+    final bootstrapCandidates = await _fetchAniPmPlaybackBootstrapCandidates(
+      detail: detail,
+      route: route,
+      id: id,
+      episode: episode,
+      mode: mode,
+    );
+    final hasBootstrapDirect =
+        _aniPmInventoryIncludesDirectServer(bootstrapCandidates);
+    final serversUri = Uri.parse('$_aniPmBaseUrl/api/anime/src/servers')
+        .replace(queryParameters: query)
+        .toString();
+    Map<String, dynamic>? servers;
+    final rawServers = <dynamic>[];
+    final seenServerKeys = <String>{};
+    for (var attempt = 0; attempt < 5; attempt += 1) {
+      servers = await _getAniPmJson(serversUri, absolute: true);
+      final currentServers =
+          servers?[mode] is List ? servers![mode] as List : const [];
+      for (final raw in currentServers) {
+        final key = raw is Map
+            ? _aniPmServerKey(Map<String, dynamic>.from(raw))
+            : raw.toString();
+        if (key.isEmpty || !seenServerKeys.add(key)) {
+          continue;
+        }
+        rawServers.add(raw);
+      }
+      final partial = servers == null || servers['partial'] == true;
+      if (hasBootstrapDirect && (rawServers.isNotEmpty || attempt >= 1)) {
+        break;
+      }
+      if (rawServers.isNotEmpty &&
+          (!partial || _aniPmInventoryIncludesDirectServer(rawServers))) {
+        break;
+      }
+      if (!partial || attempt >= 4) {
+        break;
+      }
+      final retryAfterMs =
+          _readInt(servers?['retryAfterMs'], fallback: 1250).clamp(750, 5000);
+      _debugResolver(
+        'anipm servers partial mode=$mode attempt=${attempt + 1} '
+        'count=${rawServers.length} '
+        'direct=${_aniPmInventoryIncludesDirectServer(rawServers)} '
+        'retry=${retryAfterMs}ms',
+      );
+      await Future<void>.delayed(Duration(milliseconds: retryAfterMs));
+    }
+    final seriesId = _readInt(detail['anikotoId'], fallback: id);
+    final combinedServers = [
+      ...bootstrapCandidates,
+      ...rawServers,
+      ...await _fetchAniPmHeliosServerCandidates(
+        seriesId: seriesId,
+        episode: episode,
+        mode: mode,
+      ),
+    ];
+    if (combinedServers.isEmpty) return null;
+    final candidates = combinedServers
         .whereType<Map>()
         .map((raw) {
           final item = Map<String, dynamic>.from(raw);
@@ -4003,7 +4110,6 @@ $airingScheduleFields
             !excludedServers.contains(_aniPmServerFamily(candidate.key)))
         .toList();
     if (candidates.isEmpty) return null;
-    final preferred = preferredServer.trim().toLowerCase();
     candidates.sort((left, right) {
       return _aniPmCandidateSortScore(right, preferred)
           .compareTo(_aniPmCandidateSortScore(left, preferred));
@@ -4013,10 +4119,47 @@ $airingScheduleFields
       final item = candidate.item;
       var playbackUrl = _aniPmAbsoluteUrl(_readString(item['url']));
       var kind = _readString(item['kind']).toLowerCase();
-      var tracks = _parseAniPmSubtitleTracks(item['tracks']);
-      var pageUrl = playbackUrl;
+      var tracks = _parseAniPmSubtitleTracks(
+        item['tracks'] ?? item['subtitles'] ?? item['captions'],
+      );
+      var pageUrl = _aniPmAbsoluteUrl(_readString(item['pageUrl']));
+      if (pageUrl.isEmpty) {
+        pageUrl = playbackUrl;
+      }
       if (playbackUrl.isEmpty) continue;
-      if (kind == 'embed') {
+      if (kind == 'helios-direct') {
+        final resolved = await _getAniPmJson(
+          Uri.parse('$_aniPmBaseUrl/api/anime/ep-direct').replace(
+            queryParameters: {
+              'id': playbackUrl,
+              'series': '$seriesId',
+              'ep': '$episode',
+              'channel': mode,
+            },
+          ).toString(),
+          absolute: true,
+        );
+        if (resolved == null) continue;
+        final rawResolved = [
+          resolved['m3u8'],
+          resolved['file'],
+          resolved['url'],
+        ]
+            .map(_readString)
+            .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+        if (rawResolved.isEmpty) continue;
+        playbackUrl = _aniPmAbsoluteUrl(rawResolved);
+        kind = rawResolved.contains('.m3u8') ||
+                rawResolved.contains('/api/anime/src/hls')
+            ? 'hls'
+            : 'http';
+        tracks = [
+          ...tracks,
+          ..._parseAniPmSubtitleTracks(
+            resolved['tracks'] ?? resolved['subtitles'] ?? resolved['captions'],
+          ),
+        ];
+      } else if (kind == 'embed') {
         final embedded = await _getAniPmJson(
           Uri.parse('$_aniPmBaseUrl/api/anime/src/embed-direct').replace(
             queryParameters: {'u': playbackUrl},
@@ -4067,6 +4210,128 @@ $airingScheduleFields
     return null;
   }
 
+  Future<List<Map<String, dynamic>>> _fetchAniPmPlaybackBootstrapCandidates({
+    required Map<String, dynamic> detail,
+    required String route,
+    required int id,
+    required int episode,
+    required String mode,
+  }) async {
+    final detailSource = _readString(detail['source']).toLowerCase();
+    final source =
+        route == 'ani' || detailSource == 'anilist' ? 'anilist' : 'anikoto';
+    final sourceId =
+        source == 'anilist' ? _readInt(detail['anilistId'], fallback: id) : id;
+    if (sourceId <= 0 || episode <= 0) {
+      return const [];
+    }
+    final bootstrap = await _getAniPmJson(
+      '/api/anime/playback-bootstrap/$source/$sourceId'
+      '?ep=$episode&lang=$mode',
+    );
+    final direct = bootstrap?['helios'];
+    if (direct is! Map) {
+      return const [];
+    }
+    final directItem = Map<String, dynamic>.from(direct);
+    final playbackUrl = [
+      directItem['m3u8'],
+      directItem['file'],
+      directItem['url'],
+    ]
+        .map(_readString)
+        .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+    if (playbackUrl.isEmpty) {
+      return const [];
+    }
+    final path = _readString(directItem['path']);
+    final isHls = playbackUrl.contains('.m3u8') ||
+        playbackUrl.contains('/api/anime/src/hls') ||
+        playbackUrl.contains('/api/anime/anipm-server/');
+    return [
+      {
+        'tanukiKey': 'ani-pm',
+        'provider': 'Ani.pm',
+        'name': 'Direct',
+        'kind': isHls ? 'hls' : 'http',
+        'url': playbackUrl,
+        'pageUrl': path.isEmpty
+            ? '$_aniPmBaseUrl/$route/$id?ep=$episode'
+            : 'https://megaplay.buzz/stream/$path',
+        'priority': 200,
+        'subtitle': 'soft',
+        'tracks': directItem['tracks'] ??
+            directItem['subtitles'] ??
+            directItem['captions'],
+      },
+    ];
+  }
+
+  bool _aniPmInventoryIncludesDirectServer(List<dynamic> rawServers) {
+    return rawServers.whereType<Map>().any((raw) {
+      final item = Map<String, dynamic>.from(raw);
+      final provider = _readString(item['provider']).toLowerCase();
+      final kind = _readString(item['kind']).toLowerCase();
+      final name = _readString(item['name']).toLowerCase();
+      final key = _aniPmServerKey(item);
+      return (provider == 'ani.pm' || provider == 'anipm' || key == 'ani-pm') &&
+          (kind == 'hls' || name.contains('direct'));
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchAniPmHeliosServerCandidates({
+    required int seriesId,
+    required int episode,
+    required String mode,
+  }) async {
+    if (seriesId <= 0 || episode <= 0) {
+      return const [];
+    }
+    final response = await _getAniPmJson(
+      '/api/anime/ep-servers/$seriesId/$episode',
+    );
+    final rawServers = response?['servers'];
+    if (rawServers is! List) {
+      return const [];
+    }
+    final servers = rawServers
+        .whereType<Map>()
+        .map((raw) => Map<String, dynamic>.from(raw))
+        .where((item) =>
+            _readString(item['type']).toLowerCase() == mode &&
+            _readString(item['id']).isNotEmpty)
+        .where((item) =>
+            RegExp(r'^(HD|Vidstream|VidCloud|VidPlay)\b', caseSensitive: false)
+                .hasMatch(_readString(item['name'])))
+        .toList();
+    servers.sort((left, right) => _aniPmHeliosServerSortScore(left)
+        .compareTo(_aniPmHeliosServerSortScore(right)));
+    return [
+      for (var index = 0; index < servers.length; index += 1)
+        {
+          'tanukiKey':
+              'helios-${_aniPmServerSlugPart(_readString(servers[index]['name']))}',
+          'provider': 'Helios',
+          'name': _readString(servers[index]['name']),
+          'kind': 'helios-direct',
+          'url': _readString(servers[index]['id']),
+          'pageUrl':
+              'https://megaplay.buzz/stream/ani/$seriesId/$episode/$mode',
+          'priority': 140 - index,
+          'subtitle': 'soft',
+        },
+    ];
+  }
+
+  int _aniPmHeliosServerSortScore(Map<String, dynamic> item) {
+    final name = _readString(item['name']);
+    if (RegExp(r'^HD\b', caseSensitive: false).hasMatch(name)) return 0;
+    if (RegExp(r'^Vidstream\b', caseSensitive: false).hasMatch(name)) return 1;
+    if (RegExp(r'^VidCloud\b', caseSensitive: false).hasMatch(name)) return 2;
+    if (RegExp(r'^VidPlay\b', caseSensitive: false).hasMatch(name)) return 3;
+    return 9;
+  }
+
   Future<Map<String, dynamic>?> _getAniPmJson(String path,
       {bool absolute = false}) async {
     try {
@@ -4108,11 +4373,20 @@ $airingScheduleFields
     return trimmed;
   }
 
+  String _aniPmServerSlugPart(String value) {
+    return value
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+  }
+
   String _aniPmServerKey(Map<String, dynamic> item) {
-    final provider = _readString(item['provider']).toLowerCase().replaceAll(
-          RegExp(r'[^a-z0-9]+'),
-          '-',
-        );
+    final explicit = _aniPmServerSlugPart(_readString(item['tanukiKey']));
+    if (explicit.isNotEmpty) {
+      return explicit;
+    }
+    final provider = _aniPmServerSlugPart(_readString(item['provider']));
     final name = _readString(item['name']).toLowerCase();
     final numberMatches = RegExp(r'(\d+)').allMatches(name).toList();
     final number =
@@ -4122,30 +4396,61 @@ $airingScheduleFields
         .join('-');
   }
 
-  String _aniPmServerFamily(String key) => key.split('-').first;
+  String _aniPmServerFamily(String key) {
+    final normalized = key.trim().toLowerCase();
+    if (normalized == 'ani-pm') {
+      return normalized;
+    }
+    return normalized.split('-').first;
+  }
 
   int _aniPmCandidateSortScore(
     ({Map<String, dynamic> item, String key}) candidate,
     String preferred,
   ) {
     final family = _aniPmServerFamily(candidate.key);
+    final preferredFamily = _aniPmServerFamily(preferred);
+    final preferredIsComet = preferred == 'comet' || preferredFamily == 'comet';
     var score = _readInt(candidate.item['priority']);
-    if (candidate.key == preferred) {
-      score += 100000;
-    } else if (family == preferred) {
-      score += 50000;
+    if (!preferredIsComet) {
+      if (candidate.key == preferred) {
+        score += 100000;
+      } else if (family == preferredFamily) {
+        score += 50000;
+      }
     }
     final provider = _readString(candidate.item['provider']).toLowerCase();
     final kind = _readString(candidate.item['kind']).toLowerCase();
     final subtitle = _readString(candidate.item['subtitle']).toLowerCase();
+    final name = _readString(candidate.item['name']).toLowerCase();
+    final tracks = candidate.item['tracks'] ??
+        candidate.item['subtitles'] ??
+        candidate.item['captions'];
+    final isAniPmDirect = (provider == 'ani.pm' || provider == 'anipm') &&
+        (kind == 'hls' || name.contains('direct'));
+    if (isAniPmDirect) {
+      score += 30000;
+    } else if (provider == 'helios') {
+      score -= 2000;
+    } else if (kind == 'hls' && name.contains('direct')) {
+      score += 3000;
+    }
+    if (kind == 'hls' || kind == 'helios-direct') {
+      score += 1500;
+    } else if (kind == 'embed') {
+      score -= 500;
+    }
     if (provider == 'lyra') {
-      score += 2000;
+      score += 10000;
     }
     if (subtitle == 'soft') {
       score += 500;
     }
+    if (tracks is List && tracks.isNotEmpty) {
+      score += 800 + tracks.length.clamp(0, 25).toInt();
+    }
     if (provider == 'comet') {
-      score -= 5000;
+      score -= 50000;
     }
     if (kind == 'dash') {
       score -= 20000;
@@ -4159,16 +4464,35 @@ $airingScheduleFields
         .whereType<Map>()
         .map((raw) {
           final item = Map<String, dynamic>.from(raw);
-          final url = _aniPmAbsoluteUrl(_readString(item['url']).isNotEmpty
-              ? _readString(item['url'])
-              : _readString(item['file']));
-          final label = _readString(item['label']).isNotEmpty
-              ? _readString(item['label'])
-              : _readString(item['language']);
+          final url = _aniPmAbsoluteUrl([
+            item['url'],
+            item['file'],
+            item['src'],
+          ].map(_readString).firstWhere(
+                (value) => value.isNotEmpty,
+                orElse: () => '',
+              ));
+          final language = [
+            item['language'],
+            item['lang'],
+            item['srclang'],
+          ].map(_readString).firstWhere(
+                (value) => value.isNotEmpty,
+                orElse: () => '',
+              );
+          final label = [
+            item['label'],
+            item['title'],
+            item['name'],
+            language,
+          ].map(_readString).firstWhere(
+                (value) => value.isNotEmpty,
+                orElse: () => '',
+              );
           return RemoteSubtitleTrack(
             url: url,
             label: label.isEmpty ? 'Subtitulo' : label,
-            language: _readString(item['language']),
+            language: language,
             mimeType:
                 url.toLowerCase().contains('.ass') ? 'text/x-ssa' : 'text/vtt',
             isDefault: item['default'] == true,
@@ -4766,23 +5090,10 @@ $airingScheduleFields
       'option=${selected.option.id} id=${selected.videoId} '
       'url=${selected.url} title="${selected.title}"',
     );
-    if (io.Platform.isAndroid || io.Platform.isLinux || io.Platform.isWindows) {
-      return RemoteDirectStream(
-        playbackUrl: selected.url,
-        playbackKind: 'webview',
-        pageUrl: selected.url,
-        availableModes: options.map((option) => option.server).toSet(),
-        selectedMode: selected.server,
-        provider: RemoteProvider.youtube,
-        server: selected.server,
-        httpHeaders: const {
-          'User-Agent': _defaultFetchUserAgent,
-        },
-      );
-    }
+    final availableModes = options.map((option) => option.server).toSet();
     final ytDlpStream = await _resolveYoutubeDirectStreamWithYtDlp(
       selected,
-      availableModes: options.map((option) => option.server).toSet(),
+      availableModes: availableModes,
     );
     if (ytDlpStream != null) {
       return ytDlpStream;
@@ -4808,14 +5119,17 @@ $airingScheduleFields
         });
       if (muxed.isEmpty) {
         _debugResolver('youtube missing muxed streams id=${selected.videoId}');
-        return null;
+        return _youtubeWebViewFallbackStream(
+          selected,
+          availableModes: availableModes,
+        );
       }
       final stream = muxed.first;
       return RemoteDirectStream(
         playbackUrl: stream.url.toString(),
         playbackKind: stream.container.name == 'mp4' ? 'mp4' : 'direct',
         pageUrl: selected.url,
-        availableModes: options.map((option) => option.server).toSet(),
+        availableModes: availableModes,
         selectedMode: selected.server,
         provider: RemoteProvider.youtube,
         server: selected.server,
@@ -4823,12 +5137,37 @@ $airingScheduleFields
           'User-Agent': _defaultFetchUserAgent,
         },
       );
-    } on yt.YoutubeExplodeException catch (error) {
+    } catch (error) {
       _debugResolver('youtube manifest failed id=${selected.videoId}: $error');
-      return null;
+      return _youtubeWebViewFallbackStream(
+        selected,
+        availableModes: availableModes,
+      );
     } finally {
       ytClient.close();
     }
+  }
+
+  RemoteDirectStream _youtubeWebViewFallbackStream(
+    _YoutubePlaybackOption selected, {
+    required Set<String> availableModes,
+  }) {
+    _debugResolver(
+      'youtube using WebView fallback server=${selected.server} '
+      'id=${selected.videoId}',
+    );
+    return RemoteDirectStream(
+      playbackUrl: selected.url,
+      playbackKind: 'webview',
+      pageUrl: selected.url,
+      availableModes: availableModes,
+      selectedMode: selected.server,
+      provider: RemoteProvider.youtube,
+      server: selected.server,
+      httpHeaders: const {
+        'User-Agent': _defaultFetchUserAgent,
+      },
+    );
   }
 
   Future<RemoteDirectStream?> _resolveYoutubeDirectStreamWithYtDlp(
@@ -11384,21 +11723,16 @@ $airingScheduleFields
 
   List<int> _parseAnimeAv1EpisodeNumbers(String html, String slug) {
     final normalizedSlug = slug.trim().replaceAll(RegExp(r'^/+|/+$'), '');
+    final episodeNumbers = <int>{};
     if (normalizedSlug.isNotEmpty) {
       final pattern = RegExp(
         'href="/media/${RegExp.escape(normalizedSlug)}/(\\d+)',
         caseSensitive: false,
       );
-      final fromLinks = pattern
+      episodeNumbers.addAll(pattern
           .allMatches(html)
           .map((match) => int.tryParse(match.group(1) ?? ''))
-          .whereType<int>()
-          .toSet()
-          .toList()
-        ..sort();
-      if (fromLinks.isNotEmpty) {
-        return fromLinks;
-      }
+          .whereType<int>());
     }
     final episodeCount = int.tryParse(
           RegExp(r'episodesCount:(\d+)', caseSensitive: false)
@@ -11407,9 +11741,11 @@ $airingScheduleFields
               '',
         ) ??
         0;
-    return episodeCount > 0
-        ? List.generate(episodeCount, (index) => index + 1)
-        : const [];
+    if (episodeCount > 0) {
+      episodeNumbers.addAll(List.generate(episodeCount, (index) => index + 1));
+    }
+    final sorted = episodeNumbers.toList()..sort();
+    return sorted;
   }
 
   String _extractAnimeAv1SeriesTitle(String html) {
@@ -12570,9 +12906,9 @@ String _readString(Object? value, {String fallback = ''}) {
 }
 
 String _cleanRemoteText(String value) {
-  final cleaned = _decodeHtml(value.replaceAll(RegExp(r'<[^>]*>'), ' '))
-      .replaceAll(RegExp(r'\s+'), ' ')
-      .trim();
+  final cleaned = _repairRemoteTextEncoding(
+    _decodeHtml(value.replaceAll(RegExp(r'<[^>]*>'), ' ')),
+  ).replaceAll(RegExp(r'\s+'), ' ').trim();
   switch (cleaned.toLowerCase()) {
     case '':
     case 'null':
@@ -12582,6 +12918,28 @@ String _cleanRemoteText(String value) {
     default:
       return cleaned;
   }
+}
+
+String _repairRemoteTextEncoding(String value) {
+  if (!value.contains('Ã') && !value.contains('Â') && !value.contains('�')) {
+    return value;
+  }
+  try {
+    final repaired = utf8.decode(latin1.encode(value), allowMalformed: true);
+    return _encodingNoiseScore(repaired) < _encodingNoiseScore(value)
+        ? repaired
+        : value;
+  } catch (_) {
+    return value;
+  }
+}
+
+int _encodingNoiseScore(String value) {
+  var score = 0;
+  for (final marker in const ['Ã', 'Â', '�']) {
+    score += marker.allMatches(value).length;
+  }
+  return score;
 }
 
 String _cleanRemoteUrl(String value) {

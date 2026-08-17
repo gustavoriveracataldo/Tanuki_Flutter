@@ -995,6 +995,59 @@ void main() {
     },
   );
 
+  test('keeps completed series rewatch progress resumable', () async {
+    final episode = _episode();
+    final series = SeriesItem(
+      name: 'Demo',
+      seriesStateKey: 'demo',
+      sourceType: SourceType.remote,
+      episodeCount: 1,
+      episodes: [episode],
+    );
+    final store = _MemoryAppStore(
+      AppState(
+        remoteLibrary: [series],
+        profiles: const [
+          UserProfileState(
+            playlists: [
+              PlaylistState(
+                id: 'default',
+                name: 'Playlist principal',
+                selectedSeries: {'demo'},
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+    final controller = AppController(store: store);
+    await controller.initialize();
+
+    await controller.saveEpisodePlayback(
+      episode,
+      position: const Duration(minutes: 24),
+      duration: const Duration(minutes: 24),
+      completed: true,
+    );
+
+    expect(controller.state.profile.completedSeries, contains('demo'));
+    expect(controller.playbackForEpisode(episode)?.completed, isTrue);
+    expect(controller.resumePositionForEpisode(episode), isNull);
+
+    await controller.saveEpisodePlayback(
+      episode,
+      position: const Duration(minutes: 4),
+      duration: const Duration(minutes: 24),
+    );
+
+    final record = controller.playbackForEpisode(episode);
+    expect(controller.state.profile.completedSeries, contains('demo'));
+    expect(controller.state.profile.watchingSeries, isNot(contains('demo')));
+    expect(record?.completed, isFalse);
+    expect(controller.resumePositionForEpisode(episode),
+        const Duration(minutes: 4));
+  });
+
   test('can save playback progress silently without notifying listeners',
       () async {
     final store = _MemoryAppStore(AppState.initial());
@@ -1152,6 +1205,14 @@ void main() {
     expect(restoredPreference?.facebookMode, 'dub');
     expect(restoredPreference?.facebookOption, 'option-2');
     expect(restoredPreference?.videoScaleMode, 'stretch');
+  });
+
+  test('uses Desu as default JKAnime server', () {
+    expect(jkAnimeServerPreferenceFromId(''), JkAnimeServerPreference.desu);
+    expect(
+      jkAnimeServerPreferenceFromId('unknown-server'),
+      JkAnimeServerPreference.desu,
+    );
   });
 
   test('creates selects and deletes playlists', () async {

@@ -6,6 +6,7 @@ import android.content.res.Configuration
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.os.Build
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -17,9 +18,11 @@ class MainActivity : FlutterActivity() {
     private val remoteWebResolverChannelName = "tanuki/remote_web_resolver"
     private val trailerPlayerChannelName = "tanuki/trailer_player"
     private val mediaCapabilitiesChannelName = "tanuki/media_capabilities"
+    private val playbackPowerChannelName = "tanuki/playback_power"
     private var deepLinksChannel: MethodChannel? = null
     private var remoteWebResolver: RemoteWebResolver? = null
     private var pendingLink: String? = null
+    private var playbackKeepScreenOn = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -85,7 +88,32 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            playbackPowerChannelName,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setPlaybackKeepScreenOn" -> {
+                    val enabled = call.argument<Boolean>("enabled") == true
+                    setPlaybackKeepScreenOn(enabled)
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
         dispatchDeepLink(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (playbackKeepScreenOn) {
+            setPlaybackKeepScreenOn(true)
+        }
+    }
+
+    override fun onDestroy() {
+        setPlaybackKeepScreenOn(false)
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -101,6 +129,18 @@ class MainActivity : FlutterActivity() {
         intent?.removeExtra(EXTRA_INTERNAL_DEEP_LINK)
         pendingLink = link
         deepLinksChannel?.invokeMethod("link", link)
+    }
+
+    private fun setPlaybackKeepScreenOn(enabled: Boolean) {
+        playbackKeepScreenOn = enabled
+        runOnUiThread {
+            if (enabled) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            window.decorView.keepScreenOn = enabled
+        }
     }
 
     private fun trailerEntriesJson(entries: List<Map<String, Any?>>): JSONArray {

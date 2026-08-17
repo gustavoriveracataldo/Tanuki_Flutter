@@ -195,6 +195,65 @@ Solo en la oscuridad, la luz.
     );
   });
 
+  test('watches Ani.pm Helios HLS streams for missing video frames', () {
+    expect(
+      shouldWatchRemoteVideoFrame(
+        RemoteProvider.aniPm,
+        const RemoteDirectStream(
+          playbackUrl: 'https://ani.pm/api/anime/src/hls?t=helios',
+          playbackKind: 'hls',
+          pageUrl: 'https://megaplay.buzz/stream/ani/6069/3/sub',
+          provider: RemoteProvider.aniPm,
+          server: 'helios-hd-1',
+        ),
+      ),
+      isTrue,
+    );
+  });
+
+  test('keeps established AnimeAV1 HLS instead of automatic provider fallback',
+      () {
+    expect(
+      shouldSuppressStableRemoteAv1AutomaticFallback(
+        stream: animeAv1ZillaStream.copyWith(provider: RemoteProvider.animeAv1),
+        position: const Duration(minutes: 15),
+        remotePlaybackAccepted: true,
+        hasVideoFrame: true,
+      ),
+      isTrue,
+    );
+  });
+
+  test('allows AnimeAV1 HLS fallback during startup', () {
+    expect(
+      shouldSuppressStableRemoteAv1AutomaticFallback(
+        stream: animeAv1ZillaStream.copyWith(provider: RemoteProvider.animeAv1),
+        position: const Duration(seconds: 45),
+        remotePlaybackAccepted: true,
+        hasVideoFrame: false,
+      ),
+      isFalse,
+    );
+  });
+
+  test('does not suppress non AnimeAV1 provider fallback', () {
+    expect(
+      shouldSuppressStableRemoteAv1AutomaticFallback(
+        stream: const RemoteDirectStream(
+          playbackUrl: 'https://cdn.example.test/demo.m3u8',
+          playbackKind: 'hls',
+          pageUrl: 'https://jkanime.net/demo/1/',
+          provider: RemoteProvider.jkAnime,
+          server: 'magi',
+        ),
+        position: const Duration(minutes: 15),
+        remotePlaybackAccepted: true,
+        hasVideoFrame: true,
+      ),
+      isFalse,
+    );
+  });
+
   test('does not retry missing video frames before playback grace', () {
     expect(
       shouldRetryMissingVideoFrame(
@@ -259,6 +318,7 @@ Solo en la oscuridad, la luz.
       stream: stream,
       audioSlave: '',
       referer: 'https://www.mp4upload.com/embed-demo.html',
+      userAgent: 'Mozilla/5.0',
     );
 
     expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
@@ -272,6 +332,7 @@ Solo en la oscuridad, la luz.
       args,
       contains('--http-referrer=https://www.mp4upload.com/embed-demo.html'),
     );
+    expect(args, contains('--http-user-agent=Mozilla/5.0'));
   });
 
   test('builds stable VLC profile for proxied AnimeAV1 Zilla HLS streams', () {
@@ -291,6 +352,7 @@ Solo en la oscuridad, la luz.
       audioSlave: '',
       referer:
           'https://player.zilla-networks.com/play/6a91a9fceb2dc7ac9385520de35977b3',
+      userAgent: 'Mozilla/5.0',
     );
 
     expect(
@@ -693,6 +755,7 @@ Solo en la oscuridad, la luz.
       ),
       audioSlave: '',
       referer: '',
+      userAgent: 'Mozilla/5.0',
     );
 
     expect(args, contains('--network-caching=3000'));
@@ -700,7 +763,7 @@ Solo en la oscuridad, la luz.
     expect(args, isNot(contains('--clock-synchro=0')));
   });
 
-  test('defers initial resume seek for JKAnime Magi HLS streams', () {
+  test('defers initial resume seek briefly for JKAnime Magi HLS streams', () {
     const stream = RemoteDirectStream(
       playbackUrl: 'https://nika.playmudos.com/demo.m3u8',
       playbackKind: 'hls',
@@ -712,6 +775,22 @@ Solo en la oscuridad, la luz.
     expect(shouldDeferRemoteHlsInitialSeek(stream), isTrue);
     expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
     expect(shouldDeferAndroidExoInitialSeek(stream), isTrue);
+    expect(deferredResumeSeekWarmup(stream), const Duration(seconds: 2));
+  });
+
+  test('defers initial resume seek briefly for JKAnime Desu HLS streams', () {
+    const stream = RemoteDirectStream(
+      playbackUrl: 'https://desu.example.test/demo.m3u8',
+      playbackKind: 'hls',
+      pageUrl: 'https://jkanime.net/jkplayer/desu?e=demo',
+      provider: RemoteProvider.jkAnime,
+      server: 'desu',
+    );
+
+    expect(shouldDeferRemoteHlsInitialSeek(stream), isTrue);
+    expect(shouldDeferDesktopVlcInitialSeek(stream), isTrue);
+    expect(shouldDeferAndroidExoInitialSeek(stream), isTrue);
+    expect(deferredResumeSeekWarmup(stream), const Duration(seconds: 2));
   });
 
   test('defers initial resume seek for ani.pm HLS streams', () {
@@ -944,6 +1023,44 @@ Solo en la oscuridad, la luz.
     );
   });
 
+  test('prefers Latin American Spanish subtitles before Spanish and English',
+      () {
+    final stream = animeAv1ZillaStream.copyWith(
+      subtitleTracks: const [
+        RemoteSubtitleTrack(
+          url: 'https://cdn.example.test/subs/en.vtt',
+          label: 'English',
+          language: 'english',
+          isDefault: true,
+        ),
+        RemoteSubtitleTrack(
+          url: 'https://cdn.example.test/subs/es.vtt',
+          label: 'Spanish',
+          language: 'spanish',
+        ),
+        RemoteSubtitleTrack(
+          url: 'https://cdn.example.test/subs/es-419.vtt',
+          label: 'Spanish (- Latin American)',
+          language: 'spanish (- latin american)',
+        ),
+      ],
+    );
+
+    expect(
+      selectRemoteSubtitleTrack(stream)?.url,
+      'https://cdn.example.test/subs/es-419.vtt',
+    );
+    expect(
+      preferredRemoteSubtitleTracks(stream.subtitleTracks)
+          .map((track) => track.url),
+      [
+        'https://cdn.example.test/subs/es-419.vtt',
+        'https://cdn.example.test/subs/es.vtt',
+        'https://cdn.example.test/subs/en.vtt',
+      ],
+    );
+  });
+
   test('selects requested remote subtitle track by stable key', () {
     const alternate = RemoteSubtitleTrack(
       url: 'https://cdn.example.test/subs/alternate.vtt',
@@ -979,6 +1096,29 @@ Solo en la oscuridad, la luz.
     expect(remoteServerLabel('mixdrop'), 'MixDrop');
     expect(remoteServerLabel('yourupload'), 'YourUpload');
     expect(remoteServerLabel('stape'), 'Stape');
+    expect(remoteServerLabel('ani-pm'), 'Ani.pm Direct');
+    expect(remoteServerLabel('helios-2'), 'Helios 2');
+    expect(remoteServerLabel('helios-hd-1'), 'Helios HD 1');
     expect(remoteServerLabel('custom'), 'custom');
+  });
+
+  test('orders ani.pm servers like the provider menu', () {
+    final servers = [
+      'onyx-1',
+      'lyra-4',
+      'helios-hd-1',
+      'ani-pm',
+      'astra',
+      'comet-1',
+    ]..sort(compareAniPmServerMenuOrder);
+
+    expect(servers, [
+      'ani-pm',
+      'helios-hd-1',
+      'lyra-4',
+      'comet-1',
+      'onyx-1',
+      'astra',
+    ]);
   });
 }

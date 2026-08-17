@@ -2549,6 +2549,9 @@ class AppController extends ChangeNotifier {
       return latAnimeServerPreferenceFromId(preference.latAnimeServer).id;
     }
     if (provider == RemoteProvider.justAnime) {
+      if (preference.justAnimeServer.trim().isEmpty) {
+        return '';
+      }
       return justAnimeServerPreferenceFromId(preference.justAnimeServer).id;
     }
     if (provider == RemoteProvider.aniPm) {
@@ -3297,7 +3300,7 @@ class AppController extends ChangeNotifier {
         provider: normalized,
         clearProvider: normalized == null,
         jkAnimeServer: normalized == RemoteProvider.jkAnime
-            ? JkAnimeServerPreference.magi.id
+            ? JkAnimeServerPreference.desu.id
             : null,
       ),
       normalized == null
@@ -3333,7 +3336,8 @@ class AppController extends ChangeNotifier {
     } else if (provider == RemoteProvider.aniPm) {
       next = next.copyWith(
         aniPmMode: mode,
-        aniPmServer: server,
+        aniPmServer:
+            current.aniPmServer.trim().isEmpty ? current.aniPmServer : server,
       );
     }
     if (next.toJson().toString() == current.toJson().toString()) return;
@@ -3653,10 +3657,12 @@ class AppController extends ChangeNotifier {
         ].reduce((left, right) => left > right ? left : right),
       false => positionMs < 0 ? 0 : positionMs,
     };
+    final keepExistingCompletion =
+        existing?.completed == true && !completed && normalizedPosition <= 1000;
     final record = EpisodePlaybackRecord.normalized(
       positionMs: normalizedPosition,
       durationMs: normalizedDuration,
-      completed: completed || existing?.completed == true,
+      completed: completed || keepExistingCompletion,
       remoteProgressPercent:
           positionMs > 0 ? 0 : existing?.remoteProgressPercent ?? 0,
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,

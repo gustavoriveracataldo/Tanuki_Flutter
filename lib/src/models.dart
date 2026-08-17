@@ -191,7 +191,7 @@ JkAnimeServerPreference jkAnimeServerPreferenceFromId(Object? value) {
     String text when text.contains('magi') => JkAnimeServerPreference.magi,
     String text when text.contains('vidhide') || text.contains('vid hide') =>
       JkAnimeServerPreference.vidhide,
-    _ => JkAnimeServerPreference.magi,
+    _ => JkAnimeServerPreference.desu,
   };
 }
 
