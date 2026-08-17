@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io' as io;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:flutter/services.dart';
@@ -15,6 +16,8 @@ import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
 const _appVersionLabel = '1.7.5';
+const _homeContinueWatchingLimit = 48;
+const _homeHeroRandomLibraryLimit = 180;
 String? _lastFocusedHomeShelfId;
 DateTime _suppressHomeActivationUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -80,7 +83,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _homeMoviesLoading = false;
   bool _randomLoading = false;
   bool _detailImporting = false;
-  double _animePanelScrollOffset = 0.0;
+  final ValueNotifier<double> _animePanelScrollOffset =
+      ValueNotifier<double>(0);
   int _detailSimilarRequest = 0;
   int _homeTrendingVisualRequest = 0;
   int _homeAiringVisualRequest = 0;
@@ -137,6 +141,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _homeContentFocusNode.dispose();
     _detailContentFocusNode.dispose();
     _detailActionFocusNodes.dispose();
+    _animePanelScrollOffset.dispose();
     super.dispose();
   }
 
@@ -367,7 +372,7 @@ class _HomeScreenState extends State<HomeScreen> {
       airingLoading: _homeAiringLoading,
       movieCandidates: _homeMovieResults,
       moviesLoading: _homeMoviesLoading,
-      scrollOffset: _animePanelScrollOffset,
+      scrollOffsetListenable: _animePanelScrollOffset,
       onScrollOffset: _updateAnimePanelOpacity,
       onSeriesCleared: _clearSelectedSeries,
       onRemoteCandidateSelected: (candidate) {
@@ -544,15 +549,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _updateAnimePanelOpacity(double offset) {
     final steppedOffset = (offset / 4).roundToDouble() * 4;
-    if ((steppedOffset - _animePanelScrollOffset).abs() >= 4) {
-      setState(() {
-        _animePanelScrollOffset = steppedOffset;
-      });
+    if ((steppedOffset - _animePanelScrollOffset.value).abs() >= 4) {
+      _animePanelScrollOffset.value = steppedOffset;
     }
   }
 
   void _resetAnimePanelOpacity() {
-    _animePanelScrollOffset = 0;
+    _animePanelScrollOffset.value = 0;
   }
 
   Future<void> _refreshSelectedSeriesVisuals(SeriesItem series) async {
@@ -623,7 +626,7 @@ class _HomeScreenState extends State<HomeScreen> {
       (_, attemptedAt) =>
           now.difference(attemptedAt) > const Duration(hours: 1),
     );
-    for (final entry in entries) {
+    for (final entry in entries.take(8)) {
       final series = entry.series;
       final lastAttempt = series == null
           ? null
@@ -3526,6 +3529,16 @@ List<SeriesItem> _buildHeroRecommendationQueue(
   final currentSeries = currentEntry == null
       ? null
       : controller.findSeriesForEpisode(currentEntry);
+  final watchlistKeys = _normalizedHeroKeys(profile.watchlistSeries);
+  final favoriteKeys = _normalizedHeroKeys(profile.favoriteSeries);
+  final syncedKeys = _normalizedHeroKeys({
+    ...profile.myAnimeListMappings.keys,
+    ...profile.simklMappings.keys,
+  });
+  final syncedStatusKeys = _normalizedHeroKeys({
+    ...profile.watchingSeries,
+    ...profile.watchlistSeries,
+  });
 
   void addSeries(
     SeriesItem? series, {
@@ -3562,7 +3575,7 @@ List<SeriesItem> _buildHeroRecommendationQueue(
 
   // 1. Quiero ver.
   for (final series in library) {
-    if (_seriesMatchesAnyKey(series, profile.watchlistSeries)) {
+    if (_seriesMatchesNormalizedKeys(series, watchlistKeys)) {
       addSeries(series, priority: 900, bonus: _seriesVisualScore(series));
     }
   }
@@ -3587,7 +3600,7 @@ List<SeriesItem> _buildHeroRecommendationQueue(
 
   // 4. Favoritos con capitulos pendientes.
   for (final series in library) {
-    if (_seriesMatchesAnyKey(series, profile.favoriteSeries)) {
+    if (_seriesMatchesNormalizedKeys(series, favoriteKeys)) {
       addSeries(series, priority: 600, bonus: _seriesVisualScore(series));
     }
   }
@@ -3616,17 +3629,10 @@ List<SeriesItem> _buildHeroRecommendationQueue(
   }
 
   // 7. MAL/SIMKL watching o plan to watch sin progreso local claro.
-  final syncedKeys = {
-    ...profile.myAnimeListMappings.keys,
-    ...profile.simklMappings.keys,
-  };
-  final syncedStatusKeys = {
-    ...profile.watchingSeries,
-    ...profile.watchlistSeries,
-  };
   for (final series in library) {
-    if (_seriesMatchesAnyKey(series, syncedStatusKeys) &&
-        (syncedKeys.isEmpty || _seriesMatchesAnyKey(series, syncedKeys))) {
+    if (_seriesMatchesNormalizedKeys(series, syncedStatusKeys) &&
+        (syncedKeys.isEmpty ||
+            _seriesMatchesNormalizedKeys(series, syncedKeys))) {
       addSeries(
         series,
         priority: 300,
@@ -3647,7 +3653,7 @@ List<SeriesItem> _buildHeroRecommendationQueue(
   // cuando hay alternativas mejores.
   final bucket = DateTime.now().millisecondsSinceEpoch ~/
       const Duration(hours: 6).inMilliseconds;
-  for (final series in library) {
+  for (final series in _heroRandomLibraryCandidates(library)) {
     addSeries(
       series,
       priority: 100,
@@ -3739,13 +3745,28 @@ SeriesItem? _findSeriesByKey(Iterable<SeriesItem> library, String key) {
   return null;
 }
 
-bool _seriesMatchesAnyKey(SeriesItem series, Iterable<String> keys) {
-  final normalizedKeys = keys.map(normalizeSeriesKey).toSet()
+Set<String> _normalizedHeroKeys(Iterable<String> keys) {
+  return keys.map(normalizeSeriesKey).toSet()
     ..removeWhere((key) => key.isEmpty);
+}
+
+bool _seriesMatchesNormalizedKeys(
+    SeriesItem series, Set<String> normalizedKeys) {
   if (normalizedKeys.isEmpty) {
     return false;
   }
   return _heroSeriesIdentityKeys(series).any(normalizedKeys.contains);
+}
+
+Iterable<SeriesItem> _heroRandomLibraryCandidates(List<SeriesItem> library) {
+  if (library.length <= _homeHeroRandomLibraryLimit) {
+    return library;
+  }
+  return library
+      .where((series) =>
+          _seriesHasAnyPlaybackRoute(series) ||
+          _seriesVisualScore(series) >= 90)
+      .take(_homeHeroRandomLibraryLimit);
 }
 
 Set<String> _heroSeriesIdentityKeys(SeriesItem series) {
@@ -3893,7 +3914,7 @@ class _AnimePanel extends StatelessWidget {
     required this.airingLoading,
     required this.movieCandidates,
     required this.moviesLoading,
-    required this.scrollOffset,
+    required this.scrollOffsetListenable,
     required this.onScrollOffset,
     required this.onSeriesCleared,
     required this.onRemoteCandidateSelected,
@@ -3930,7 +3951,7 @@ class _AnimePanel extends StatelessWidget {
   final bool airingLoading;
   final List<RemoteSearchCandidate> movieCandidates;
   final bool moviesLoading;
-  final double scrollOffset;
+  final ValueListenable<double> scrollOffsetListenable;
   final ValueChanged<double> onScrollOffset;
   final VoidCallback onSeriesCleared;
   final ValueChanged<RemoteSearchCandidate> onRemoteCandidateSelected;
@@ -3984,7 +4005,7 @@ class _AnimePanel extends StatelessWidget {
     const sectionGap = 28.0;
     const fadeDistance = 80.0;
 
-    double sectionOpacity(double sectionTop) {
+    double sectionOpacity(double sectionTop, double scrollOffset) {
       final startOffset = sectionTop + topPadding - heroHeight;
       final delta = scrollOffset - startOffset;
       if (delta <= 0) return 1.0;
@@ -3993,9 +4014,15 @@ class _AnimePanel extends StatelessWidget {
     }
 
     Widget fadeSection(double sectionTop, Widget child) {
-      return Opacity(
-        opacity: sectionOpacity(sectionTop),
+      return ValueListenableBuilder<double>(
+        valueListenable: scrollOffsetListenable,
         child: child,
+        builder: (context, scrollOffset, child) {
+          return Opacity(
+            opacity: sectionOpacity(sectionTop, scrollOffset),
+            child: child,
+          );
+        },
       );
     }
 
@@ -8993,8 +9020,9 @@ class _ContinueWatchingEntry {
 }
 
 List<_ContinueWatchingEntry> _continueWatchingEntries(
-  AppController controller,
-) {
+  AppController controller, {
+  int limit = _homeContinueWatchingLimit,
+}) {
   final current = controller.currentEntry;
   final currentSeriesKey = current == null ? '' : _seriesKeyForEpisode(current);
   final currentTitleKey =
@@ -9022,11 +9050,19 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         currentSeriesKey == series.stableKey &&
         current.episodeIndex >= minimumEpisodeIndex &&
         (!rewatchFromStart || _isPartialPlayback(currentPlayback));
-    final partialEpisode = _partialPlaybackEpisode(
-      controller,
-      series,
-      minimumEpisodeIndex: minimumEpisodeIndex,
-    );
+    final hasPlayableRoute =
+        currentForSeries || _seriesHasAnyPlaybackRoute(series);
+    if (!hasPlayableRoute) {
+      continue;
+    }
+    final partialEpisode =
+        (!currentForSeries && (rewatchFromStart || watched <= 0))
+            ? _partialPlaybackEpisode(
+                controller,
+                series,
+                minimumEpisodeIndex: minimumEpisodeIndex,
+              )
+            : null;
     final shouldInclude = currentForSeries ||
         partialEpisode != null ||
         (!rewatchFromStart && watched > 0);
@@ -9137,7 +9173,7 @@ List<_ContinueWatchingEntry> _continueWatchingEntries(
         .toLowerCase()
         .compareTo(right.seriesName.toLowerCase());
   });
-  return entries.toList(growable: false);
+  return entries.take(limit).toList(growable: false);
 }
 
 String _seriesTitleDedupeKey(String value) {
@@ -9224,6 +9260,9 @@ EpisodeItem? _partialPlaybackEpisode(
   SeriesItem series, {
   required int minimumEpisodeIndex,
 }) {
+  if (!_seriesHasAnyPlaybackRoute(series)) {
+    return null;
+  }
   final episodes = [...series.episodes]..sort(
       (left, right) => left.episodeIndex.compareTo(right.episodeIndex),
     );
@@ -9241,6 +9280,10 @@ EpisodeItem? _partialPlaybackEpisode(
     }
   }
   return null;
+}
+
+bool _seriesHasAnyPlaybackRoute(SeriesItem series) {
+  return series.episodes.any(_episodeHasPlaybackRoute);
 }
 
 bool _isPartialPlayback(EpisodePlaybackRecord? playback) {

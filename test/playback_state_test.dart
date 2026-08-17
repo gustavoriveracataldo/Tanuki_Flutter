@@ -342,6 +342,38 @@ void main() {
     expect(controller.isConnectingMyAnimeList, isFalse);
   });
 
+  test('imports long MAL series as compact placeholders', () async {
+    final mal = _FakeMyAnimeListService(
+      remoteEntries: const [
+        MyAnimeListRemoteAnimeEntry(
+          malId: 321,
+          title: 'Long Remote Demo',
+          imageUrl: 'https://example.test/mal.jpg',
+          year: 1999,
+          mediaType: 'tv',
+          episodeCount: 1000,
+          status: MyAnimeListRemoteStatus(
+            status: 'watching',
+            watchedEpisodes: 500,
+          ),
+        ),
+      ],
+    );
+    final store = _MemoryAppStore(AppState.initial());
+    final controller = AppController(store: store, myAnimeListService: mal);
+    await controller.initialize();
+
+    await controller.setMyAnimeListClientId('client');
+    await controller.beginMyAnimeListConnection();
+    await controller.completeMyAnimeListConnection(
+      '${MyAnimeListService.redirectUri}?code=ok&state=state',
+    );
+
+    expect(store.state.remoteLibrary.single.episodeCount, 1000);
+    expect(store.state.remoteLibrary.single.episodes, hasLength(1));
+    expect(store.state.activePlaylist.progress['catalog:321'], 500);
+  });
+
   test('connects SIMKL with PIN and imports remote list', () async {
     final store = _MemoryAppStore(AppState.initial());
     final controller = AppController(

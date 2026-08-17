@@ -50,6 +50,7 @@ const _androidExoListenerPositionAdvanceThreshold = Duration(milliseconds: 900);
 const _playbackHeartbeatInterval = Duration(milliseconds: 500);
 const _androidExoPositionStallThreshold = Duration(milliseconds: 1100);
 const _androidExoPositionStallTolerance = Duration(milliseconds: 250);
+const _playerProgressUiRebuildInterval = Duration(milliseconds: 250);
 const _playerProgressKeyboardSeekCommitDelay = Duration(seconds: 1);
 const _animeSkipPromptLead = Duration(seconds: 1);
 const _animeSkipSeekEndOffset = Duration(milliseconds: 500);
@@ -148,6 +149,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _handlingPlaybackError = false;
   bool _playerOverlaysVisible = true;
   bool _playerControlsFocused = false;
+  int _playerControlsFocusTicket = 0;
   bool _playerBuffering = false;
   bool _playerVolumeSliderVisible = false;
   bool _suppressNextPlayerActivationKeyUp = false;
@@ -194,6 +196,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   DateTime _lastPositionChangeAt = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastPlayerOverlayPointerRefresh =
       DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastDesktopVlcRebuild = DateTime.fromMillisecondsSinceEpoch(0);
   Duration _lastPosition = Duration.zero;
   Duration _lastDuration = Duration.zero;
   int _lastPositionDebugBucket = -1;
@@ -265,6 +268,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   _UpcomingCardPhase _upcomingCardPhase = _UpcomingCardPhase.none;
   bool _startUpcomingCardsShown = false;
   bool _endUpcomingCardsShown = false;
+  List<EpisodeItem>? _cachedUpcomingEntriesAfterCurrent;
   int _upcomingCardTicket = 0;
   DateTime _lastPlaybackMonitorReportAt =
       DateTime.fromMillisecondsSinceEpoch(0);
@@ -762,6 +766,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     _lastPosition = Duration.zero;
     _lastDuration = Duration.zero;
     _lastPositionChangeAt = DateTime.now();
+    _lastDesktopVlcRebuild = DateTime.fromMillisecondsSinceEpoch(0);
+    _lastAndroidExoRebuild = DateTime.fromMillisecondsSinceEpoch(0);
     _lastPositionDebugBucket = -1;
     _lastBufferDebugBucket = -1;
     if (path.isEmpty && !widget.episode.isRemote) {
@@ -1203,7 +1209,18 @@ class _PlayerScreenState extends State<PlayerScreen>
       _maybeScheduleUpcomingCards(_lastPosition);
       _maybeUpdateAnimeSkipPrompt(_lastPosition);
       _persistPlaybackThrottled();
-      if (mounted) {
+      final now = DateTime.now();
+      if (mounted &&
+          shouldRebuildPlayerProgressUi(
+            overlaysVisible: _playerOverlaysVisible,
+            controlsFocused: _playerControlsFocused,
+            dialogOpen: _playerDialogOpen,
+            subtitlesEnabled: _subtitlesEnabled,
+            captionText: _activeRemoteSubtitleCaption,
+          ) &&
+          now.difference(_lastDesktopVlcRebuild) >=
+              _playerProgressUiRebuildInterval) {
+        _lastDesktopVlcRebuild = now;
         setState(() {});
       }
     });
@@ -2209,7 +2226,7 @@ class _PlayerScreenState extends State<PlayerScreen>
               : value.caption.text,
         ) &&
         now.difference(_lastAndroidExoRebuild) >=
-            const Duration(milliseconds: 250)) {
+            _playerProgressUiRebuildInterval) {
       _lastAndroidExoRebuild = now;
       setState(() {});
     }
@@ -3660,6 +3677,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _upcomingCardPhase = _UpcomingCardPhase.none;
     _startUpcomingCardsShown = false;
     _endUpcomingCardsShown = false;
+    _cachedUpcomingEntriesAfterCurrent = null;
   }
 
   void _resetAnimeSkip() {
@@ -3981,7 +3999,11 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   List<EpisodeItem> _upcomingEntriesAfterCurrent() {
-    return switch (widget.launchMode) {
+    final cached = _cachedUpcomingEntriesAfterCurrent;
+    if (cached != null) {
+      return cached;
+    }
+    final entries = switch (widget.launchMode) {
       PlayerLaunchMode.playlist => _playlistEntriesAfterCurrent(limit: 2),
       PlayerLaunchMode.continueWatchingRoundRobin =>
         _continueWatchingEntriesAfterCurrent(
@@ -3992,6 +4014,8 @@ class _PlayerScreenState extends State<PlayerScreen>
         _continueWatchingEntriesAfterCurrent(limit: 2),
       _ => _seriesEntriesAfterCurrent(limit: 2),
     };
+    _cachedUpcomingEntriesAfterCurrent = entries;
+    return entries;
   }
 
   List<EpisodeItem> _playlistEntriesAfterCurrent({required int limit}) {
@@ -4198,280 +4222,295 @@ class _PlayerScreenState extends State<PlayerScreen>
     final playerControlScale =
         shouldUseAndroidPhoneUi(_androidMediaCapabilities) ? 2.0 : 1.0;
     final bottomControlInset = 14.0 * playerControlScale;
+    final overscanHorizontal = widget.controller.state.overscanHorizontal;
+    final overscanTop = widget.controller.state.overscanTop;
+    final overscanBottom = widget.controller.state.overscanBottom;
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Focus(
-        focusNode: _playerControlsRootFocusNode,
-        autofocus: true,
-        onKeyEvent: _handlePlayerRootKey,
-        child: Listener(
-          onPointerMove: (_) => _showPlayerOverlays(throttled: true),
-          onPointerHover: (_) => _showPlayerOverlays(throttled: true),
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: RepaintBoundary(
-                  child: _openedMedia &&
-                          _androidExoController?.value.isInitialized == true
-                      ? _AndroidExoVideoSurface(
-                          controller: _androidExoController!,
-                          fit: _boxFitForVideoScaleMode(_videoScaleMode),
-                          subtitlesEnabled:
-                              _subtitlesEnabled && _remoteSubtitleCues.isEmpty,
-                        )
-                      : _openedMedia && _youtubeWebController != null
-                          ? _YoutubeWebVideoSurface(
-                              controller: _youtubeWebController!,
-                            )
-                          : _openedMedia && _desktopVlcPlayer != null
-                              ? vlc.Video(
-                                  player: _desktopVlcPlayer!,
-                                  fit:
-                                      _boxFitForVideoScaleMode(_videoScaleMode),
-                                  showControls: false,
-                                )
-                              : _openedMedia && _videoController != null
-                                  ? _TanukiVideoTheme(
-                                      child: Video(
-                                        controller: _videoController!,
-                                        fit: _boxFitForVideoScaleMode(
-                                            _videoScaleMode),
-                                        subtitleViewConfiguration:
-                                            SubtitleViewConfiguration(
-                                          visible: _subtitlesEnabled &&
-                                              _remoteSubtitleCues.isEmpty,
-                                        ),
-                                      ),
-                                    )
-                                  : _PlayerFallback(
-                                      episode: episode,
-                                      error: _error,
-                                    ),
-                ),
-              ),
-              Positioned.fill(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.translucent,
-                  onTap: _togglePlayerOverlaysFromPointer,
-                ),
-              ),
-              if (_openedMedia && _activeRemoteSubtitleCaption.isNotEmpty)
-                Positioned(
-                  left: 32,
-                  right: 32,
-                  bottom: 72,
-                  child: IgnorePointer(
-                    child: Text(
-                      _activeRemoteSubtitleCaption,
-                      textAlign: TextAlign.center,
-                      style: _subtitleOverlayTextStyle,
-                    ),
-                  ),
-                ),
-              if (_openedMedia &&
-                  _playerBuffering &&
-                  !useDesktopYoutubeWebControls)
+      body: Padding(
+        padding: EdgeInsets.only(
+          left: overscanHorizontal,
+          right: overscanHorizontal,
+          top: overscanTop,
+          bottom: overscanBottom,
+        ),
+        child: Focus(
+          focusNode: _playerControlsRootFocusNode,
+          autofocus: true,
+          onKeyEvent: _handlePlayerRootKey,
+          child: Listener(
+            onPointerMove: (_) => _showPlayerOverlays(throttled: true),
+            onPointerHover: (_) => _showPlayerOverlays(throttled: true),
+            child: Stack(
+              children: [
                 Positioned.fill(
-                  child: IgnorePointer(
-                    child: _PlayerBufferingOverlay(
-                      message: _currentResolvedStream?.provider ==
-                              RemoteProvider.bilibili
-                          ? 'BiliBili demora en cargar y al adelantar puede demorarse.'
-                          : '',
-                    ),
+                  child: RepaintBoundary(
+                    child: _openedMedia &&
+                            _androidExoController?.value.isInitialized == true
+                        ? _AndroidExoVideoSurface(
+                            controller: _androidExoController!,
+                            fit: _boxFitForVideoScaleMode(_videoScaleMode),
+                            subtitlesEnabled: _subtitlesEnabled &&
+                                _remoteSubtitleCues.isEmpty,
+                          )
+                        : _openedMedia && _youtubeWebController != null
+                            ? _YoutubeWebVideoSurface(
+                                controller: _youtubeWebController!,
+                              )
+                            : _openedMedia && _desktopVlcPlayer != null
+                                ? vlc.Video(
+                                    player: _desktopVlcPlayer!,
+                                    fit: _boxFitForVideoScaleMode(
+                                        _videoScaleMode),
+                                    showControls: false,
+                                  )
+                                : _openedMedia && _videoController != null
+                                    ? _TanukiVideoTheme(
+                                        child: Video(
+                                          controller: _videoController!,
+                                          fit: _boxFitForVideoScaleMode(
+                                              _videoScaleMode),
+                                          subtitleViewConfiguration:
+                                              SubtitleViewConfiguration(
+                                            visible: _subtitlesEnabled &&
+                                                _remoteSubtitleCues.isEmpty,
+                                          ),
+                                        ),
+                                      )
+                                    : _PlayerFallback(
+                                        episode: episode,
+                                        error: _error,
+                                      ),
                   ),
                 ),
-              Positioned(
-                left: 48,
-                bottom: 96,
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 240),
-                  reverseDuration: const Duration(milliseconds: 220),
-                  switchInCurve: Curves.easeOutCubic,
-                  switchOutCurve: Curves.easeInCubic,
-                  transitionBuilder: (child, animation) {
-                    return FadeTransition(
-                      opacity: animation,
-                      child: child,
-                    );
-                  },
-                  child: _activeAnimeSkipInterval == null
-                      ? const SizedBox.shrink(
-                          key: ValueKey('anime-skip-none'),
-                        )
-                      : _AnimeSkipPrompt(
-                          key: ValueKey(
-                            'anime-skip-${_activeAnimeSkipInterval!.stableKey}',
-                          ),
-                          label: _animeSkipPromptLabel(
-                            _activeAnimeSkipInterval!.type,
-                          ),
-                          focusNode: _animeSkipButtonFocusNode,
-                          onPressed: () => unawaited(_skipActiveAnimeSegment()),
-                        ),
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onTap: _togglePlayerOverlaysFromPointer,
+                  ),
                 ),
-              ),
-              if (!useDesktopYoutubeWebControls)
-                Positioned(
-                  left: 0,
-                  top: 0,
-                  right: 0,
-                  child: IgnorePointer(
-                    ignoring: _openedMedia && !_playerOverlaysVisible,
-                    child: AnimatedOpacity(
-                      opacity: !_openedMedia || _playerOverlaysVisible ? 1 : 0,
-                      duration: const Duration(milliseconds: 220),
-                      child: RepaintBoundary(
-                        child: _PlayerTopBar(
-                          episode: episode,
-                          status: sourceStatus.label,
-                          statusIcon: sourceStatus.icon,
-                          statusColor: sourceStatus.color,
-                          onBack: _exitPlayer,
-                          onPrevious: _playPrevious,
-                          onNext: _playNext,
-                          onSettings: _showPlayerSettingsDialog,
-                          onEpisodes: () => unawaited(_showEpisodeListPanel()),
-                          onToggleVolume: _togglePlayerMute,
-                          onVolumeHoverChanged: _setPlayerVolumeSliderVisible,
-                          onVolumeChanged: _setPlayerVolume,
-                          onFullscreen: () =>
-                              unawaited(_toggleFullscreenMode()),
-                          onControlFocusChanged: _setPlayerControlsFocused,
-                          showVolumeControl: _showsDesktopVolumeControl,
-                          showVolumeSlider: _playerVolumeSliderVisible,
-                          volume: _playerVolume,
-                          showFullscreenControl: _showsPlayerFullscreenControl,
-                          backButtonFocusNode: _playerBackButtonFocusNode,
-                          previousButtonFocusNode:
-                              _playerPreviousButtonFocusNode,
-                          nextButtonFocusNode: _playerNextButtonFocusNode,
-                          settingsButtonFocusNode:
-                              _playerSettingsButtonFocusNode,
-                          episodesButtonFocusNode:
-                              _playerEpisodesButtonFocusNode,
-                          volumeButtonFocusNode: _playerVolumeButtonFocusNode,
-                          fullscreenButtonFocusNode:
-                              _playerFullscreenButtonFocusNode,
-                          controlScale: playerControlScale,
-                        ),
+                if (_openedMedia && _activeRemoteSubtitleCaption.isNotEmpty)
+                  Positioned(
+                    left: 32,
+                    right: 32,
+                    bottom: 72,
+                    child: IgnorePointer(
+                      child: Text(
+                        _activeRemoteSubtitleCaption,
+                        textAlign: TextAlign.center,
+                        style: _subtitleOverlayTextStyle,
                       ),
                     ),
                   ),
-                ),
-              if (_upcomingCardsEnabled)
+                if (_openedMedia &&
+                    _playerBuffering &&
+                    !useDesktopYoutubeWebControls)
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: _PlayerBufferingOverlay(
+                        message: _currentResolvedStream?.provider ==
+                                RemoteProvider.bilibili
+                            ? 'BiliBili demora en cargar y al adelantar puede demorarse.'
+                            : '',
+                      ),
+                    ),
+                  ),
                 Positioned(
-                  right: 46,
-                  bottom: 72,
-                  child: IgnorePointer(
-                    ignoring: true,
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 260),
-                      reverseDuration: const Duration(milliseconds: 260),
-                      switchInCurve: Curves.easeOutCubic,
-                      switchOutCurve: Curves.easeInCubic,
-                      child: visibleUpcomingCard == null
-                          ? const SizedBox(
-                              key: ValueKey('upcoming-none'),
-                              width: 300,
-                              height: 170,
-                            )
-                          : KeyedSubtree(
-                              key: ValueKey(
-                                'upcoming-${_upcomingCardPhase.name}-'
-                                '${_seriesKeyFor(visibleUpcomingCard)}-'
-                                '${visibleUpcomingCard.episodeNumber}',
-                              ),
-                              child: _UpcomingCard(
-                                label: _visibleUpcomingCardLabel(),
-                                labelColor: _visibleUpcomingCardColor(),
-                                episode: visibleUpcomingCard,
-                              ),
+                  left: 48,
+                  bottom: 96,
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 240),
+                    reverseDuration: const Duration(milliseconds: 220),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) {
+                      return FadeTransition(
+                        opacity: animation,
+                        child: child,
+                      );
+                    },
+                    child: _activeAnimeSkipInterval == null
+                        ? const SizedBox.shrink(
+                            key: ValueKey('anime-skip-none'),
+                          )
+                        : _AnimeSkipPrompt(
+                            key: ValueKey(
+                              'anime-skip-${_activeAnimeSkipInterval!.stableKey}',
                             ),
-                    ),
+                            label: _animeSkipPromptLabel(
+                              _activeAnimeSkipInterval!.type,
+                            ),
+                            focusNode: _animeSkipButtonFocusNode,
+                            onPressed: () =>
+                                unawaited(_skipActiveAnimeSegment()),
+                          ),
                   ),
                 ),
-              if (_openedMedia &&
-                  _androidExoController?.value.isInitialized == true)
-                Positioned(
-                  left: bottomControlInset,
-                  right: bottomControlInset,
-                  bottom: 10 * playerControlScale,
-                  child: IgnorePointer(
-                    ignoring: !_playerOverlaysVisible,
-                    child: AnimatedOpacity(
-                      opacity: _playerOverlaysVisible ? 1 : 0,
-                      duration: const Duration(milliseconds: 220),
-                      child: RepaintBoundary(
-                        child: _AndroidExoControls(
-                          controller: _androidExoController!,
-                          onTogglePlayback: _toggleAndroidExoPlayback,
-                          onSeek: _seekAndroidExoPlayer,
-                          formatTime: _formatPlaybackTime,
-                          onFocusChanged: _setPlayerControlsFocused,
-                          playButtonFocusNode: _playerBottomPlayFocusNode,
-                          progressFocusNode: _playerBottomProgressFocusNode,
-                          controlScale: playerControlScale,
+                if (!useDesktopYoutubeWebControls)
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    child: IgnorePointer(
+                      ignoring: _openedMedia && !_playerOverlaysVisible,
+                      child: AnimatedOpacity(
+                        opacity:
+                            !_openedMedia || _playerOverlaysVisible ? 1 : 0,
+                        duration: const Duration(milliseconds: 220),
+                        child: RepaintBoundary(
+                          child: _PlayerTopBar(
+                            episode: episode,
+                            status: sourceStatus.label,
+                            statusIcon: sourceStatus.icon,
+                            statusColor: sourceStatus.color,
+                            onBack: _exitPlayer,
+                            onPrevious: _playPrevious,
+                            onNext: _playNext,
+                            onSettings: _showPlayerSettingsDialog,
+                            onEpisodes: () =>
+                                unawaited(_showEpisodeListPanel()),
+                            onToggleVolume: _togglePlayerMute,
+                            onVolumeHoverChanged: _setPlayerVolumeSliderVisible,
+                            onVolumeChanged: _setPlayerVolume,
+                            onFullscreen: () =>
+                                unawaited(_toggleFullscreenMode()),
+                            onControlFocusChanged: _setPlayerControlsFocused,
+                            showVolumeControl: _showsDesktopVolumeControl,
+                            showVolumeSlider: _playerVolumeSliderVisible,
+                            volume: _playerVolume,
+                            showFullscreenControl:
+                                _showsPlayerFullscreenControl,
+                            backButtonFocusNode: _playerBackButtonFocusNode,
+                            previousButtonFocusNode:
+                                _playerPreviousButtonFocusNode,
+                            nextButtonFocusNode: _playerNextButtonFocusNode,
+                            settingsButtonFocusNode:
+                                _playerSettingsButtonFocusNode,
+                            episodesButtonFocusNode:
+                                _playerEpisodesButtonFocusNode,
+                            volumeButtonFocusNode: _playerVolumeButtonFocusNode,
+                            fullscreenButtonFocusNode:
+                                _playerFullscreenButtonFocusNode,
+                            controlScale: playerControlScale,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-              if (_openedMedia &&
-                  _youtubeWebController != null &&
-                  !useDesktopYoutubeWebControls)
-                Positioned(
-                  left: bottomControlInset,
-                  right: bottomControlInset,
-                  bottom: 10 * playerControlScale,
-                  child: IgnorePointer(
-                    ignoring: !_playerOverlaysVisible,
-                    child: AnimatedOpacity(
-                      opacity: _playerOverlaysVisible ? 1 : 0,
-                      duration: const Duration(milliseconds: 220),
-                      child: RepaintBoundary(
-                        child: _YoutubeWebControls(
-                          isPlaying: _youtubeWebPlaying,
-                          position: _youtubeWebPosition,
-                          duration: _youtubeWebDuration,
-                          onTogglePlayback: _toggleYoutubeWebPlayback,
-                          onSeek: _seekYoutubeWebPlayer,
-                          formatTime: _formatPlaybackTime,
-                          onFocusChanged: _setPlayerControlsFocused,
-                          playButtonFocusNode: _playerBottomPlayFocusNode,
-                          progressFocusNode: _playerBottomProgressFocusNode,
-                          controlScale: playerControlScale,
+                if (_upcomingCardsEnabled)
+                  Positioned(
+                    right: 46,
+                    bottom: 72,
+                    child: IgnorePointer(
+                      ignoring: true,
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 260),
+                        reverseDuration: const Duration(milliseconds: 260),
+                        switchInCurve: Curves.easeOutCubic,
+                        switchOutCurve: Curves.easeInCubic,
+                        child: visibleUpcomingCard == null
+                            ? const SizedBox(
+                                key: ValueKey('upcoming-none'),
+                                width: 300,
+                                height: 170,
+                              )
+                            : KeyedSubtree(
+                                key: ValueKey(
+                                  'upcoming-${_upcomingCardPhase.name}-'
+                                  '${_seriesKeyFor(visibleUpcomingCard)}-'
+                                  '${visibleUpcomingCard.episodeNumber}',
+                                ),
+                                child: _UpcomingCard(
+                                  label: _visibleUpcomingCardLabel(),
+                                  labelColor: _visibleUpcomingCardColor(),
+                                  episode: visibleUpcomingCard,
+                                ),
+                              ),
+                      ),
+                    ),
+                  ),
+                if (_openedMedia &&
+                    _androidExoController?.value.isInitialized == true)
+                  Positioned(
+                    left: bottomControlInset,
+                    right: bottomControlInset,
+                    bottom: 10 * playerControlScale,
+                    child: IgnorePointer(
+                      ignoring: !_playerOverlaysVisible,
+                      child: AnimatedOpacity(
+                        opacity: _playerOverlaysVisible ? 1 : 0,
+                        duration: const Duration(milliseconds: 220),
+                        child: RepaintBoundary(
+                          child: _AndroidExoControls(
+                            controller: _androidExoController!,
+                            onTogglePlayback: _toggleAndroidExoPlayback,
+                            onSeek: _seekAndroidExoPlayer,
+                            formatTime: _formatPlaybackTime,
+                            onFocusChanged: _setPlayerControlsFocused,
+                            playButtonFocusNode: _playerBottomPlayFocusNode,
+                            progressFocusNode: _playerBottomProgressFocusNode,
+                            controlScale: playerControlScale,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-              if (_openedMedia && _desktopVlcPlayer != null)
-                Positioned(
-                  left: bottomControlInset,
-                  right: bottomControlInset,
-                  bottom: 10 * playerControlScale,
-                  child: IgnorePointer(
-                    ignoring: !_playerOverlaysVisible,
-                    child: AnimatedOpacity(
-                      opacity: _playerOverlaysVisible ? 1 : 0,
-                      duration: const Duration(milliseconds: 220),
-                      child: RepaintBoundary(
-                        child: _DesktopVlcControls(
-                          player: _desktopVlcPlayer!,
-                          onTogglePlayback: _toggleDesktopVlcPlayback,
-                          onSeek: _seekDesktopVlcPlayer,
-                          formatTime: _formatPlaybackTime,
-                          onFocusChanged: _setPlayerControlsFocused,
-                          playButtonFocusNode: _playerBottomPlayFocusNode,
-                          progressFocusNode: _playerBottomProgressFocusNode,
-                          controlScale: playerControlScale,
+                if (_openedMedia &&
+                    _youtubeWebController != null &&
+                    !useDesktopYoutubeWebControls)
+                  Positioned(
+                    left: bottomControlInset,
+                    right: bottomControlInset,
+                    bottom: 10 * playerControlScale,
+                    child: IgnorePointer(
+                      ignoring: !_playerOverlaysVisible,
+                      child: AnimatedOpacity(
+                        opacity: _playerOverlaysVisible ? 1 : 0,
+                        duration: const Duration(milliseconds: 220),
+                        child: RepaintBoundary(
+                          child: _YoutubeWebControls(
+                            isPlaying: _youtubeWebPlaying,
+                            position: _youtubeWebPosition,
+                            duration: _youtubeWebDuration,
+                            onTogglePlayback: _toggleYoutubeWebPlayback,
+                            onSeek: _seekYoutubeWebPlayer,
+                            formatTime: _formatPlaybackTime,
+                            onFocusChanged: _setPlayerControlsFocused,
+                            playButtonFocusNode: _playerBottomPlayFocusNode,
+                            progressFocusNode: _playerBottomProgressFocusNode,
+                            controlScale: playerControlScale,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-            ],
+                if (_openedMedia && _desktopVlcPlayer != null)
+                  Positioned(
+                    left: bottomControlInset,
+                    right: bottomControlInset,
+                    bottom: 10 * playerControlScale,
+                    child: IgnorePointer(
+                      ignoring: !_playerOverlaysVisible,
+                      child: AnimatedOpacity(
+                        opacity: _playerOverlaysVisible ? 1 : 0,
+                        duration: const Duration(milliseconds: 220),
+                        child: RepaintBoundary(
+                          child: _DesktopVlcControls(
+                            player: _desktopVlcPlayer!,
+                            onTogglePlayback: _toggleDesktopVlcPlayback,
+                            onSeek: _seekDesktopVlcPlayer,
+                            formatTime: _formatPlaybackTime,
+                            onFocusChanged: _setPlayerControlsFocused,
+                            playButtonFocusNode: _playerBottomPlayFocusNode,
+                            progressFocusNode: _playerBottomProgressFocusNode,
+                            controlScale: playerControlScale,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
         ),
       ),
@@ -4537,19 +4576,33 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!mounted) {
       return;
     }
-    if (_playerControlsFocused != focused) {
-      setState(() {
-        _playerControlsFocused = focused;
-        if (focused) {
-          _playerOverlaysVisible = true;
-        }
-      });
-    }
+    final ticket = ++_playerControlsFocusTicket;
     if (focused) {
       _playerOverlayHideTimer?.cancel();
-    } else {
-      _schedulePlayerOverlayHide();
+      if (!_playerControlsFocused || !_playerOverlaysVisible) {
+        setState(() {
+          _playerControlsFocused = true;
+          _playerOverlaysVisible = true;
+        });
+      }
+      return;
     }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || ticket != _playerControlsFocusTicket) {
+        return;
+      }
+      if (_hasFocusedPlayerControl) {
+        return;
+      }
+      if (!_playerControlsFocused) {
+        _schedulePlayerOverlayHide();
+        return;
+      }
+      setState(() {
+        _playerControlsFocused = false;
+      });
+      _schedulePlayerOverlayHide();
+    });
   }
 
   KeyEventResult _handlePlayerRootKey(FocusNode node, KeyEvent event) {
@@ -9484,6 +9537,22 @@ bool shouldReportAndroidExoPositionStall({
 }
 
 bool shouldRebuildAndroidExoProgress({
+  required bool overlaysVisible,
+  required bool controlsFocused,
+  required bool dialogOpen,
+  required bool subtitlesEnabled,
+  required String captionText,
+}) {
+  return shouldRebuildPlayerProgressUi(
+    overlaysVisible: overlaysVisible,
+    controlsFocused: controlsFocused,
+    dialogOpen: dialogOpen,
+    subtitlesEnabled: subtitlesEnabled,
+    captionText: captionText,
+  );
+}
+
+bool shouldRebuildPlayerProgressUi({
   required bool overlaysVisible,
   required bool controlsFocused,
   required bool dialogOpen,

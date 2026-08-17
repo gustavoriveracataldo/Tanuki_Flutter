@@ -1299,11 +1299,21 @@ class AppController extends ChangeNotifier {
 
   Future<void> initialize() async {
     _state = await _store.load();
+    final loadedRemoteLibrary = _state.remoteLibrary;
+    final compactRemoteLibrary =
+        _compactMyAnimeListPlaceholders(loadedRemoteLibrary);
+    final compactedRemoteLibrary =
+        !identical(compactRemoteLibrary, loadedRemoteLibrary);
     _state = _state.copyWith(
-      remoteLibrary: _applyFillerCacheToLibrary(_state.remoteLibrary),
+      remoteLibrary: _applyFillerCacheToLibrary(
+        compactRemoteLibrary,
+      ),
     );
     _storePath = await _store.storagePath();
     notifyListeners();
+    if (compactedRemoteLibrary) {
+      unawaited(_save(notify: false));
+    }
     unawaited(_consumeInitialNativeDeepLink());
     if (_state.rootPaths.isNotEmpty) {
       await rescanLibrary();
@@ -4502,7 +4512,7 @@ class AppController extends ChangeNotifier {
         .toList();
     return state.copyWith(
       remoteLibrary: _mergeRemoteLibraryByKey(
-        state.remoteLibrary,
+        _compactMyAnimeListPlaceholders(state.remoteLibrary),
         placeholders,
       ),
       profile: profile,
@@ -4560,8 +4570,8 @@ class AppController extends ChangeNotifier {
     final title = entry.title.trim().isEmpty
         ? 'MyAnimeList ${entry.malId > 0 ? entry.malId : seriesKey}'
         : entry.title.trim();
-    final episodes = List.generate(count, (index) {
-      final episodeNumber = index + 1;
+    final episodes = List.generate(1, (index) {
+      const episodeNumber = 1;
       return EpisodeItem(
         seriesName: title,
         seriesStateKey: seriesKey,
@@ -4583,7 +4593,7 @@ class AppController extends ChangeNotifier {
       seriesStateKey: seriesKey,
       sourceType: SourceType.remote,
       slug: entry.malId > 0 ? '${entry.malId}' : '',
-      episodeCount: episodes.length,
+      episodeCount: count,
       imageUrl: entry.imageUrl,
       episodes: episodes,
       releaseYear: entry.year,
@@ -5103,6 +5113,36 @@ class AppController extends ChangeNotifier {
       );
     }
     return merged.values.toList();
+  }
+
+  List<SeriesItem> _compactMyAnimeListPlaceholders(List<SeriesItem> library) {
+    var changed = false;
+    final compacted = library.map((series) {
+      if (!_isExpandableMyAnimeListPlaceholder(series)) {
+        return series;
+      }
+      changed = true;
+      return series.copyWith(
+        episodeCount: max(series.episodeCount, series.episodes.length),
+        episodes: [series.episodes.first],
+      );
+    }).toList(growable: false);
+    return changed ? compacted : library;
+  }
+
+  bool _isExpandableMyAnimeListPlaceholder(SeriesItem series) {
+    if (series.sourceType != SourceType.remote ||
+        series.provider != null ||
+        series.catalogId <= 0 ||
+        series.episodes.length <= 1) {
+      return false;
+    }
+    return series.episodes.every((episode) {
+      return episode.filePath.trim().isEmpty &&
+          episode.watchUrl.trim().isEmpty &&
+          episode.provider == null &&
+          episode.relativePath.startsWith('MyAnimeList / ');
+    });
   }
 
   String _spaceStatusFromMyAnimeList(MyAnimeListRemoteStatus status) {
