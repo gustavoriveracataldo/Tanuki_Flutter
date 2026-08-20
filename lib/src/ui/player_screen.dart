@@ -153,6 +153,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _playerBuffering = false;
   bool _playerVolumeSliderVisible = false;
   bool _suppressNextPlayerActivationKeyUp = false;
+  bool _suppressNextPlayerActivationKeyUpFromDialog = false;
   double _subtitleTimingOffsetSeconds = 0.0;
   double _subtitleFontScale = 1.0;
   double _playerVolume = 1.0;
@@ -4542,6 +4543,10 @@ class _PlayerScreenState extends State<PlayerScreen>
       _showPlayerOverlays();
       return;
     }
+    if (_playerDialogOpen) {
+      _showPlayerOverlays();
+      return;
+    }
     final nextVisible = !_playerOverlaysVisible;
     setState(() {
       _playerOverlaysVisible = nextVisible;
@@ -4559,11 +4564,14 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   void _schedulePlayerOverlayHide() {
     _playerOverlayHideTimer?.cancel();
-    if (!_openedMedia || _playerControlsFocused) {
+    if (!_openedMedia || _playerControlsFocused || _playerDialogOpen) {
       return;
     }
     _playerOverlayHideTimer = Timer(_playerOverlayAutoHideDelay, () {
-      if (!mounted || !_openedMedia) {
+      if (!mounted ||
+          !_openedMedia ||
+          _playerControlsFocused ||
+          _playerDialogOpen) {
         return;
       }
       setState(() {
@@ -4606,11 +4614,20 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   KeyEventResult _handlePlayerRootKey(FocusNode node, KeyEvent event) {
+    if (_playerDialogOpen) {
+      _showPlayerOverlays();
+      return KeyEventResult.ignored;
+    }
     final key = event.logicalKey;
     if (event is KeyUpEvent && _isPlayerActivationKey(key)) {
       if (_suppressNextPlayerActivationKeyUp) {
+        final suppressFromDialog = _suppressNextPlayerActivationKeyUpFromDialog;
         _suppressNextPlayerActivationKeyUp = false;
-        return KeyEventResult.handled;
+        _suppressNextPlayerActivationKeyUpFromDialog = false;
+        if (!suppressFromDialog ||
+            DateTime.now().isBefore(_suppressPlayerDialogOpenUntil)) {
+          return KeyEventResult.handled;
+        }
       }
       if (_activeAnimeSkipInterval != null) {
         unawaited(_skipActiveAnimeSegment());
@@ -4647,6 +4664,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _showPlayerOverlays();
       _requestPlayerControlFocus(preferBottom: true);
       _suppressNextPlayerActivationKeyUp = true;
+      _suppressNextPlayerActivationKeyUpFromDialog = false;
       return KeyEventResult.handled;
     }
     if (_playerControlsFocused && key == LogicalKeyboardKey.arrowDown) {
@@ -4699,6 +4717,10 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   KeyEventResult _handlePlayerBackKey(KeyEvent event) {
+    if (_playerDialogOpen) {
+      _showPlayerOverlays();
+      return KeyEventResult.ignored;
+    }
     if (event is KeyDownEvent) {
       if (_playerRemoteBackKeyDown) {
         return KeyEventResult.handled;
@@ -4741,6 +4763,13 @@ class _PlayerScreenState extends State<PlayerScreen>
       _playerOverlayHideTimer?.cancel();
     }
     return KeyEventResult.handled;
+  }
+
+  void _resetPlayerRemoteBackState() {
+    _playerRemoteBackKeyDown = false;
+    _playerRemoteBackLongPressTriggered = false;
+    _playerRemoteBackHoldTimer?.cancel();
+    _playerRemoteBackHoldTimer = null;
   }
 
   void _triggerPlayerRemoteBackLongPressExit() {
@@ -4848,6 +4877,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _cancelRemoteVideoFrameWatchdog();
     _cancelDeferredAnimeAv1PlaybackError();
     _playerOverlayHideTimer?.cancel();
+    _resetPlayerRemoteBackState();
     unawaited(_pauseSimklScrobble());
     FocusManager.instance.primaryFocus?.unfocus();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4859,7 +4889,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   void _requestPlayerControlFocus({bool preferBottom = false}) {
-    if (!mounted) {
+    if (!mounted || _playerDialogOpen) {
       return;
     }
     if (preferBottom && _playerBottomPlayFocusNode.canRequestFocus) {
@@ -5675,21 +5705,27 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!mounted) {
       return;
     }
+    _resetPlayerRemoteBackState();
     _suppressPlayerDialogOpenUntil =
         DateTime.now().add(_playerDialogReopenSuppressDelay);
     _suppressNextPlayerActivationKeyUp = true;
+    _suppressNextPlayerActivationKeyUpFromDialog = true;
     _playerControlsRootFocusNode.requestFocus();
+    _schedulePlayerOverlayHide();
   }
 
   Future<void> _showEpisodeListPanel() async {
     if (!_canOpenPlayerDialog) {
       return;
     }
+    _resetPlayerRemoteBackState();
     _playerDialogOpen = true;
     _showPlayerOverlays();
     final series = widget.controller.findSeriesForEpisode(widget.episode);
     if (series == null || series.episodes.isEmpty) {
       _playerDialogOpen = false;
+      _resetPlayerRemoteBackState();
+      _suppressPlayerDialogReopen();
       return;
     }
     EpisodeItem? selected;
@@ -5708,6 +5744,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       );
     } finally {
       _playerDialogOpen = false;
+      _resetPlayerRemoteBackState();
       _suppressPlayerDialogReopen();
     }
     final selectedEpisode = selected;
@@ -5731,6 +5768,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!_canOpenPlayerDialog) {
       return;
     }
+    _resetPlayerRemoteBackState();
     _playerDialogOpen = true;
     _showPlayerOverlays();
     var preference =
@@ -6481,6 +6519,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         node.dispose();
       }
       _playerDialogOpen = false;
+      _resetPlayerRemoteBackState();
       _suppressPlayerDialogReopen();
     }
   }

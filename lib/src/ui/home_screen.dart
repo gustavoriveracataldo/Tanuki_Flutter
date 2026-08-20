@@ -3,8 +3,9 @@ import 'dart:io' as io;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:qr_flutter/qr_flutter.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../app_controller.dart';
@@ -15,10 +16,11 @@ import 'player_screen.dart';
 import 'toonami_theme.dart';
 import 'trailer_queue_screen.dart';
 
-const _appVersionLabel = '1.7.5';
+const _appVersionLabel = '1.7.8';
 const _homeContinueWatchingLimit = 48;
 const _homeHeroRandomLibraryLimit = 180;
 String? _lastFocusedHomeShelfId;
+FocusNode? _lastFocusedHomePosterNode;
 DateTime _suppressHomeActivationUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
 void _suppressHomeActivation([
@@ -41,6 +43,20 @@ enum _Section {
   settings,
 }
 
+enum _HeroPreviewSource {
+  none,
+  continueWatching,
+  remoteCandidate,
+  seasonCandidate,
+  selectedSeries,
+}
+
+enum _HeroActionMode {
+  none,
+  initialWatchlist,
+  continueWatching,
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
@@ -60,6 +76,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final FocusNode _homeContentFocusNode = FocusNode(
     debugLabel: 'homeFirstContent',
   );
+  final FocusNode _heroPlayFocusNode = FocusNode(debugLabel: 'heroPlayAction');
   final FocusNode _detailContentFocusNode = FocusNode(
     debugLabel: 'detailEpisodeContent',
   );
@@ -69,6 +86,7 @@ class _HomeScreenState extends State<HomeScreen> {
   SeriesItem? _selectedSeries;
   _Section? _detailReturnSection;
   SeriesItem? _heroPreviewSeries;
+  _HeroPreviewSource _heroPreviewSource = _HeroPreviewSource.none;
   final SeriesItem? _similarSeries = null;
   final List<RemoteSearchCandidate> _similarResults = const [];
   List<RemoteSearchCandidate> _detailSimilarResults = const [];
@@ -95,6 +113,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final String _similarStatus = '';
   String _detailSimilarStatus = '';
   bool _profilePickerVisible = false;
+  bool _initialHomeLoading = true;
+  bool _initialSplashVisible = true;
+  bool _initialHeroFocusRequested = false;
   bool _handlingTrailerDetailRequest = false;
   bool _playerRouteActive = false;
   DateTime _lastPlayerReturnAt = DateTime.fromMillisecondsSinceEpoch(0);
@@ -110,9 +131,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadAndroidMediaCapabilities();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        unawaited(_loadHomeTrending());
-        unawaited(_loadHomeAiring());
-        unawaited(_loadHomeMovies());
+        unawaited(_loadInitialHomeData());
         _handlePendingTrailerDetailRequest();
       }
     });
@@ -139,6 +158,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _sideAnimeFocusNode.dispose();
     _searchFieldFocusNode.dispose();
     _homeContentFocusNode.dispose();
+    _heroPlayFocusNode.dispose();
     _detailContentFocusNode.dispose();
     _detailActionFocusNodes.dispose();
     _animePanelScrollOffset.dispose();
@@ -167,6 +187,11 @@ class _HomeScreenState extends State<HomeScreen> {
           animation: widget.controller,
           builder: (context, _) {
             final heroSeries = _resolveHeroSeries(widget.controller);
+            final heroActionMode = _resolveHeroActionMode(
+              widget.controller,
+              heroSeries,
+            );
+            _scheduleInitialHeroFocus(heroActionMode);
             _scheduleContinueWatchingVisualHydration(widget.controller);
             final overscanHorizontal =
                 widget.controller.state.overscanHorizontal;
@@ -265,6 +290,20 @@ class _HomeScreenState extends State<HomeScreen> {
                                   onDeleteProfile: _deleteProfile,
                                 ),
                               ),
+                            if (_initialSplashVisible)
+                              Positioned.fill(
+                                child: _InitialHomeSplash(
+                                  key: const ValueKey('initial-home-splash'),
+                                  loading: _initialHomeLoading,
+                                  onHidden: () {
+                                    if (mounted && !_initialHomeLoading) {
+                                      setState(() {
+                                        _initialSplashVisible = false;
+                                      });
+                                    }
+                                  },
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -330,6 +369,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _resetAnimePanelOpacity();
       if (section == _Section.anime) {
         _selectedSeries = null;
+        _heroPreviewSeries = null;
+        _heroPreviewSource = _HeroPreviewSource.none;
       }
     });
     if (section == _Section.search && widget.controller.remoteResults.isEmpty) {
@@ -351,16 +392,81 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  _HeroActionMode _resolveHeroActionMode(
+    AppController controller,
+    SeriesItem? heroSeries,
+  ) {
+    if (heroSeries == null || _selectedSeries != null) {
+      return _HeroActionMode.none;
+    }
+    if (_heroPreviewSource == _HeroPreviewSource.continueWatching) {
+      return _HeroActionMode.continueWatching;
+    }
+    if (_heroPreviewSource == _HeroPreviewSource.seasonCandidate) {
+      return _HeroActionMode.none;
+    }
+    if (_heroPreviewSeries != null ||
+        _heroPreviewSource != _HeroPreviewSource.none) {
+      return _HeroActionMode.none;
+    }
+    final watchlistKeys =
+        _normalizedHeroKeys(controller.state.profile.watchlistSeries);
+    return _seriesMatchesNormalizedKeys(heroSeries, watchlistKeys)
+        ? _HeroActionMode.initialWatchlist
+        : _HeroActionMode.none;
+  }
+
+  void _scheduleInitialHeroFocus(_HeroActionMode heroActionMode) {
+    if (_initialHeroFocusRequested ||
+        _initialHomeLoading ||
+        heroActionMode != _HeroActionMode.initialWatchlist) {
+      return;
+    }
+    _initialHeroFocusRequested = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_heroPlayFocusNode.canRequestFocus) {
+        return;
+      }
+      _heroPlayFocusNode.requestFocus();
+    });
+  }
+
+  Future<void> _loadInitialHomeData() async {
+    final startedAt = DateTime.now();
+    await Future.wait<void>([
+      _loadHomeTrending(),
+      _loadHomeAiring(),
+      _loadHomeMovies(),
+    ]);
+    final remaining = const Duration(milliseconds: 650) -
+        DateTime.now().difference(startedAt);
+    if (remaining > Duration.zero) {
+      await Future<void>.delayed(remaining);
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _initialHomeLoading = false;
+    });
+  }
+
   Widget _buildAnimePanel(AppController controller) {
+    final recommendedHeroSeries = _resolveRecommendedHeroSeries(
+      controller,
+      trendingCandidates: _homeTrendingResults,
+      movieCandidates: _homeMovieResults,
+    );
     return _AnimePanel(
       controller: controller,
       selectedSeries: _selectedSeries,
       heroPreviewSeries: _heroPreviewSeries,
-      recommendedHeroSeries: _resolveRecommendedHeroSeries(
+      recommendedHeroSeries: recommendedHeroSeries,
+      heroActionMode: _resolveHeroActionMode(
         controller,
-        trendingCandidates: _homeTrendingResults,
-        movieCandidates: _homeMovieResults,
+        _selectedSeries ?? _heroPreviewSeries ?? recommendedHeroSeries,
       ),
+      heroPlayFocusNode: _heroPlayFocusNode,
       detailBackLabel: _detailBackLabel,
       detailSimilarCandidates: _detailSimilarResults,
       detailSimilarStatus: _detailSimilarStatus,
@@ -393,6 +499,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onContinueWatchingGoToSeries: _openContinueWatchingSeriesDetail,
       onSeriesSelected: _selectSeries,
       onPreviewSeries: _previewSeries,
+      onPreviewSeasonCandidate: _previewSeasonCandidate,
       onPreviewRemoteCandidate: _previewRemoteCandidate,
       onResetSeriesVisuals: _resetSelectedSeriesVisuals,
     );
@@ -446,6 +553,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _detailReturnSection =
           origin == _Section.anime || origin == _Section.random ? null : origin;
       _heroPreviewSeries = series;
+      _heroPreviewSource = _HeroPreviewSource.selectedSeries;
       _section = _Section.anime;
       _resetAnimePanelOpacity();
       _detailImporting = importing;
@@ -472,22 +580,43 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _previewSeries(SeriesItem series) {
     if (_selectedSeries?.stableKey == series.stableKey ||
-        _heroPreviewSeries?.stableKey == series.stableKey) {
+        (_heroPreviewSeries?.stableKey == series.stableKey &&
+            _heroPreviewSource == _HeroPreviewSource.continueWatching)) {
       return;
     }
     setState(() {
       _heroPreviewSeries = series;
+      _heroPreviewSource = _HeroPreviewSource.continueWatching;
     });
   }
 
   void _previewRemoteCandidate(RemoteSearchCandidate candidate) {
+    _previewRemoteCandidateWithSource(
+      candidate,
+      source: _HeroPreviewSource.remoteCandidate,
+    );
+  }
+
+  void _previewSeasonCandidate(RemoteSearchCandidate candidate) {
+    _previewRemoteCandidateWithSource(
+      candidate,
+      source: _HeroPreviewSource.seasonCandidate,
+    );
+  }
+
+  void _previewRemoteCandidateWithSource(
+    RemoteSearchCandidate candidate, {
+    required _HeroPreviewSource source,
+  }) {
     unawaited(_refreshHomeVisualsNear(candidate));
     final preview = candidate.toSeries(existingNames: const []);
-    if (_heroPreviewSeries?.stableKey == preview.stableKey) {
+    if (_heroPreviewSeries?.stableKey == preview.stableKey &&
+        _heroPreviewSource == source) {
       return;
     }
     setState(() {
       _heroPreviewSeries = preview;
+      _heroPreviewSource = source;
     });
   }
 
@@ -573,6 +702,8 @@ class _HomeScreenState extends State<HomeScreen> {
           refreshed.logoUrl != series.logoUrl;
       setState(() {
         _selectedSeries = refreshed;
+        _heroPreviewSeries = refreshed;
+        _heroPreviewSource = _HeroPreviewSource.selectedSeries;
       });
       if (similarIdentityChanged) {
         unawaited(_loadDetailSimilar(refreshed));
@@ -614,6 +745,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _selectedSeries = refreshed;
       _heroPreviewSeries = refreshed;
+      _heroPreviewSource = _HeroPreviewSource.selectedSeries;
       _detailImporting = false;
     });
     unawaited(_loadDetailSimilar(refreshed));
@@ -655,6 +787,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _selectedSeries = null;
       _detailReturnSection = null;
       _detailImporting = false;
+      _heroPreviewSeries = null;
+      _heroPreviewSource = _HeroPreviewSource.none;
       if (returnSection != null) {
         _section = returnSection;
       }
@@ -1087,9 +1221,12 @@ class _HomeScreenState extends State<HomeScreen> {
     List<RemoteSearchCandidate> candidates,
   ) {
     final preview = _heroPreviewSeries;
-    if (preview == null) {
+    if (preview == null ||
+        (_heroPreviewSource != _HeroPreviewSource.remoteCandidate &&
+            _heroPreviewSource != _HeroPreviewSource.seasonCandidate)) {
       return;
     }
+    final source = _heroPreviewSource;
     final refreshedPreview = candidates.firstWhere(
       (candidate) => normalizeSeriesKey(candidate.title) == preview.stableKey,
       orElse: () => const RemoteSearchCandidate(
@@ -1100,6 +1237,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (refreshedPreview.title.isNotEmpty) {
       _heroPreviewSeries = refreshedPreview.toSeries(existingNames: const []);
+      _heroPreviewSource = source;
     }
   }
 
@@ -1391,6 +1529,13 @@ class _SideRailState extends State<_SideRail> {
     }
     if (widget.activeSection != _Section.anime) {
       return KeyEventResult.ignored;
+    }
+    final lastPosterFocusNode = _lastFocusedHomePosterNode;
+    if (lastPosterFocusNode != null &&
+        lastPosterFocusNode != widget.homeContentFocusNode &&
+        lastPosterFocusNode.canRequestFocus) {
+      lastPosterFocusNode.requestFocus();
+      return KeyEventResult.handled;
     }
     if (widget.homeContentFocusNode.canRequestFocus) {
       widget.homeContentFocusNode.requestFocus();
@@ -2095,6 +2240,86 @@ enum _ProfileOverlayMode {
   rename,
   avatar,
   delete,
+}
+
+class _InitialHomeSplash extends StatefulWidget {
+  const _InitialHomeSplash({
+    super.key,
+    required this.loading,
+    required this.onHidden,
+  });
+
+  final bool loading;
+  final VoidCallback onHidden;
+
+  @override
+  State<_InitialHomeSplash> createState() => _InitialHomeSplashState();
+}
+
+class _InitialHomeSplashState extends State<_InitialHomeSplash> {
+  static const _logoAsset = 'assets/images/tanuki_brand_logo.png';
+
+  bool _logoVisible = true;
+  bool _exitStarted = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    precacheImage(const AssetImage(_logoAsset), context);
+  }
+
+  @override
+  void didUpdateWidget(covariant _InitialHomeSplash oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.loading && !widget.loading) {
+      _startExit();
+    }
+  }
+
+  void _startExit() {
+    if (_exitStarted) {
+      return;
+    }
+    _exitStarted = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _logoVisible = false;
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.sizeOf(context);
+    final shortestSide = size.width < size.height ? size.width : size.height;
+    final logoSize = (shortestSide * 0.34).clamp(180.0, 360.0);
+
+    return IgnorePointer(
+      child: ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: RepaintBoundary(
+            child: AnimatedOpacity(
+              opacity: _logoVisible ? 1 : 0,
+              duration: const Duration(milliseconds: 760),
+              curve: Curves.easeInOutCubic,
+              onEnd: _logoVisible ? null : widget.onHidden,
+              child: Image.asset(
+                _logoAsset,
+                width: logoSize,
+                height: logoSize,
+                fit: BoxFit.contain,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _HomeFocusTargets extends InheritedWidget {
@@ -3903,6 +4128,8 @@ class _AnimePanel extends StatelessWidget {
     required this.selectedSeries,
     required this.heroPreviewSeries,
     required this.recommendedHeroSeries,
+    required this.heroActionMode,
+    required this.heroPlayFocusNode,
     required this.detailBackLabel,
     required this.detailSimilarCandidates,
     required this.detailSimilarStatus,
@@ -3932,6 +4159,7 @@ class _AnimePanel extends StatelessWidget {
     required this.onContinueWatchingGoToSeries,
     required this.onSeriesSelected,
     required this.onPreviewSeries,
+    required this.onPreviewSeasonCandidate,
     required this.onPreviewRemoteCandidate,
     required this.onResetSeriesVisuals,
   });
@@ -3940,6 +4168,8 @@ class _AnimePanel extends StatelessWidget {
   final SeriesItem? selectedSeries;
   final SeriesItem? heroPreviewSeries;
   final SeriesItem? recommendedHeroSeries;
+  final _HeroActionMode heroActionMode;
+  final FocusNode heroPlayFocusNode;
   final String detailBackLabel;
   final List<RemoteSearchCandidate> detailSimilarCandidates;
   final String detailSimilarStatus;
@@ -3969,6 +4199,7 @@ class _AnimePanel extends StatelessWidget {
   final ValueChanged<SeriesItem> onContinueWatchingGoToSeries;
   final ValueChanged<SeriesItem> onSeriesSelected;
   final ValueChanged<SeriesItem> onPreviewSeries;
+  final ValueChanged<RemoteSearchCandidate> onPreviewSeasonCandidate;
   final ValueChanged<RemoteSearchCandidate> onPreviewRemoteCandidate;
   final ValueChanged<SeriesItem> onResetSeriesVisuals;
 
@@ -3992,6 +4223,9 @@ class _AnimePanel extends StatelessWidget {
     final seasonTitle = controller.currentSeasonFilter.summaryLabel.isEmpty
         ? 'Temporada actual'
         : controller.currentSeasonFilter.summaryLabel;
+    final heroTrailerActionLabel = seasonTitle == 'Temporada actual'
+        ? 'Trailers Anime'
+        : 'Trailers Anime $seasonTitle';
 
     final screenHeight = MediaQuery.sizeOf(context).height;
     final heroHeight = (screenHeight * 0.36).clamp(320.0, 480.0);
@@ -4037,7 +4271,6 @@ class _AnimePanel extends StatelessWidget {
           entries: continueWatching,
           firstFocusNode: homeContentFocusNode,
           onPlayEpisode: onPlayEpisode,
-          onPlayQueue: onPlayContinueWatchingQueue,
           onStopWatchingSeries: onStopWatchingSeries,
           onAbandonSeries: onAbandonSeries,
           onGoToSeries: onContinueWatchingGoToSeries,
@@ -4058,8 +4291,7 @@ class _AnimePanel extends StatelessWidget {
               focusContinueWatchingFirst ? null : homeContentFocusNode,
           loading: trendingLoading,
           onCandidateSelected: onRemoteCandidateSelected,
-          onCandidateFocused: onPreviewRemoteCandidate,
-          onPlayTrailers: onPlayTrendingTrailers,
+          onCandidateFocused: onPreviewSeasonCandidate,
           showScheduleChip: false,
         ),
       ));
@@ -4171,8 +4403,13 @@ class _AnimePanel extends StatelessWidget {
               controller: controller,
               series: hero,
               height: heroHeight,
+              actionMode: heroActionMode,
+              playFocusNode: heroPlayFocusNode,
               onPlayEpisode: onPlayEpisode,
               onOpenTrailer: onOpenSeriesTrailer,
+              onPlayContinueWatchingQueue: onPlayContinueWatchingQueue,
+              onPlayTrendingTrailers: onPlayTrendingTrailers,
+              trendingTrailersLabel: heroTrailerActionLabel,
             ),
           ),
         ],
@@ -4297,6 +4534,12 @@ class _RandomLoadingPanel extends StatelessWidget {
 }
 
 const double _homePosterScale = 1.5;
+const double _horizontalShelfFocusAlignment = 0.06;
+const double _focusedPosterScale = 1.045;
+const Duration _homeHorizontalFocusScrollDuration = Duration(milliseconds: 340);
+const Duration _homeHorizontalFocusMoveInterval = Duration(milliseconds: 115);
+const Duration _homeVerticalFocusScrollDuration = Duration(milliseconds: 260);
+const Duration _homePosterFocusScaleDuration = Duration(milliseconds: 170);
 
 double _homeShelfPosterHeight(
   BuildContext context, {
@@ -4312,6 +4555,15 @@ double _homeResponsiveValue(BuildContext context, double base,
   final scale = (width / 960).clamp(0.88, 1.24);
   final value = base * scale;
   return value.clamp(min == 0 ? base * 0.8 : min, max);
+}
+
+EdgeInsets _homeHorizontalShelfPadding(BuildContext context, double itemWidth) {
+  final viewportWidth = MediaQuery.sizeOf(context).width;
+  final trailingPadding =
+      (viewportWidth * (1 - _horizontalShelfFocusAlignment) - itemWidth)
+          .clamp(18.0, viewportWidth)
+          .toDouble();
+  return EdgeInsets.fromLTRB(16, 2, trailingPadding, 6);
 }
 
 class _HorizontalFocusShelf extends StatelessWidget {
@@ -4387,6 +4639,9 @@ class _HorizontalFocusShelfBinding extends InheritedWidget {
 
 class _HorizontalFocusShelfController {
   final Map<FocusNode, BuildContext> _nodes = {};
+  FocusNode? _anchoredMoveTarget;
+  DateTime _lastHorizontalMoveAt = DateTime.fromMillisecondsSinceEpoch(0);
+  bool? _lastHorizontalMoveForward;
 
   void register(FocusNode node, BuildContext context) {
     _nodes[node] = context;
@@ -4396,11 +4651,18 @@ class _HorizontalFocusShelfController {
     _nodes.remove(node);
   }
 
-  _HorizontalFocusMoveResult moveFrom(FocusNode node, {required bool forward}) {
+  _HorizontalFocusMoveResult moveFrom(
+    FocusNode node, {
+    required bool forward,
+    required bool repeated,
+  }) {
     final nodes = _orderedNodes();
     final focusedIndex = nodes.indexOf(node);
     if (focusedIndex < 0) {
       return _HorizontalFocusMoveResult.unavailable;
+    }
+    if (_shouldThrottleMove(forward: forward, repeated: repeated)) {
+      return _HorizontalFocusMoveResult.throttled;
     }
     final targetIndex = focusedIndex + (forward ? 1 : -1);
     if (targetIndex < 0 || targetIndex >= nodes.length) {
@@ -4408,14 +4670,83 @@ class _HorizontalFocusShelfController {
     }
     final target = nodes[targetIndex];
     if (target.canRequestFocus) {
+      final targetContext = _nodes[target];
+      final scrollPosition = _horizontalScrollPositionOf(targetContext);
+      final targetRenderObject = targetContext?.findRenderObject();
+      final canAnchor = targetRenderObject != null && scrollPosition != null;
+      if (canAnchor) {
+        _anchoredMoveTarget = target;
+      }
       target.requestFocus();
+      if (canAnchor) {
+        _scrollToFocusAnchor(scrollPosition, targetRenderObject);
+      }
+      _markHorizontalMove(forward: forward);
       return _HorizontalFocusMoveResult.moved;
     }
     return _HorizontalFocusMoveResult.edge;
   }
 
+  bool consumeAnchoredMove(FocusNode node) {
+    if (_anchoredMoveTarget != node) {
+      return false;
+    }
+    _anchoredMoveTarget = null;
+    return true;
+  }
+
   void dispose() {
     _nodes.clear();
+  }
+
+  bool _shouldThrottleMove({
+    required bool forward,
+    required bool repeated,
+  }) {
+    final lastForward = _lastHorizontalMoveForward;
+    if (lastForward != null && lastForward != forward) {
+      return false;
+    }
+    final elapsed = DateTime.now().difference(_lastHorizontalMoveAt);
+    final interval = repeated
+        ? _homeHorizontalFocusMoveInterval
+        : const Duration(milliseconds: 70);
+    return elapsed < interval;
+  }
+
+  void _markHorizontalMove({required bool forward}) {
+    _lastHorizontalMoveAt = DateTime.now();
+    _lastHorizontalMoveForward = forward;
+  }
+
+  ScrollPosition? _horizontalScrollPositionOf(BuildContext? context) {
+    if (context == null) {
+      return null;
+    }
+    final scrollable = Scrollable.maybeOf(context);
+    if (scrollable == null) {
+      return null;
+    }
+    final position = scrollable.position;
+    if (axisDirectionToAxis(position.axisDirection) != Axis.horizontal ||
+        !position.hasPixels ||
+        !position.hasContentDimensions) {
+      return null;
+    }
+    return position;
+  }
+
+  void _scrollToFocusAnchor(ScrollPosition position, RenderObject target) {
+    if (!target.attached) {
+      return;
+    }
+    position.ensureVisible(
+      target,
+      duration: _homeHorizontalFocusScrollDuration,
+      curve: Curves.easeInOutCubic,
+      alignment: _horizontalShelfFocusAlignment,
+      alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
+    );
   }
 
   List<FocusNode> _orderedNodes() {
@@ -4443,6 +4774,7 @@ class _HorizontalFocusShelfController {
 
 enum _HorizontalFocusMoveResult {
   moved,
+  throttled,
   edge,
   unavailable,
 }
@@ -4459,20 +4791,33 @@ double _heroLogoHeight(BuildContext context) =>
 double _heroTitleFontSize(BuildContext context) =>
     _homeResponsiveValue(context, 34, min: 26, max: 42);
 
+double _heroQuickActionWidth(BuildContext context) =>
+    _homeResponsiveValue(context, 236, min: 198, max: 284);
+
 class _HeroBlock extends StatelessWidget {
   const _HeroBlock({
     required this.controller,
     required this.series,
     required this.height,
+    required this.actionMode,
+    required this.playFocusNode,
     required this.onPlayEpisode,
     required this.onOpenTrailer,
+    required this.onPlayContinueWatchingQueue,
+    required this.onPlayTrendingTrailers,
+    required this.trendingTrailersLabel,
   });
 
   final AppController controller;
   final SeriesItem? series;
   final double height;
+  final _HeroActionMode actionMode;
+  final FocusNode playFocusNode;
   final ValueChanged<EpisodeItem> onPlayEpisode;
   final ValueChanged<SeriesItem> onOpenTrailer;
+  final VoidCallback onPlayContinueWatchingQueue;
+  final VoidCallback onPlayTrendingTrailers;
+  final String trendingTrailersLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -4484,107 +4829,143 @@ class _HeroBlock extends StatelessWidget {
         : 'Playlist nocturna, biblioteca local y catalogo anime en una interfaz TV.';
     final nextEpisode =
         series == null ? null : controller.firstPlayableEpisode(series!);
+    final showActions = series != null && actionMode != _HeroActionMode.none;
+    final quickActionWidth = _heroQuickActionWidth(context);
     final maxHeroTextWidth =
         (MediaQuery.sizeOf(context).width * 0.55).clamp(340.0, 520.0);
     return Container(
       height: height,
       padding: const EdgeInsets.fromLTRB(20, 14, 20, 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Stack(
+        clipBehavior: Clip.none,
         children: [
-          Expanded(
-            child: Align(
-              alignment: Alignment.topLeft,
-              child: ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: maxHeroTextWidth),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _Badge(text: _heroBadge(series)),
-                    const SizedBox(height: 10),
-                    if (series?.logoUrl.isNotEmpty == true)
-                      SizedBox(
-                        height: _heroLogoHeight(context),
-                        child: _FadeInNetworkImage(
-                          imageUrl: series!.logoUrl,
-                          fit: BoxFit.contain,
-                          alignment: Alignment.centerLeft,
-                          cacheWidth: 720,
-                          errorBuilder: (_, __, ___) =>
-                              _HeroTitleFallback(title: title),
-                        ),
-                      )
-                    else if (series == null)
-                      Image.asset(
-                        'assets/images/tanuki_brand_logo.png',
-                        width: (MediaQuery.sizeOf(context).width * 0.27)
-                            .clamp(200.0, 280.0),
-                        height: _heroLogoHeight(context),
+          Align(
+            alignment: Alignment.topLeft,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: maxHeroTextWidth),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _Badge(text: _heroBadge(series)),
+                  const SizedBox(height: 10),
+                  if (series?.logoUrl.isNotEmpty == true)
+                    SizedBox(
+                      height: _heroLogoHeight(context),
+                      child: _FadeInNetworkImage(
+                        imageUrl: series!.logoUrl,
                         fit: BoxFit.contain,
-                      )
-                    else
-                      _HeroTitleFallback(title: title),
-                    if (meta.isNotEmpty) ...[
-                      const SizedBox(height: 6),
-                      Text(
-                        meta,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFFF0B760),
-                          fontSize: 13,
-                          fontWeight: FontWeight.w800,
-                        ),
+                        alignment: Alignment.centerLeft,
+                        cacheWidth: 720,
+                        errorBuilder: (_, __, ___) =>
+                            _HeroTitleFallback(title: title),
                       ),
-                    ],
-                    const SizedBox(height: 8),
+                    )
+                  else if (series == null)
+                    Image.asset(
+                      'assets/images/tanuki_brand_logo.png',
+                      width: (MediaQuery.sizeOf(context).width * 0.27)
+                          .clamp(200.0, 280.0),
+                      height: _heroLogoHeight(context),
+                      fit: BoxFit.contain,
+                    )
+                  else
+                    _HeroTitleFallback(title: title),
+                  if (meta.isNotEmpty) ...[
+                    const SizedBox(height: 6),
                     Text(
-                      _compactDescription(description),
+                      meta,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(height: 1.35),
+                      style: const TextStyle(
+                        color: Color(0xFFF0B760),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
+                  ],
+                  const SizedBox(height: 8),
+                  Text(
+                    _compactDescription(description),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(height: 1.35),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (showActions)
+            Positioned(
+              left: 0,
+              right: quickActionWidth + 18,
+              bottom: 0,
+              child: FocusTraversalGroup(
+                policy: WidgetOrderTraversalPolicy(),
+                child: Wrap(
+                  spacing: 10,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    _HeroIconButton(
+                      icon: Icons.play_arrow,
+                      tooltip: 'Reproducir',
+                      focusNode: playFocusNode,
+                      onPressed: nextEpisode == null
+                          ? null
+                          : () => onPlayEpisode(nextEpisode),
+                      primary: true,
+                    ),
+                    _HeroIconButton(
+                      icon: controller.isSelected(series!)
+                          ? Icons.check
+                          : Icons.add,
+                      tooltip: controller.isSelected(series!)
+                          ? 'Agregada'
+                          : 'Agregar',
+                      onPressed: () =>
+                          controller.toggleSeriesSelection(series!),
+                    ),
+                    if (series?.trailerUrl.isNotEmpty == true)
+                      _HeroIconButton(
+                        icon: Icons.movie_filter,
+                        tooltip: 'Trailer',
+                        onPressed: () => onOpenTrailer(series!),
+                      ),
+                    if (rating.isNotEmpty) _HeroRatingPill(text: rating),
                   ],
                 ),
               ),
             ),
-          ),
-          if (series != null)
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                _HeroIconButton(
-                  icon: Icons.play_arrow,
-                  tooltip: 'Reproducir',
-                  onPressed: nextEpisode == null
-                      ? null
-                      : () => onPlayEpisode(nextEpisode),
-                  primary: true,
+          if (showActions)
+            Positioned(
+              right: 0,
+              bottom: 0,
+              width: quickActionWidth,
+              child: FocusTraversalGroup(
+                policy: WidgetOrderTraversalPolicy(),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _HeroQuickActionButton(
+                      icon: Icons.queue_play_next,
+                      label: 'Lista continuar viendo',
+                      tooltip: 'Lista continuar viendo',
+                      onPressed: onPlayContinueWatchingQueue,
+                    ),
+                    const SizedBox(height: 8),
+                    _HeroQuickActionButton(
+                      icon: Icons.video_library,
+                      label: trendingTrailersLabel,
+                      tooltip: trendingTrailersLabel,
+                      onPressed: onPlayTrendingTrailers,
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 10),
-                _HeroIconButton(
-                  icon:
-                      controller.isSelected(series!) ? Icons.check : Icons.add,
-                  tooltip:
-                      controller.isSelected(series!) ? 'Agregada' : 'Agregar',
-                  onPressed: () => controller.toggleSeriesSelection(series!),
-                ),
-                if (series?.trailerUrl.isNotEmpty == true) ...[
-                  const SizedBox(height: 10),
-                  _HeroIconButton(
-                    icon: Icons.movie_filter,
-                    tooltip: 'Trailer',
-                    onPressed: () => onOpenTrailer(series!),
-                  ),
-                ],
-                if (rating.isNotEmpty) ...[
-                  const SizedBox(height: 10),
-                  _HeroRatingPill(text: rating),
-                ],
-              ],
+              ),
             ),
         ],
       ),
@@ -4661,12 +5042,14 @@ class _HeroIconButton extends StatefulWidget {
     required this.icon,
     required this.tooltip,
     required this.onPressed,
+    this.focusNode,
     this.primary = false,
   });
 
   final IconData icon;
   final String tooltip;
   final VoidCallback? onPressed;
+  final FocusNode? focusNode;
   final bool primary;
 
   @override
@@ -4674,8 +5057,10 @@ class _HeroIconButton extends StatefulWidget {
 }
 
 class _HeroIconButtonState extends State<_HeroIconButton> {
-  final FocusNode _focusNode = FocusNode(debugLabel: 'homeHeroAction');
+  final FocusNode _internalFocusNode = FocusNode(debugLabel: 'homeHeroAction');
   bool _focused = false;
+
+  FocusNode get _focusNode => widget.focusNode ?? _internalFocusNode;
 
   @override
   void initState() {
@@ -4684,9 +5069,21 @@ class _HeroIconButtonState extends State<_HeroIconButton> {
   }
 
   @override
+  void didUpdateWidget(covariant _HeroIconButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.focusNode == widget.focusNode) {
+      return;
+    }
+    (oldWidget.focusNode ?? _internalFocusNode)
+        .removeListener(_handleFocusChanged);
+    _focusNode.addListener(_handleFocusChanged);
+    _handleFocusChanged();
+  }
+
+  @override
   void dispose() {
     _focusNode.removeListener(_handleFocusChanged);
-    _focusNode.dispose();
+    _internalFocusNode.dispose();
     super.dispose();
   }
 
@@ -4718,15 +5115,147 @@ class _HeroIconButtonState extends State<_HeroIconButton> {
               iconSize: _heroIconSize(context),
               style: IconButton.styleFrom(
                 fixedSize: Size(buttonSide, buttonSide),
-                backgroundColor:
-                    widget.primary ? Colors.white : const Color(0x554A5E72),
-                foregroundColor:
-                    widget.primary ? TanukiColors.background : Colors.white,
+                backgroundColor: _focused
+                    ? TanukiColors.orangeHot
+                    : widget.primary
+                        ? Colors.white
+                        : const Color(0x554A5E72),
+                foregroundColor: _focused
+                    ? Colors.black
+                    : widget.primary
+                        ? TanukiColors.background
+                        : Colors.white,
                 disabledForegroundColor: TanukiColors.subtle,
+                side: BorderSide(
+                  color: _focused ? Colors.white : Colors.transparent,
+                  width: _focused ? 2 : 0,
+                ),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(buttonSide / 2),
                 ),
               ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HeroQuickActionButton extends StatefulWidget {
+  const _HeroQuickActionButton({
+    required this.icon,
+    required this.label,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String label;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  State<_HeroQuickActionButton> createState() => _HeroQuickActionButtonState();
+}
+
+class _HeroQuickActionButtonState extends State<_HeroQuickActionButton> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'homeHeroQuickAction');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_handleFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_handleFocusChanged);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() {
+    final focused = _focusNode.hasFocus;
+    if (_focused != focused) {
+      setState(() => _focused = focused);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final collapsedWidth = _heroButtonSide(context);
+    final buttonHeight = _heroButtonSide(context);
+    const labelStyle = TextStyle(
+      fontSize: 13,
+      fontWeight: FontWeight.w900,
+    );
+    final iconSize = _heroIconSize(context) * 0.78;
+    final textPainter = TextPainter(
+      text: TextSpan(text: widget.label, style: labelStyle),
+      maxLines: 1,
+      textDirection: Directionality.of(context),
+    )..layout();
+    final expandedWidth = (iconSize + 10 + textPainter.width + 34)
+        .clamp(collapsedWidth, _heroQuickActionWidth(context))
+        .toDouble();
+
+    return Tooltip(
+      message: widget.tooltip,
+      child: AnimatedScale(
+        scale: _focused ? 1.06 : 1,
+        alignment: Alignment.centerRight,
+        duration: const Duration(milliseconds: 130),
+        curve: Curves.easeOutCubic,
+        child: AnimatedContainer(
+          width: _focused ? expandedWidth : collapsedWidth,
+          height: buttonHeight,
+          duration: const Duration(milliseconds: 170),
+          curve: Curves.easeOutCubic,
+          child: TextButton(
+            focusNode: _focusNode,
+            onPressed: widget.onPressed,
+            style: TextButton.styleFrom(
+              fixedSize: Size(
+                _focused ? expandedWidth : collapsedWidth,
+                buttonHeight,
+              ),
+              minimumSize: Size.zero,
+              padding: EdgeInsets.symmetric(horizontal: _focused ? 14 : 0),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              backgroundColor:
+                  _focused ? TanukiColors.orangeHot : const Color(0xAA101821),
+              foregroundColor: _focused ? Colors.black : Colors.white,
+              side: BorderSide(
+                color: _focused ? Colors.white : const Color(0x55FFFFFF),
+                width: _focused ? 2 : 1,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(buttonHeight / 2),
+              ),
+            ),
+            child: Row(
+              mainAxisAlignment:
+                  _focused ? MainAxisAlignment.start : MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.max,
+              children: [
+                Icon(widget.icon, size: iconSize),
+                if (_focused) const SizedBox(width: 10),
+                if (_focused)
+                  Flexible(
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        widget.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.left,
+                        style: labelStyle,
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
         ),
@@ -6268,7 +6797,6 @@ class _TrendingPosterShelf extends StatelessWidget {
     required this.loading,
     required this.onCandidateSelected,
     required this.onCandidateFocused,
-    required this.onPlayTrailers,
     this.showScheduleChip = false,
   });
 
@@ -6279,7 +6807,6 @@ class _TrendingPosterShelf extends StatelessWidget {
   final bool loading;
   final ValueChanged<RemoteSearchCandidate> onCandidateSelected;
   final ValueChanged<RemoteSearchCandidate> onCandidateFocused;
-  final VoidCallback onPlayTrailers;
   final bool showScheduleChip;
 
   @override
@@ -6295,28 +6822,11 @@ class _TrendingPosterShelf extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: _SectionHeader(
-                title: title,
-                trailing: loading
-                    ? 'Cargando portada...'
-                    : '${visibleCandidates.length} series',
-              ),
-            ),
-            const SizedBox(width: 8),
-            _ShelfActionButton(
-              onPressed: visibleCandidates.any(
-                        (candidate) => candidate.trailerUrl.isNotEmpty,
-                      ) &&
-                      !loading
-                  ? onPlayTrailers
-                  : null,
-              icon: Icons.movie_filter,
-              tooltip: 'Reproducir trailers',
-            ),
-          ],
+        _SectionHeader(
+          title: title,
+          trailing: loading
+              ? 'Cargando portada...'
+              : '${visibleCandidates.length} series',
         ),
         const SizedBox(height: 4),
         SizedBox(
@@ -6327,7 +6837,9 @@ class _TrendingPosterShelf extends StatelessWidget {
                   child: ListView.separated(
                     scrollDirection: Axis.horizontal,
                     clipBehavior: Clip.none,
-                    padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                    scrollCacheExtent:
+                        ScrollCacheExtent.pixels(posterWidth * 3),
+                    padding: _homeHorizontalShelfPadding(context, posterWidth),
                     itemBuilder: (context, index) {
                       final candidate = visibleCandidates[index];
                       final importedSeries =
@@ -6481,7 +6993,10 @@ class _UpcomingPosterShelf extends StatelessWidget {
                     child: ListView.separated(
                       scrollDirection: Axis.horizontal,
                       clipBehavior: Clip.none,
-                      padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+                      scrollCacheExtent:
+                          ScrollCacheExtent.pixels(posterWidth * 3),
+                      padding:
+                          _homeHorizontalShelfPadding(context, posterWidth),
                       itemBuilder: (context, index) {
                         final candidate = candidates[index];
                         final importedSeries =
@@ -6649,7 +7164,6 @@ class _ContinueWatchingShelf extends StatelessWidget {
     required this.entries,
     required this.firstFocusNode,
     required this.onPlayEpisode,
-    required this.onPlayQueue,
     required this.onStopWatchingSeries,
     required this.onAbandonSeries,
     required this.onGoToSeries,
@@ -6659,7 +7173,6 @@ class _ContinueWatchingShelf extends StatelessWidget {
   final List<_ContinueWatchingEntry> entries;
   final FocusNode? firstFocusNode;
   final ValueChanged<EpisodeItem> onPlayEpisode;
-  final VoidCallback onPlayQueue;
   final ValueChanged<SeriesItem> onStopWatchingSeries;
   final ValueChanged<SeriesItem> onAbandonSeries;
   final ValueChanged<SeriesItem> onGoToSeries;
@@ -6683,22 +7196,9 @@ class _ContinueWatchingShelf extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: _SectionHeader(
-                title: 'Continuar viendo',
-                trailing: '${entries.length} series',
-              ),
-            ),
-            const SizedBox(width: 8),
-            _ShelfActionButton(
-              onPressed:
-                  entries.any((entry) => entry.enabled) ? onPlayQueue : null,
-              icon: Icons.queue_play_next,
-              tooltip: 'Reproducir una por serie',
-            ),
-          ],
+        _SectionHeader(
+          title: 'Continuar viendo',
+          trailing: '${entries.length} series',
         ),
         const SizedBox(height: 4),
         SizedBox(
@@ -6707,7 +7207,8 @@ class _ContinueWatchingShelf extends StatelessWidget {
             child: ListView.separated(
               clipBehavior: Clip.none,
               scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.fromLTRB(16, 2, 18, 6),
+              scrollCacheExtent: ScrollCacheExtent.pixels(cardWidth * 3),
+              padding: _homeHorizontalShelfPadding(context, cardWidth),
               itemBuilder: (context, index) {
                 final entry = entries[index];
                 return _ContinueWatchingPosterCard(
@@ -9676,8 +10177,8 @@ void _ensureFocusedShelfVisible(
     final phoneUi = _HomePhoneUi.enabledOf(context);
     Scrollable.ensureVisible(
       context,
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOutCubic,
+      duration: _homeVerticalFocusScrollDuration,
+      curve: Curves.easeOutQuart,
       alignment: shelfChanged ? (phoneUi ? 0.86 : 0.76) : 0.72,
       alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
     );
@@ -10258,6 +10759,9 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
     if (oldFocusNode == _focusNode) {
       return;
     }
+    if (_lastFocusedHomePosterNode == oldFocusNode) {
+      _lastFocusedHomePosterNode = _focusNode;
+    }
     _horizontalShelf?.unregister(oldFocusNode);
     _horizontalShelf?.register(_focusNode, context);
   }
@@ -10265,6 +10769,9 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
   @override
   void dispose() {
     _remoteLongPressTimer?.cancel();
+    if (_lastFocusedHomePosterNode == _focusNode) {
+      _lastFocusedHomePosterNode = null;
+    }
     _horizontalShelf?.unregister(_focusNode);
     _internalFocusNode.dispose();
     super.dispose();
@@ -10288,12 +10795,17 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
         final result = _horizontalShelf?.moveFrom(
               _focusNode,
               forward: forward,
+              repeated: event is KeyRepeatEvent,
             ) ??
             _HorizontalFocusMoveResult.unavailable;
-        if (result == _HorizontalFocusMoveResult.moved) {
+        if (result == _HorizontalFocusMoveResult.moved ||
+            result == _HorizontalFocusMoveResult.throttled) {
           return KeyEventResult.handled;
         }
         if (result == _HorizontalFocusMoveResult.edge) {
+          if (forward) {
+            return KeyEventResult.handled;
+          }
           if (_horizontalScrollHasRoom(context, forward: forward)) {
             return KeyEventResult.ignored;
           }
@@ -10375,18 +10887,24 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
         }
         widget.onFocusChanged?.call(value);
         if (value) {
+          _lastFocusedHomePosterNode = _focusNode;
           widget.onFocused?.call();
-          _ensureFocusableVisible(context, alignment: 0.54);
+          if (_horizontalShelf?.consumeAnchoredMove(_focusNode) != true) {
+            _ensureFocusableVisible(
+              context,
+              alignment: _horizontalShelfFocusAlignment,
+            );
+          }
         }
       },
       child: RepaintBoundary(
         child: AnimatedScale(
-          scale: _active ? 1.015 : 1,
-          duration: const Duration(milliseconds: 120),
-          curve: Curves.easeOut,
+          scale: _active ? _focusedPosterScale : 1,
+          duration: _homePosterFocusScaleDuration,
+          curve: Curves.easeOutCubic,
           child: Material(
             color: Colors.transparent,
-            elevation: _active ? 12 : widget.elevation,
+            elevation: _active ? 16 : widget.elevation,
             shadowColor: const Color(0x77000000),
             borderRadius: BorderRadius.circular(8),
             clipBehavior: Clip.antiAlias,
@@ -10624,8 +11142,8 @@ void _ensureFocusableVisible(
   }
   scrollable.position.ensureVisible(
     renderObject,
-    duration: const Duration(milliseconds: 160),
-    curve: Curves.easeOutCubic,
+    duration: _homeHorizontalFocusScrollDuration,
+    curve: Curves.easeInOutCubic,
     alignment: alignment,
     alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
   );

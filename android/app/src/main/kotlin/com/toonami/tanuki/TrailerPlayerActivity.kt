@@ -43,6 +43,7 @@ class TrailerPlayerActivity : Activity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val hideOverlayRunnable = Runnable { overlay.visibility = View.GONE }
+    private val playbackPowerKeeper by lazy { PlaybackPowerKeeper(this) }
     private val entries = mutableListOf<QueueEntry>()
 
     private lateinit var root: FrameLayout
@@ -63,6 +64,7 @@ class TrailerPlayerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+        playbackPowerKeeper.setEnabled(true)
 
         queueTitle = intent.getStringExtra(EXTRA_TITLE).orEmpty()
         entries += parseEntries(intent.getStringExtra(EXTRA_ENTRIES).orEmpty())
@@ -94,6 +96,11 @@ class TrailerPlayerActivity : Activity() {
         )
         setContentView(root)
         loadCurrentTrailer()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        playbackPowerKeeper.onResume()
     }
 
     @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
@@ -394,6 +401,7 @@ class TrailerPlayerActivity : Activity() {
     }
 
     override fun onDestroy() {
+        playbackPowerKeeper.dispose()
         handler.removeCallbacksAndMessages(null)
         hideCustomView()
         runCatching { webView.stopLoading() }

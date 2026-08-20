@@ -6,7 +6,6 @@ import android.content.res.Configuration
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.os.Build
-import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -21,8 +20,8 @@ class MainActivity : FlutterActivity() {
     private val playbackPowerChannelName = "tanuki/playback_power"
     private var deepLinksChannel: MethodChannel? = null
     private var remoteWebResolver: RemoteWebResolver? = null
+    private val playbackPowerKeeper by lazy { PlaybackPowerKeeper(this) }
     private var pendingLink: String? = null
-    private var playbackKeepScreenOn = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -106,13 +105,11 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (playbackKeepScreenOn) {
-            setPlaybackKeepScreenOn(true)
-        }
+        playbackPowerKeeper.onResume()
     }
 
     override fun onDestroy() {
-        setPlaybackKeepScreenOn(false)
+        playbackPowerKeeper.dispose()
         super.onDestroy()
     }
 
@@ -132,15 +129,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun setPlaybackKeepScreenOn(enabled: Boolean) {
-        playbackKeepScreenOn = enabled
-        runOnUiThread {
-            if (enabled) {
-                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            } else {
-                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            }
-            window.decorView.keepScreenOn = enabled
-        }
+        runOnUiThread { playbackPowerKeeper.setEnabled(enabled) }
     }
 
     private fun trailerEntriesJson(entries: List<Map<String, Any?>>): JSONArray {
