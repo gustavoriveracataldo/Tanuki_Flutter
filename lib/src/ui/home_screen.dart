@@ -7819,13 +7819,71 @@ class _SearchPanel extends StatefulWidget {
 }
 
 class _SearchPanelState extends State<_SearchPanel> {
+  final ScrollController _searchScrollController = ScrollController();
   final FocusNode _firstFilterFocusNode =
       FocusNode(debugLabel: 'searchFirstFilter');
+  final FocusNode _firstResultFocusNode =
+      FocusNode(debugLabel: 'searchFirstResult');
+  bool _wasSearching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _wasSearching = widget.controller.isSearching;
+    widget.controller.addListener(_handleControllerChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _SearchPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) {
+      return;
+    }
+    oldWidget.controller.removeListener(_handleControllerChanged);
+    _wasSearching = widget.controller.isSearching;
+    widget.controller.addListener(_handleControllerChanged);
+  }
 
   @override
   void dispose() {
+    widget.controller.removeListener(_handleControllerChanged);
+    _searchScrollController.dispose();
     _firstFilterFocusNode.dispose();
+    _firstResultFocusNode.dispose();
     super.dispose();
+  }
+
+  void _handleControllerChanged() {
+    final isSearching = widget.controller.isSearching;
+    final finishedSearchWithResults = _wasSearching &&
+        !isSearching &&
+        widget.controller.remoteResults.isNotEmpty;
+    _wasSearching = isSearching;
+    if (!finishedSearchWithResults || !mounted) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_firstResultFocusNode.canRequestFocus) {
+        return;
+      }
+      _firstResultFocusNode.requestFocus();
+      _revealSearchTopControls();
+    });
+  }
+
+  void _revealSearchTopControls() {
+    if (!_searchScrollController.hasClients) {
+      return;
+    }
+    final position = _searchScrollController.position;
+    if (!position.hasPixels || position.pixels <= 0) {
+      return;
+    }
+    unawaited(_searchScrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+    ));
   }
 
   KeyEventResult _handleSearchFieldKey(FocusNode node, KeyEvent event) {
@@ -7841,6 +7899,7 @@ class _SearchPanelState extends State<_SearchPanel> {
     final scope = FocusScope.of(context);
     if (key == LogicalKeyboardKey.arrowDown) {
       _firstFilterFocusNode.requestFocus();
+      _revealSearchTopControls();
     } else {
       scope.previousFocus();
     }
@@ -7855,6 +7914,7 @@ class _SearchPanelState extends State<_SearchPanel> {
       return KeyEventResult.ignored;
     }
     widget.searchFieldFocusNode.requestFocus();
+    _revealSearchTopControls();
     return KeyEventResult.handled;
   }
 
@@ -7866,6 +7926,7 @@ class _SearchPanelState extends State<_SearchPanel> {
       return KeyEventResult.ignored;
     }
     _firstFilterFocusNode.requestFocus();
+    _revealSearchTopControls();
     return KeyEventResult.handled;
   }
 
@@ -7883,6 +7944,7 @@ class _SearchPanelState extends State<_SearchPanel> {
         return false;
       },
       child: SingleChildScrollView(
+        controller: _searchScrollController,
         clipBehavior: Clip.none,
         padding: const EdgeInsets.only(left: 20, bottom: 16),
         child: Column(
@@ -8012,10 +8074,11 @@ class _SearchPanelState extends State<_SearchPanel> {
                           .floor()
                           .clamp(4, 7)
                           .toInt();
-                  final spacing = 6.0;
+                  const spacing = 14.0;
                   final cardWidth =
                       (constraints.maxWidth - spacing * (columns - 1)) /
                           columns;
+                  final cardHeight = cardWidth * 1.5;
                   return Wrap(
                     spacing: spacing,
                     runSpacing: spacing,
@@ -8027,9 +8090,12 @@ class _SearchPanelState extends State<_SearchPanel> {
                               .findRemoteSeriesForCandidate(entry.value);
                           return SizedBox(
                             width: cardWidth,
-                            height: 208,
+                            height: cardHeight,
                             child: _SearchResultPosterCard(
                               candidate: entry.value,
+                              focusNode:
+                                  entry.key == 0 ? _firstResultFocusNode : null,
+                              ensureVisibleOnFocus: false,
                               spaceStatus: importedSeries == null
                                   ? ''
                                   : controller.spaceStatusFor(importedSeries),
@@ -8148,6 +8214,7 @@ class _SearchResultPosterCard extends StatefulWidget {
     required this.onTap,
     this.spaceStatus = '',
     this.focusNode,
+    this.ensureVisibleOnFocus = true,
     this.onFocused,
     this.onLongPress,
     this.onArrowUp,
@@ -8159,6 +8226,7 @@ class _SearchResultPosterCard extends StatefulWidget {
   final String spaceStatus;
   final VoidCallback onTap;
   final FocusNode? focusNode;
+  final bool ensureVisibleOnFocus;
   final VoidCallback? onFocused;
   final VoidCallback? onLongPress;
   final FocusOnKeyEventCallback? onArrowUp;
@@ -8178,8 +8246,11 @@ class _SearchResultPosterCardState extends State<_SearchResultPosterCard> {
     final scheduleLabel = _candidateScheduleChipLabel(widget.candidate);
     final relationLabel = widget.candidate.relationLabel.trim();
     final spaceStatus = widget.spaceStatus.trim();
+    final showEpisodeCount = !_candidateLooksMovieForCard(widget.candidate) &&
+        widget.candidate.episodeCount > 0;
     return _FocusablePosterSurface(
       focusNode: widget.focusNode,
+      ensureVisibleOnFocus: widget.ensureVisibleOnFocus,
       onTap: widget.onTap,
       onFocused: widget.onFocused,
       onLongPress: widget.onLongPress,
@@ -8198,32 +8269,31 @@ class _SearchResultPosterCardState extends State<_SearchResultPosterCard> {
             imageUrl: widget.candidate.imageUrl,
             title: widget.candidate.title,
           ),
-          Positioned(
-            left: 5,
-            top: 5,
-            child: Container(
-              width: 28,
-              height: 28,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: const Color(0xD6101822),
-                shape: BoxShape.circle,
-                border: Border.all(color: TanukiColors.orangeHot, width: 2),
-              ),
-              child: Text(
-                widget.candidate.episodeCount > 0
-                    ? '${widget.candidate.episodeCount}'
-                    : '?',
-                maxLines: 1,
-                overflow: TextOverflow.fade,
-                style: const TextStyle(
-                  color: TanukiColors.text,
-                  fontSize: 9,
-                  fontWeight: FontWeight.w900,
+          if (showEpisodeCount)
+            Positioned(
+              left: 5,
+              top: 5,
+              child: Container(
+                width: 28,
+                height: 28,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: const Color(0xD6101822),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: TanukiColors.orangeHot, width: 2),
+                ),
+                child: Text(
+                  '${widget.candidate.episodeCount}',
+                  maxLines: 1,
+                  overflow: TextOverflow.fade,
+                  style: const TextStyle(
+                    color: TanukiColors.text,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w900,
+                  ),
                 ),
               ),
             ),
-          ),
           if (spaceStatus.isNotEmpty)
             Positioned(
               left: 5,
@@ -8250,34 +8320,39 @@ class _SearchResultPosterCardState extends State<_SearchResultPosterCard> {
             left: 0,
             right: 0,
             bottom: 0,
-            child: Container(
-              padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
-              color: const Color(0xB010161D),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    widget.candidate.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: TanukiColors.text,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
+            child: AnimatedOpacity(
+              opacity: _focused ? 1 : 0,
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(7, 6, 7, 7),
+                color: const Color(0xB010161D),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      widget.candidate.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: TanukiColors.text,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    _formatCandidateMeta(widget.candidate),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Color(0xFFB1C0CF),
-                      fontSize: 9,
+                    const SizedBox(height: 2),
+                    Text(
+                      _formatCandidateMeta(widget.candidate),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Color(0xFFB1C0CF),
+                        fontSize: 9,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -10282,13 +10357,26 @@ String _monthLabel(int month) {
 }
 
 String _formatCandidateMeta(RemoteSearchCandidate candidate) {
+  final isMovie = _candidateLooksMovieForCard(candidate);
   final parts = [
     if (candidate.format.isNotEmpty) candidate.format,
     if (candidate.releaseYear > 0) '${candidate.releaseYear}',
-    if (candidate.episodeCount > 0) '${candidate.episodeCount} eps',
+    if (!isMovie && candidate.episodeCount > 0) '${candidate.episodeCount} eps',
     if (candidate.rating.isNotEmpty) 'Score ${candidate.rating}',
   ];
   return parts.isEmpty ? 'Serie remota' : parts.join(' | ');
+}
+
+bool _candidateLooksMovieForCard(RemoteSearchCandidate candidate) {
+  final format = normalizeSeriesKey(candidate.format);
+  if (format.contains('movie') || format.contains('pelicula')) {
+    return true;
+  }
+  final slug = candidate.slug.toLowerCase();
+  final url = '${candidate.watchUrl} ${candidate.seriesUrl}'.toLowerCase();
+  return slug.startsWith('tmdb-movie-') ||
+      url.contains('themoviedb.org/movie/') ||
+      url.contains('/movie/');
 }
 
 String _formatMySpaceSummary(int totalSaved) {
@@ -10705,6 +10793,7 @@ class _FocusablePosterSurface extends StatefulWidget {
     required this.child,
     required this.onTap,
     this.focusNode,
+    this.ensureVisibleOnFocus = true,
     this.onFocused,
     this.onFocusChanged,
     this.onLongPress,
@@ -10716,6 +10805,7 @@ class _FocusablePosterSurface extends StatefulWidget {
   final Widget child;
   final VoidCallback onTap;
   final FocusNode? focusNode;
+  final bool ensureVisibleOnFocus;
   final VoidCallback? onFocused;
   final ValueChanged<bool>? onFocusChanged;
   final VoidCallback? onLongPress;
@@ -10889,7 +10979,8 @@ class _FocusablePosterSurfaceState extends State<_FocusablePosterSurface> {
         if (value) {
           _lastFocusedHomePosterNode = _focusNode;
           widget.onFocused?.call();
-          if (_horizontalShelf?.consumeAnchoredMove(_focusNode) != true) {
+          if (widget.ensureVisibleOnFocus &&
+              _horizontalShelf?.consumeAnchoredMove(_focusNode) != true) {
             _ensureFocusableVisible(
               context,
               alignment: _horizontalShelfFocusAlignment,

@@ -1490,6 +1490,7 @@ class UserProfileState {
     this.preferredRemoteProvider,
     this.seriesPlaybackPreferences = const {},
     this.currentEntry,
+    this.subtitleFontScale = 1.0,
     this.myAnimeListAuth = const MyAnimeListAuthState(),
     this.myAnimeListMappings = const {},
     this.simklAuth = const SimklAuthState(),
@@ -1511,6 +1512,7 @@ class UserProfileState {
   final RemoteProvider? preferredRemoteProvider;
   final Map<String, SeriesPlaybackPreference> seriesPlaybackPreferences;
   final EpisodeItem? currentEntry;
+  final double subtitleFontScale;
   final MyAnimeListAuthState myAnimeListAuth;
   final Map<String, int> myAnimeListMappings;
   final SimklAuthState simklAuth;
@@ -1561,6 +1563,9 @@ class UserProfileState {
           ? EpisodeItem.fromJson(
               Map<String, dynamic>.from(json['currentEntry'] as Map))
           : null,
+      subtitleFontScale: _readDouble(json['subtitleFontScale'], fallback: 1.0)
+          .clamp(0.6, 2.4)
+          .toDouble(),
       myAnimeListAuth: json['myAnimeListAuth'] is Map
           ? MyAnimeListAuthState.fromJson(
               Map<String, dynamic>.from(json['myAnimeListAuth'] as Map))
@@ -1592,6 +1597,7 @@ class UserProfileState {
     Map<String, SeriesPlaybackPreference>? seriesPlaybackPreferences,
     EpisodeItem? currentEntry,
     bool clearCurrentEntry = false,
+    double? subtitleFontScale,
     MyAnimeListAuthState? myAnimeListAuth,
     Map<String, int>? myAnimeListMappings,
     bool clearMyAnimeList = false,
@@ -1625,6 +1631,9 @@ class UserProfileState {
           seriesPlaybackPreferences ?? this.seriesPlaybackPreferences,
       currentEntry:
           clearCurrentEntry ? null : currentEntry ?? this.currentEntry,
+      subtitleFontScale: (subtitleFontScale ?? this.subtitleFontScale)
+          .clamp(0.6, 2.4)
+          .toDouble(),
       myAnimeListAuth: clearMyAnimeList
           ? const MyAnimeListAuthState()
           : myAnimeListAuth ?? this.myAnimeListAuth,
@@ -1659,6 +1668,7 @@ class UserProfileState {
         (key, value) => MapEntry(key, value.toJson()),
       ),
       'currentEntry': currentEntry?.toJson(),
+      'subtitleFontScale': subtitleFontScale.clamp(0.6, 2.4),
       'myAnimeListAuth': myAnimeListAuth.toJson(),
       'myAnimeListMappings': myAnimeListMappings,
       'simklAuth': simklAuth.toJson(),

@@ -18,7 +18,7 @@ class PlaybackPowerKeeper(private val activity: Activity) {
                 return
             }
             applyKeepScreenOn()
-            acquireWakeLockPulse()
+            acquireWakeLock()
             handler.postDelayed(this, PULSE_INTERVAL_MS)
         }
     }
@@ -27,7 +27,7 @@ class PlaybackPowerKeeper(private val activity: Activity) {
         if (enabled == value) {
             if (value) {
                 applyKeepScreenOn()
-                acquireWakeLockPulse()
+                acquireWakeLock()
             }
             return
         }
@@ -35,7 +35,7 @@ class PlaybackPowerKeeper(private val activity: Activity) {
         handler.removeCallbacks(pulseRunnable)
         if (value) {
             applyKeepScreenOn()
-            acquireWakeLockPulse()
+            acquireWakeLock()
             handler.postDelayed(pulseRunnable, PULSE_INTERVAL_MS)
         } else {
             clearKeepScreenOn()
@@ -46,7 +46,7 @@ class PlaybackPowerKeeper(private val activity: Activity) {
     fun onResume() {
         if (enabled) {
             applyKeepScreenOn()
-            acquireWakeLockPulse()
+            acquireWakeLock()
             handler.removeCallbacks(pulseRunnable)
             handler.postDelayed(pulseRunnable, PULSE_INTERVAL_MS)
         }
@@ -70,7 +70,7 @@ class PlaybackPowerKeeper(private val activity: Activity) {
     }
 
     @Suppress("DEPRECATION")
-    private fun acquireWakeLockPulse() {
+    private fun acquireWakeLock() {
         val lock = wakeLock ?: run {
             val powerManager =
                 activity.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -83,7 +83,9 @@ class PlaybackPowerKeeper(private val activity: Activity) {
             }
         }
         runCatching {
-            lock.acquire(WAKE_LOCK_PULSE_MS)
+            if (!lock.isHeld) {
+                lock.acquire()
+            }
         }
     }
 
@@ -99,6 +101,5 @@ class PlaybackPowerKeeper(private val activity: Activity) {
 
     private companion object {
         const val PULSE_INTERVAL_MS = 25_000L
-        const val WAKE_LOCK_PULSE_MS = 35_000L
     }
 }

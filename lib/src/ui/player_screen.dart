@@ -60,6 +60,8 @@ const _normalizedMaxVolume = 1.0;
 const _youtubeMaxVolume = 100;
 const _mediaCapabilitiesChannel = MethodChannel('tanuki/media_capabilities');
 const _playbackPowerChannel = MethodChannel('tanuki/playback_power');
+const _androidVideoSurfaceChannel =
+    MethodChannel('tanuki/video_player_android_surface');
 int _nextDesktopVlcPlayerId = 1;
 const _androidHardwareDecoderCodecs = 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1';
 const _androidHardwareDecoderCodecsWithoutAv1 =
@@ -140,6 +142,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _desktopVlcAudioFallbackHandled = false;
   bool _desktopVlcDeferredResumeSeekHandled = false;
   bool _desktopVlcRebufferHoldActive = false;
+  int _selectedDesktopVlcAudioTrack = 1;
   Duration? _desktopVlcDeferredResumeSeekTarget;
   DateTime? _desktopVlcDeferredResumeSeekReadyAt;
   bool _handlingAndroidExoError = false;
@@ -170,12 +173,16 @@ class _PlayerScreenState extends State<PlayerScreen>
       FocusNode(debugLabel: 'playerSubtitlesButton');
   final FocusNode _playerFitButtonFocusNode =
       FocusNode(debugLabel: 'playerFitButton');
-  final FocusNode _playerSettingsButtonFocusNode =
-      FocusNode(debugLabel: 'playerSettingsButton');
+  final FocusNode _playerSourcesButtonFocusNode =
+      FocusNode(debugLabel: 'playerSourcesButton');
   final FocusNode _playerEpisodesButtonFocusNode =
       FocusNode(debugLabel: 'playerEpisodesButton');
   final FocusNode _playerVolumeButtonFocusNode =
       FocusNode(debugLabel: 'playerVolumeButton');
+  final FocusNode _playerAudioTracksButtonFocusNode =
+      FocusNode(debugLabel: 'playerAudioTracksButton');
+  final FocusNode _playerQualityButtonFocusNode =
+      FocusNode(debugLabel: 'playerQualityButton');
   final FocusNode _playerFullscreenButtonFocusNode =
       FocusNode(debugLabel: 'playerFullscreenButton');
   final FocusNode _playerBottomPlayFocusNode =
@@ -291,6 +298,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     unawaited(_setPlaybackWakelock(enabled: true));
     _videoScaleMode =
         widget.controller.videoScaleModeForEpisode(widget.episode);
+    _subtitleFontScale = widget.controller.subtitleFontScale;
     _loadAndroidUiCapabilities();
     if (!_usesAndroidExoPlayer &&
         !_usesDesktopVlcPlayer &&
@@ -351,9 +359,11 @@ class _PlayerScreenState extends State<PlayerScreen>
     _playerNextButtonFocusNode.dispose();
     _playerSubtitlesButtonFocusNode.dispose();
     _playerFitButtonFocusNode.dispose();
-    _playerSettingsButtonFocusNode.dispose();
+    _playerSourcesButtonFocusNode.dispose();
     _playerEpisodesButtonFocusNode.dispose();
     _playerVolumeButtonFocusNode.dispose();
+    _playerAudioTracksButtonFocusNode.dispose();
+    _playerQualityButtonFocusNode.dispose();
     _playerFullscreenButtonFocusNode.dispose();
     _playerBottomPlayFocusNode.dispose();
     _playerBottomProgressFocusNode.dispose();
@@ -1070,6 +1080,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       await _applyAndroidExoSubtitleTrack();
       await _preloadAndroidExoStableStartupBuffer(controller);
       _debugPlayerEvent('ExoPlayer play start');
+      unawaited(_setAndroidExoNativeResizeMode(controller));
       await controller.play();
       _scheduleAndroidExoDeferredResumeSeek(controller, resumePosition);
       _debugPlayerEvent('ExoPlayer play requested');
@@ -1083,6 +1094,11 @@ class _PlayerScreenState extends State<PlayerScreen>
         _status = resumePosition == null
             ? 'Reproduciendo con ExoPlayer'
             : 'Reanudado en ${_formatPlaybackTime(resumePosition)}';
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _androidExoController == controller) {
+          unawaited(_setAndroidExoNativeResizeMode(controller));
+        }
       });
       _commitCurrentEntryAfterOpen();
       _scheduleOpeningUpcomingCards();
@@ -1160,6 +1176,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _desktopVlcDeferredResumeSeekHandled = false;
     _desktopVlcDeferredResumeSeekTarget = null;
     _desktopVlcDeferredResumeSeekReadyAt = null;
+    _selectedDesktopVlcAudioTrack = 1;
     _setPlayerBuffering(true);
 
     final resumePosition = resumeOverride ??
@@ -1993,7 +2010,7 @@ class _PlayerScreenState extends State<PlayerScreen>
         unawaited(_playNext());
         return;
       case 'settings':
-        unawaited(_showPlayerSettingsDialog());
+        unawaited(_cycleVideoScaleMode());
         return;
       case 'episodes':
         unawaited(_showEpisodeListPanel());
@@ -4250,9 +4267,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                             _androidExoController?.value.isInitialized == true
                         ? _AndroidExoVideoSurface(
                             controller: _androidExoController!,
-                            fit: _boxFitForVideoScaleMode(_videoScaleMode),
                             subtitlesEnabled: _subtitlesEnabled &&
                                 _remoteSubtitleCues.isEmpty,
+                            subtitleFontScale: _subtitleFontScale,
                           )
                         : _openedMedia && _youtubeWebController != null
                             ? _YoutubeWebVideoSurface(
@@ -4367,29 +4384,49 @@ class _PlayerScreenState extends State<PlayerScreen>
                             onBack: _exitPlayer,
                             onPrevious: _playPrevious,
                             onNext: _playNext,
-                            onSettings: _showPlayerSettingsDialog,
+                            onToggleFit: () =>
+                                unawaited(_cycleVideoScaleMode()),
+                            onSources: () =>
+                                unawaited(_showRemoteSourceSelectorDialog()),
+                            onSubtitles: () =>
+                                unawaited(_showSubtitleTrackDialog()),
+                            onQuality: () =>
+                                unawaited(_showRemoteQualityDialog()),
                             onEpisodes: () =>
                                 unawaited(_showEpisodeListPanel()),
                             onToggleVolume: _togglePlayerMute,
                             onVolumeHoverChanged: _setPlayerVolumeSliderVisible,
                             onVolumeChanged: _setPlayerVolume,
+                            onAudioTracks: () =>
+                                unawaited(_showAudioTrackDialog()),
                             onFullscreen: () =>
                                 unawaited(_toggleFullscreenMode()),
                             onControlFocusChanged: _setPlayerControlsFocused,
                             showVolumeControl: _showsDesktopVolumeControl,
                             showVolumeSlider: _playerVolumeSliderVisible,
                             volume: _playerVolume,
+                            showSubtitleControl: _canShowSubtitleTrackControl,
+                            showAudioTrackControl: _canShowAudioTrackControl,
+                            showQualityControl: _canShowRemoteQualityControl,
                             showFullscreenControl:
                                 _showsPlayerFullscreenControl,
+                            videoScaleMode: _videoScaleMode,
                             backButtonFocusNode: _playerBackButtonFocusNode,
                             previousButtonFocusNode:
                                 _playerPreviousButtonFocusNode,
                             nextButtonFocusNode: _playerNextButtonFocusNode,
-                            settingsButtonFocusNode:
-                                _playerSettingsButtonFocusNode,
+                            fitButtonFocusNode: _playerFitButtonFocusNode,
+                            sourcesButtonFocusNode:
+                                _playerSourcesButtonFocusNode,
                             episodesButtonFocusNode:
                                 _playerEpisodesButtonFocusNode,
                             volumeButtonFocusNode: _playerVolumeButtonFocusNode,
+                            subtitlesButtonFocusNode:
+                                _playerSubtitlesButtonFocusNode,
+                            audioTracksButtonFocusNode:
+                                _playerAudioTracksButtonFocusNode,
+                            qualityButtonFocusNode:
+                                _playerQualityButtonFocusNode,
                             fullscreenButtonFocusNode:
                                 _playerFullscreenButtonFocusNode,
                             controlScale: playerControlScale,
@@ -4441,16 +4478,20 @@ class _PlayerScreenState extends State<PlayerScreen>
                       child: AnimatedOpacity(
                         opacity: _playerOverlaysVisible ? 1 : 0,
                         duration: const Duration(milliseconds: 220),
-                        child: RepaintBoundary(
-                          child: _AndroidExoControls(
-                            controller: _androidExoController!,
-                            onTogglePlayback: _toggleAndroidExoPlayback,
-                            onSeek: _seekAndroidExoPlayer,
-                            formatTime: _formatPlaybackTime,
-                            onFocusChanged: _setPlayerControlsFocused,
-                            playButtonFocusNode: _playerBottomPlayFocusNode,
-                            progressFocusNode: _playerBottomProgressFocusNode,
-                            controlScale: playerControlScale,
+                        child: Listener(
+                          behavior: HitTestBehavior.opaque,
+                          onPointerDown: (_) => _showPlayerOverlays(),
+                          child: RepaintBoundary(
+                            child: _AndroidExoControls(
+                              controller: _androidExoController!,
+                              onTogglePlayback: _toggleAndroidExoPlayback,
+                              onSeek: _seekAndroidExoPlayer,
+                              formatTime: _formatPlaybackTime,
+                              onFocusChanged: _setPlayerControlsFocused,
+                              playButtonFocusNode: _playerBottomPlayFocusNode,
+                              progressFocusNode: _playerBottomProgressFocusNode,
+                              controlScale: playerControlScale,
+                            ),
                           ),
                         ),
                       ),
@@ -4468,18 +4509,22 @@ class _PlayerScreenState extends State<PlayerScreen>
                       child: AnimatedOpacity(
                         opacity: _playerOverlaysVisible ? 1 : 0,
                         duration: const Duration(milliseconds: 220),
-                        child: RepaintBoundary(
-                          child: _YoutubeWebControls(
-                            isPlaying: _youtubeWebPlaying,
-                            position: _youtubeWebPosition,
-                            duration: _youtubeWebDuration,
-                            onTogglePlayback: _toggleYoutubeWebPlayback,
-                            onSeek: _seekYoutubeWebPlayer,
-                            formatTime: _formatPlaybackTime,
-                            onFocusChanged: _setPlayerControlsFocused,
-                            playButtonFocusNode: _playerBottomPlayFocusNode,
-                            progressFocusNode: _playerBottomProgressFocusNode,
-                            controlScale: playerControlScale,
+                        child: Listener(
+                          behavior: HitTestBehavior.opaque,
+                          onPointerDown: (_) => _showPlayerOverlays(),
+                          child: RepaintBoundary(
+                            child: _YoutubeWebControls(
+                              isPlaying: _youtubeWebPlaying,
+                              position: _youtubeWebPosition,
+                              duration: _youtubeWebDuration,
+                              onTogglePlayback: _toggleYoutubeWebPlayback,
+                              onSeek: _seekYoutubeWebPlayer,
+                              formatTime: _formatPlaybackTime,
+                              onFocusChanged: _setPlayerControlsFocused,
+                              playButtonFocusNode: _playerBottomPlayFocusNode,
+                              progressFocusNode: _playerBottomProgressFocusNode,
+                              controlScale: playerControlScale,
+                            ),
                           ),
                         ),
                       ),
@@ -4495,16 +4540,20 @@ class _PlayerScreenState extends State<PlayerScreen>
                       child: AnimatedOpacity(
                         opacity: _playerOverlaysVisible ? 1 : 0,
                         duration: const Duration(milliseconds: 220),
-                        child: RepaintBoundary(
-                          child: _DesktopVlcControls(
-                            player: _desktopVlcPlayer!,
-                            onTogglePlayback: _toggleDesktopVlcPlayback,
-                            onSeek: _seekDesktopVlcPlayer,
-                            formatTime: _formatPlaybackTime,
-                            onFocusChanged: _setPlayerControlsFocused,
-                            playButtonFocusNode: _playerBottomPlayFocusNode,
-                            progressFocusNode: _playerBottomProgressFocusNode,
-                            controlScale: playerControlScale,
+                        child: Listener(
+                          behavior: HitTestBehavior.opaque,
+                          onPointerDown: (_) => _showPlayerOverlays(),
+                          child: RepaintBoundary(
+                            child: _DesktopVlcControls(
+                              player: _desktopVlcPlayer!,
+                              onTogglePlayback: _toggleDesktopVlcPlayback,
+                              onSeek: _seekDesktopVlcPlayer,
+                              formatTime: _formatPlaybackTime,
+                              onFocusChanged: _setPlayerControlsFocused,
+                              playButtonFocusNode: _playerBottomPlayFocusNode,
+                              progressFocusNode: _playerBottomProgressFocusNode,
+                              controlScale: playerControlScale,
+                            ),
                           ),
                         ),
                       ),
@@ -4798,9 +4847,11 @@ class _PlayerScreenState extends State<PlayerScreen>
         _playerNextButtonFocusNode.hasFocus ||
         _playerSubtitlesButtonFocusNode.hasFocus ||
         _playerFitButtonFocusNode.hasFocus ||
-        _playerSettingsButtonFocusNode.hasFocus ||
+        _playerSourcesButtonFocusNode.hasFocus ||
         _playerEpisodesButtonFocusNode.hasFocus ||
         _playerVolumeButtonFocusNode.hasFocus ||
+        _playerAudioTracksButtonFocusNode.hasFocus ||
+        _playerQualityButtonFocusNode.hasFocus ||
         _playerFullscreenButtonFocusNode.hasFocus ||
         _playerBottomPlayFocusNode.hasFocus ||
         _playerBottomProgressFocusNode.hasFocus ||
@@ -4821,15 +4872,15 @@ class _PlayerScreenState extends State<PlayerScreen>
       return true;
     }
     if (_playerSubtitlesButtonFocusNode.hasFocus) {
-      _toggleSubtitles();
+      unawaited(_showSubtitleTrackDialog());
       return true;
     }
     if (_playerFitButtonFocusNode.hasFocus) {
       _cycleVideoScaleMode();
       return true;
     }
-    if (_playerSettingsButtonFocusNode.hasFocus) {
-      unawaited(_showPlayerSettingsDialog());
+    if (_playerSourcesButtonFocusNode.hasFocus) {
+      unawaited(_showRemoteSourceSelectorDialog());
       return true;
     }
     if (_playerEpisodesButtonFocusNode.hasFocus) {
@@ -4838,6 +4889,14 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
     if (_playerVolumeButtonFocusNode.hasFocus) {
       _togglePlayerMute();
+      return true;
+    }
+    if (_playerAudioTracksButtonFocusNode.hasFocus) {
+      unawaited(_showAudioTrackDialog());
+      return true;
+    }
+    if (_playerQualityButtonFocusNode.hasFocus) {
+      unawaited(_showRemoteQualityDialog());
       return true;
     }
     if (_playerFullscreenButtonFocusNode.hasFocus) {
@@ -4907,8 +4966,12 @@ class _PlayerScreenState extends State<PlayerScreen>
       _playerPreviousButtonFocusNode,
       _playerNextButtonFocusNode,
       _playerEpisodesButtonFocusNode,
-      _playerSettingsButtonFocusNode,
+      _playerFitButtonFocusNode,
+      if (widget.episode.isRemote) _playerSourcesButtonFocusNode,
       if (_showsDesktopVolumeControl) _playerVolumeButtonFocusNode,
+      if (_canShowSubtitleTrackControl) _playerSubtitlesButtonFocusNode,
+      if (_canShowAudioTrackControl) _playerAudioTracksButtonFocusNode,
+      if (_canShowRemoteQualityControl) _playerQualityButtonFocusNode,
       if (_showsPlayerFullscreenControl) _playerFullscreenButtonFocusNode,
     ];
     final currentIndex = nodes.indexWhere((node) => node.hasFocus);
@@ -5397,6 +5460,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
+  // ignore: unused_element
   void _toggleSubtitles() {
     setState(() {
       _subtitlesEnabled = !_subtitlesEnabled;
@@ -5411,14 +5475,6 @@ class _PlayerScreenState extends State<PlayerScreen>
     final tracks = preferredRemoteSubtitleTracks(
       _currentResolvedStream?.subtitleTracks ?? const <RemoteSubtitleTrack>[],
     );
-    if (tracks.isEmpty) {
-      if (mounted) {
-        setState(() {
-          _status = 'Esta fuente no ofrece subtitulos';
-        });
-      }
-      return;
-    }
     _showPlayerOverlays();
     final selected = await showDialog<String>(
       context: context,
@@ -5461,19 +5517,50 @@ class _PlayerScreenState extends State<PlayerScreen>
                 ],
               ),
             ),
+          if (tracks.isEmpty)
+            const Padding(
+              padding: EdgeInsets.fromLTRB(24, 8, 24, 10),
+              child: Text(
+                'Esta fuente no ofrece pistas de subtitulos.',
+                style: TextStyle(color: TanukiColors.muted),
+              ),
+            ),
+          const Divider(color: Color(0x22FFFFFF)),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, '__adjust__'),
+            child: const Row(
+              children: [
+                Icon(Icons.tune, color: TanukiColors.orange),
+                SizedBox(width: 10),
+                Text('Ajustes'),
+              ],
+            ),
+          ),
         ],
       ),
     );
     if (selected == null || !mounted) return;
+    if (selected == '__adjust__') {
+      await Future<void>.delayed(
+        const Duration(milliseconds: 120),
+        _showSubtitleAdjustDialog,
+      );
+      return;
+    }
     _debugPlayerEvent(
         'subtitle dialog selected key=$selected tracks=${tracks.length}');
     setState(() {
       _subtitlesEnabled = selected != '__off__';
-      if (_subtitlesEnabled) _selectedRemoteSubtitleTrackKey = selected;
-      _status = _subtitlesEnabled
-          ? 'Subtitulos: ${remoteSubtitleTrackLabel(tracks.firstWhere(
-              (track) => remoteSubtitleTrackKey(track) == selected,
-            ))}'
+      if (_subtitlesEnabled) {
+        _selectedRemoteSubtitleTrackKey = selected;
+      }
+      final track = tracks.cast<RemoteSubtitleTrack?>().firstWhere(
+            (track) =>
+                track != null && remoteSubtitleTrackKey(track) == selected,
+            orElse: () => null,
+          );
+      _status = _subtitlesEnabled && track != null
+          ? 'Subtitulos: ${remoteSubtitleTrackLabel(track)}'
           : 'Subtitulos desactivados';
     });
     await _applyRemoteSubtitleTrackIfReady();
@@ -5504,6 +5591,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                 final next =
                     (_subtitleFontScale + delta).clamp(0.6, 2.4).toDouble();
                 setState(() => _subtitleFontScale = next);
+                unawaited(widget.controller.setSubtitleFontScale(next));
                 setDialogState(() {});
               }
 
@@ -5664,6 +5752,840 @@ class _PlayerScreenState extends State<PlayerScreen>
     return 'Seleccionado: ${remoteSubtitleTrackCompactLabel(track)}';
   }
 
+  bool get _canShowAudioTrackControl {
+    if (widget.episode.isRemote || _openedMedia) {
+      return true;
+    }
+    final vlcPlayer = _desktopVlcPlayer;
+    if (vlcPlayer != null) {
+      try {
+        return vlcPlayer.audioTrackCount > 1;
+      } catch (_) {
+        return false;
+      }
+    }
+    final mediaKit = _player;
+    if (mediaKit != null) {
+      return mediaKit.state.tracks.audio
+              .where((track) => track.id != 'auto' && track.id != 'no')
+              .length >
+          1;
+    }
+    return false;
+  }
+
+  bool get _canShowSubtitleTrackControl {
+    return widget.episode.isRemote || _openedMedia;
+  }
+
+  bool get _canShowRemoteQualityControl {
+    return false;
+  }
+
+  Future<void> _showRemoteQualityDialog() async {
+    if (mounted) {
+      setState(() {
+        _status = 'Esta fuente no ofrece selector de calidad';
+      });
+      _showPlayerOverlays();
+    }
+  }
+
+  String _audioTrackLabel(AudioTrack track, int index) {
+    final title = track.title?.trim() ?? '';
+    final language = track.language?.trim() ?? '';
+    final parts = <String>[
+      if (title.isNotEmpty) title,
+      if (language.isNotEmpty && language.toLowerCase() != title.toLowerCase())
+        language.toUpperCase(),
+    ];
+    if (parts.isEmpty) {
+      return 'Pista ${index + 1}';
+    }
+    return parts.join(' - ');
+  }
+
+  String _androidExoAudioTrackLabel(vp.VideoAudioTrack track, int index) {
+    final label = track.label?.trim() ?? '';
+    final language = track.language?.trim() ?? '';
+    final codec = track.codec?.trim() ?? '';
+    final channels = track.channelCount == null || track.channelCount! <= 0
+        ? ''
+        : '${track.channelCount}ch';
+    final bitrate = track.bitrate == null || track.bitrate! <= 0
+        ? ''
+        : '${(track.bitrate! / 1000).round()} kbps';
+    final parts = <String>[
+      if (label.isNotEmpty) label,
+      if (language.isNotEmpty && language.toLowerCase() != label.toLowerCase())
+        language.toUpperCase(),
+      if (codec.isNotEmpty) codec.toUpperCase(),
+      if (channels.isNotEmpty) channels,
+      if (bitrate.isNotEmpty) bitrate,
+    ];
+    if (parts.isEmpty) {
+      return 'Pista ${index + 1}';
+    }
+    return parts.join(' - ');
+  }
+
+  Future<void> _showAudioTrackDialog() async {
+    if (!_canOpenPlayerDialog) {
+      return;
+    }
+    _resetPlayerRemoteBackState();
+    _playerDialogOpen = true;
+    _showPlayerOverlays();
+    try {
+      final androidExoController = _androidExoController;
+      final mediaKit = _player;
+      final vlcPlayer = _desktopVlcPlayer;
+      if (_usesAndroidExoPlayer && androidExoController != null) {
+        await _showAndroidExoAudioTrackDialog(androidExoController);
+      } else if (mediaKit != null && vlcPlayer == null) {
+        await _showMediaKitAudioTrackDialog(mediaKit);
+      } else if (vlcPlayer != null) {
+        await _showDesktopVlcAudioTrackDialog(vlcPlayer);
+      } else if (mounted) {
+        setState(() {
+          _status = 'No hay pistas de audio seleccionables';
+        });
+      }
+    } finally {
+      _playerDialogOpen = false;
+      _resetPlayerRemoteBackState();
+      if (mounted) {
+        _playerControlsRootFocusNode.requestFocus();
+      }
+    }
+  }
+
+  Future<void> _showAndroidExoAudioTrackDialog(
+    vp.VideoPlayerController controller,
+  ) async {
+    if (!controller.value.isInitialized) {
+      if (mounted) {
+        setState(() {
+          _status = 'Audio disponible despues de cargar';
+        });
+      }
+      return;
+    }
+    if (!controller.isAudioTrackSupportAvailable()) {
+      if (mounted) {
+        setState(() {
+          _status = 'Este reproductor no permite cambiar audio';
+        });
+      }
+      return;
+    }
+    late final List<vp.VideoAudioTrack> tracks;
+    try {
+      tracks = await controller.getAudioTracks();
+    } catch (error) {
+      _debugPlayerEvent('ExoPlayer audio tracks read failed: $error');
+      if (mounted) {
+        setState(() {
+          _status = 'No se pudieron leer pistas de audio';
+        });
+      }
+      return;
+    }
+    _debugPlayerEvent(
+      'ExoPlayer audio tracks=${tracks.length} '
+      'selected=${tracks.where((track) => track.isSelected).map((track) => track.id).join(',')}',
+    );
+    if (tracks.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _status = 'Esta fuente no ofrece pistas de audio';
+        });
+      }
+      return;
+    }
+    if (!mounted || _androidExoController != controller) {
+      return;
+    }
+    final selectedId = tracks
+        .where((track) => track.isSelected)
+        .map((track) => track.id)
+        .firstOrNull;
+    final selected = await showDialog<String>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (context) => SimpleDialog(
+        backgroundColor: TanukiColors.panelSolid,
+        title: const Text('Pistas de audio'),
+        children: [
+          for (final entry in tracks.asMap().entries)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, entry.value.id),
+              child: Row(
+                children: [
+                  Icon(
+                    selectedId == entry.value.id
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_off,
+                    color: TanukiColors.orange,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                        _androidExoAudioTrackLabel(entry.value, entry.key)),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (selected == null || !mounted || _androidExoController != controller) {
+      return;
+    }
+    final selectedTrack =
+        tracks.firstWhere((track) => track.id == selected, orElse: () {
+      return tracks.first;
+    });
+    try {
+      _debugPlayerEvent('ExoPlayer audio select id=$selected');
+      await controller.selectAudioTrack(selected);
+      final refreshed = await controller.getAudioTracks();
+      final confirmed = refreshed.any(
+        (track) => track.id == selected && track.isSelected,
+      );
+      if (!mounted || _androidExoController != controller) {
+        return;
+      }
+      setState(() {
+        _status = confirmed
+            ? 'Audio: ${_androidExoAudioTrackLabel(selectedTrack, tracks.indexOf(selectedTrack))}'
+            : 'Audio solicitado: ${_androidExoAudioTrackLabel(selectedTrack, tracks.indexOf(selectedTrack))}';
+      });
+      _showPlayerOverlays();
+      _debugPlayerEvent(
+        'ExoPlayer audio selected id=$selected confirmed=$confirmed',
+      );
+    } catch (error) {
+      _debugPlayerEvent('ExoPlayer audio track change failed: $error');
+      if (mounted) {
+        setState(() {
+          _status = 'No se pudo cambiar audio';
+        });
+      }
+    }
+  }
+
+  Future<void> _showMediaKitAudioTrackDialog(Player player) async {
+    final tracks = player.state.tracks.audio
+        .where((track) => track.id != 'auto' && track.id != 'no')
+        .toList(growable: false);
+    if (tracks.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _status = 'Esta fuente no ofrece pistas de audio';
+        });
+      }
+      return;
+    }
+    final selectedId = player.state.track.audio.id;
+    final selected = await showDialog<String>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (context) => SimpleDialog(
+        backgroundColor: TanukiColors.panelSolid,
+        title: const Text('Pistas de audio'),
+        children: [
+          for (final entry in tracks.asMap().entries)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, entry.value.id),
+              child: Row(
+                children: [
+                  Icon(
+                    selectedId == entry.value.id
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_off,
+                    color: TanukiColors.orange,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(_audioTrackLabel(entry.value, entry.key)),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (selected == null || !mounted || _player != player) {
+      return;
+    }
+    final track = tracks.firstWhere((track) => track.id == selected);
+    await player.setAudioTrack(track);
+    if (!mounted || _player != player) {
+      return;
+    }
+    setState(() {
+      _status = 'Audio: ${_audioTrackLabel(track, tracks.indexOf(track))}';
+    });
+    _showPlayerOverlays();
+  }
+
+  Future<void> _showDesktopVlcAudioTrackDialog(vlc.Player player) async {
+    final count = player.audioTrackCount;
+    if (count <= 0) {
+      if (mounted) {
+        setState(() {
+          _status = 'Esta fuente no ofrece pistas de audio';
+        });
+      }
+      return;
+    }
+    final selected = await showDialog<int>(
+      context: context,
+      barrierColor: const Color(0xAA000000),
+      builder: (context) => SimpleDialog(
+        backgroundColor: TanukiColors.panelSolid,
+        title: const Text('Pistas de audio'),
+        children: [
+          for (var index = 1; index <= count; index += 1)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, index),
+              child: Row(
+                children: [
+                  Icon(
+                    _selectedDesktopVlcAudioTrack == index
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_off,
+                    color: TanukiColors.orange,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text('Pista $index')),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (selected == null || !mounted || _desktopVlcPlayer != player) {
+      return;
+    }
+    try {
+      player.setAudioTrack(selected);
+      setState(() {
+        _selectedDesktopVlcAudioTrack = selected;
+        _status = 'Audio: pista $selected';
+      });
+      _showPlayerOverlays();
+    } catch (error) {
+      _debugPlayerEvent('VLC audio track change ignored error: $error');
+      setState(() {
+        _status = 'No se pudo cambiar audio';
+      });
+    }
+  }
+
+  Future<void> _showRemoteSourceSelectorDialog() async {
+    if (!_canOpenPlayerDialog || !widget.episode.isRemote) {
+      return;
+    }
+    final providers = [
+      RemoteProvider.animeAv1,
+      RemoteProvider.jkAnime,
+      RemoteProvider.latAnime,
+      RemoteProvider.justAnime,
+      RemoteProvider.aniPm,
+      RemoteProvider.internetArchive,
+      RemoteProvider.bilibili,
+      RemoteProvider.youtube,
+      if (widget.controller.canUsePlaybackProviderForEpisode(
+        widget.episode,
+        RemoteProvider.facebook,
+      ))
+        RemoteProvider.facebook,
+    ]
+        .where((provider) => widget.controller
+            .canUsePlaybackProviderForEpisode(widget.episode, provider))
+        .toList(growable: false);
+    if (providers.isEmpty) {
+      return;
+    }
+    _resetPlayerRemoteBackState();
+    _playerDialogOpen = true;
+    _showPlayerOverlays();
+    final preference =
+        widget.controller.playbackPreferenceForEpisode(widget.episode);
+    final currentProvider = widget.controller.playbackProviderForEpisode(
+          widget.episode,
+        ) ??
+        _currentResolvedStream?.provider ??
+        widget.episode.provider;
+    var selectedProvider =
+        currentProvider != null && providers.contains(currentProvider)
+            ? currentProvider
+            : providers.first;
+    var selectedMode = _preferredRemoteSourceMode(
+      selectedProvider,
+      preference,
+    );
+    var selectedServer = _preferredRemoteSourceServer(
+      selectedProvider,
+      preference,
+    );
+    var selectedOption = _preferredRemoteSourceOption(
+      selectedProvider,
+      preference,
+    );
+
+    List<({String id, String label})> modeOptionsFor(
+      RemoteProvider provider,
+    ) {
+      return switch (provider) {
+        RemoteProvider.animeAv1 => [
+            for (final mode in AnimeAv1PlaybackMode.values)
+              (id: mode.id, label: mode.dialogLabel),
+          ],
+        RemoteProvider.justAnime => [
+            for (final mode in JustAnimePlaybackMode.values)
+              (id: mode.id, label: mode.dialogLabel),
+          ],
+        RemoteProvider.aniPm => [
+            for (final mode in AniPmPlaybackMode.values)
+              (id: mode.id, label: mode.dialogLabel),
+          ],
+        RemoteProvider.facebook => [
+            for (final mode in FacebookPlaybackMode.values)
+              (id: mode.id, label: mode.dialogLabel),
+          ],
+        RemoteProvider.youtube => [
+            for (final mode in YoutubePlaybackMode.values)
+              (id: mode.id, label: mode.dialogLabel),
+          ],
+        _ => const <({String id, String label})>[],
+      };
+    }
+
+    List<({String id, String label})> serverOptionsFor(
+      RemoteProvider provider,
+    ) {
+      final servers = switch (provider) {
+        RemoteProvider.jkAnime => [
+            for (final server in _availableJkAnimeServers())
+              (id: server.id, label: server.label),
+          ],
+        RemoteProvider.latAnime => [
+            for (final server in LatAnimeServerPreference.values)
+              (id: server.id, label: server.label),
+          ],
+        RemoteProvider.justAnime => [
+            for (final server in JustAnimeServerPreference.values)
+              (id: server.id, label: server.label),
+          ],
+        RemoteProvider.aniPm => [
+            (id: '', label: 'Automatico'),
+            if (preference.aniPmServer.trim().isNotEmpty)
+              (
+                id: preference.aniPmServer.trim().toLowerCase(),
+                label: remoteServerLabel(preference.aniPmServer),
+              ),
+            for (final server
+                in _remoteServerOptionsFor(RemoteProvider.aniPm).toList()
+                  ..sort(compareAniPmServerMenuOrder))
+              (id: server, label: remoteServerLabel(server)),
+          ],
+        _ => const <({String id, String label})>[],
+      };
+      final seen = <String>{};
+      return [
+        for (final server in servers)
+          if (seen.add(server.id.trim().toLowerCase())) server,
+      ];
+    }
+
+    List<({String id, String label})> extraOptionsFor(
+      RemoteProvider provider,
+    ) {
+      return switch (provider) {
+        RemoteProvider.facebook => [
+            for (final option in FacebookPlaybackOption.values)
+              (id: option.id, label: option.label),
+          ],
+        RemoteProvider.youtube => [
+            for (final option in YoutubePlaybackOption.values)
+              (id: option.id, label: option.label),
+          ],
+        _ => const <({String id, String label})>[],
+      };
+    }
+
+    String normalizedSelection(
+      String selected,
+      List<({String id, String label})> options,
+    ) {
+      if (options.isEmpty) {
+        return '';
+      }
+      final normalized = selected.trim().toLowerCase();
+      if (options.any((option) => option.id == normalized)) {
+        return normalized;
+      }
+      return options.first.id;
+    }
+
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        barrierColor: const Color(0xAA000000),
+        builder: (dialogContext) {
+          return _PlayerDialogScale(
+            scale: _playerDialogScale,
+            child: StatefulBuilder(
+              builder: (context, setDialogState) {
+                final dialogScale = _PlayerDialogScale.of(context);
+                final mediaSize = MediaQuery.sizeOf(context);
+                final availableDialogWidth = (mediaSize.width - 44)
+                    .clamp(260.0, double.infinity)
+                    .toDouble();
+                final dialogWidth = (430 * dialogScale)
+                    .clamp(260.0, availableDialogWidth)
+                    .toDouble();
+                final modeOptions = modeOptionsFor(selectedProvider);
+                final serverOptions = serverOptionsFor(selectedProvider);
+                final extraOptions = extraOptionsFor(selectedProvider);
+                final selectedModeValue =
+                    normalizedSelection(selectedMode, modeOptions);
+                final selectedServerValue =
+                    normalizedSelection(selectedServer, serverOptions);
+                final selectedOptionValue =
+                    normalizedSelection(selectedOption, extraOptions);
+
+                InputDecoration decoration(String label) {
+                  return InputDecoration(
+                    labelText: label,
+                    filled: true,
+                    fillColor: const Color(0xFF0F141A),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8 * dialogScale),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8 * dialogScale),
+                      borderSide:
+                          const BorderSide(color: TanukiColors.panelStroke),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8 * dialogScale),
+                      borderSide: BorderSide(
+                        color: TanukiColors.orange,
+                        width: 2 * dialogScale,
+                      ),
+                    ),
+                  );
+                }
+
+                return Dialog(
+                  alignment: Alignment.centerRight,
+                  insetPadding: const EdgeInsets.only(right: 28),
+                  backgroundColor: const Color(0xF2131518),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: BorderSide.none,
+                  ),
+                  child: SizedBox(
+                    width: dialogWidth,
+                    child: Padding(
+                      padding: EdgeInsets.all(16 * dialogScale),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                Icons.cloud_queue,
+                                color: TanukiColors.orange,
+                                size: 24 * dialogScale,
+                              ),
+                              SizedBox(width: 10 * dialogScale),
+                              Text(
+                                'Fuentes',
+                                style: TextStyle(
+                                  color: TanukiColors.text,
+                                  fontSize: 16 * dialogScale,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                              const Spacer(),
+                              IconButton(
+                                onPressed: () =>
+                                    Navigator.of(dialogContext).pop(false),
+                                icon: const Icon(Icons.close),
+                              ),
+                            ],
+                          ),
+                          const Divider(color: Color(0x22FFFFFF)),
+                          DropdownButtonFormField<RemoteProvider>(
+                            initialValue: selectedProvider,
+                            dropdownColor: TanukiColors.panelSolid,
+                            decoration: decoration('Fuente'),
+                            items: [
+                              for (final provider in providers)
+                                DropdownMenuItem(
+                                  value: provider,
+                                  child: Text(provider.label),
+                                ),
+                            ],
+                            onChanged: (provider) {
+                              if (provider == null) {
+                                return;
+                              }
+                              setDialogState(() {
+                                selectedProvider = provider;
+                                selectedMode = _preferredRemoteSourceMode(
+                                  provider,
+                                  preference,
+                                );
+                                selectedServer = _preferredRemoteSourceServer(
+                                  provider,
+                                  preference,
+                                );
+                                selectedOption = _preferredRemoteSourceOption(
+                                  provider,
+                                  preference,
+                                );
+                              });
+                            },
+                          ),
+                          if (modeOptions.isNotEmpty) ...[
+                            SizedBox(height: 14 * dialogScale),
+                            DropdownButtonFormField<String>(
+                              key: ValueKey(
+                                'remote-source-mode-${selectedProvider.id}-$selectedModeValue',
+                              ),
+                              initialValue: selectedModeValue,
+                              dropdownColor: TanukiColors.panelSolid,
+                              decoration: decoration(
+                                selectedProvider == RemoteProvider.animeAv1
+                                    ? 'Modo'
+                                    : 'Audio',
+                              ),
+                              items: [
+                                for (final option in modeOptions)
+                                  DropdownMenuItem(
+                                    value: option.id,
+                                    child: Text(option.label),
+                                  ),
+                              ],
+                              onChanged: (mode) {
+                                if (mode == null) {
+                                  return;
+                                }
+                                setDialogState(() {
+                                  selectedMode = mode;
+                                });
+                              },
+                            ),
+                          ],
+                          if (serverOptions.isNotEmpty) ...[
+                            SizedBox(height: 14 * dialogScale),
+                            DropdownButtonFormField<String>(
+                              key: ValueKey(
+                                'remote-source-server-${selectedProvider.id}-$selectedServerValue',
+                              ),
+                              initialValue: selectedServerValue,
+                              dropdownColor: TanukiColors.panelSolid,
+                              decoration: decoration('Servidor'),
+                              items: [
+                                for (final option in serverOptions)
+                                  DropdownMenuItem(
+                                    value: option.id,
+                                    child: Text(option.label),
+                                  ),
+                              ],
+                              onChanged: (server) {
+                                if (server == null) {
+                                  return;
+                                }
+                                setDialogState(() {
+                                  selectedServer = server;
+                                });
+                              },
+                            ),
+                          ],
+                          if (extraOptions.isNotEmpty) ...[
+                            SizedBox(height: 14 * dialogScale),
+                            DropdownButtonFormField<String>(
+                              key: ValueKey(
+                                'remote-source-extra-${selectedProvider.id}-$selectedOptionValue',
+                              ),
+                              initialValue: selectedOptionValue,
+                              dropdownColor: TanukiColors.panelSolid,
+                              decoration: decoration('Opcion'),
+                              items: [
+                                for (final option in extraOptions)
+                                  DropdownMenuItem(
+                                    value: option.id,
+                                    child: Text(option.label),
+                                  ),
+                              ],
+                              onChanged: (option) {
+                                if (option == null) {
+                                  return;
+                                }
+                                setDialogState(() {
+                                  selectedOption = option;
+                                });
+                              },
+                            ),
+                          ],
+                          SizedBox(height: 18 * dialogScale),
+                          FilledButton.icon(
+                            autofocus: true,
+                            onPressed: () =>
+                                Navigator.of(dialogContext).pop(true),
+                            icon: const Icon(Icons.play_arrow),
+                            label: const Text('Reproducir'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          );
+        },
+      );
+      if (confirmed != true || !mounted) {
+        return;
+      }
+      await widget.controller.setPlaybackProviderForEpisode(
+        widget.episode,
+        selectedProvider,
+      );
+      switch (selectedProvider) {
+        case RemoteProvider.animeAv1:
+          await widget.controller.setAnimeAv1ModeForEpisode(
+            widget.episode,
+            animeAv1PlaybackModeFromId(selectedMode),
+          );
+        case RemoteProvider.jkAnime:
+          await widget.controller.setJkAnimeServerForEpisode(
+            widget.episode,
+            jkAnimeServerPreferenceFromId(selectedServer),
+          );
+        case RemoteProvider.latAnime:
+          await widget.controller.setLatAnimeServerForEpisode(
+            widget.episode,
+            latAnimeServerPreferenceFromId(selectedServer),
+          );
+        case RemoteProvider.justAnime:
+          await widget.controller.setJustAnimeModeForEpisode(
+            widget.episode,
+            justAnimePlaybackModeFromId(selectedMode),
+          );
+          await widget.controller.setJustAnimeServerForEpisode(
+            widget.episode,
+            justAnimeServerPreferenceFromId(selectedServer),
+          );
+        case RemoteProvider.aniPm:
+          await widget.controller.setAniPmModeForEpisode(
+            widget.episode,
+            aniPmPlaybackModeFromId(selectedMode),
+          );
+          await widget.controller.setAniPmServerForEpisode(
+            widget.episode,
+            selectedServer,
+          );
+        case RemoteProvider.facebook:
+          await widget.controller.setFacebookModeForEpisode(
+            widget.episode,
+            facebookPlaybackModeFromId(selectedMode),
+          );
+          await widget.controller.setFacebookOptionForEpisode(
+            widget.episode,
+            facebookPlaybackOptionFromId(selectedOption),
+          );
+        case RemoteProvider.youtube:
+          await widget.controller.setYoutubeModeForEpisode(
+            widget.episode,
+            youtubePlaybackModeFromId(selectedMode),
+          );
+          await widget.controller.setYoutubeOptionForEpisode(
+            widget.episode,
+            youtubePlaybackOptionFromId(selectedOption),
+          );
+        default:
+          break;
+      }
+      if (!mounted) {
+        return;
+      }
+      await _reloadRemoteSource();
+    } finally {
+      _playerDialogOpen = false;
+      _resetPlayerRemoteBackState();
+      _suppressPlayerDialogReopen();
+    }
+  }
+
+  String _preferredRemoteSourceMode(
+    RemoteProvider provider,
+    SeriesPlaybackPreference preference,
+  ) {
+    return switch (provider) {
+      RemoteProvider.animeAv1 => animeAv1PlaybackModeFromId(
+          preference.animeAv1Mode,
+        ).id,
+      RemoteProvider.justAnime => justAnimePlaybackModeFromId(
+          preference.justAnimeMode,
+        ).id,
+      RemoteProvider.aniPm => aniPmPlaybackModeFromId(
+          preference.aniPmMode,
+        ).id,
+      RemoteProvider.facebook => facebookPlaybackModeFromId(
+          preference.facebookMode,
+        ).id,
+      RemoteProvider.youtube => youtubePlaybackModeFromId(
+          preference.youtubeMode,
+        ).id,
+      _ => '',
+    };
+  }
+
+  String _preferredRemoteSourceServer(
+    RemoteProvider provider,
+    SeriesPlaybackPreference preference,
+  ) {
+    final resolvedServer = _currentResolvedStream?.provider == provider
+        ? _currentResolvedStream?.server.trim().toLowerCase() ?? ''
+        : '';
+    final savedServer = switch (provider) {
+      RemoteProvider.jkAnime =>
+        jkAnimeServerPreferenceFromId(preference.jkAnimeServer).id,
+      RemoteProvider.latAnime =>
+        latAnimeServerPreferenceFromId(preference.latAnimeServer).id,
+      RemoteProvider.justAnime =>
+        justAnimeServerPreferenceFromId(preference.justAnimeServer).id,
+      RemoteProvider.aniPm => preference.aniPmServer.trim().toLowerCase(),
+      _ => '',
+    };
+    return savedServer.isNotEmpty ? savedServer : resolvedServer;
+  }
+
+  String _preferredRemoteSourceOption(
+    RemoteProvider provider,
+    SeriesPlaybackPreference preference,
+  ) {
+    return switch (provider) {
+      RemoteProvider.facebook => facebookPlaybackOptionFromId(
+          preference.facebookOption,
+        ).id,
+      RemoteProvider.youtube => youtubePlaybackOptionFromId(
+          preference.youtubeOption,
+        ).id,
+      _ => '',
+    };
+  }
+
   Future<void> _setVideoScaleMode(VideoScaleMode mode) async {
     if (_videoScaleMode == mode) {
       return;
@@ -5672,7 +6594,33 @@ class _PlayerScreenState extends State<PlayerScreen>
       _videoScaleMode = mode;
       _status = 'Vista del video: ${mode.dialogLabel}';
     });
+    final androidExoController = _androidExoController;
+    if (androidExoController != null) {
+      unawaited(_setAndroidExoNativeResizeMode(androidExoController));
+    }
     await widget.controller.setVideoScaleModeForEpisode(widget.episode, mode);
+  }
+
+  Future<void> _setAndroidExoNativeResizeMode(
+    vp.VideoPlayerController controller,
+  ) async {
+    // The local Android plugin channel needs the active video_player instance id.
+    // ignore: invalid_use_of_visible_for_testing_member
+    final playerId = controller.playerId;
+    if (!Platform.isAndroid || playerId < 0) {
+      return;
+    }
+    try {
+      await _androidVideoSurfaceChannel.invokeMethod<bool>(
+        'setResizeMode',
+        {
+          'playerId': playerId,
+          'mode': _videoScaleMode == VideoScaleMode.stretch ? 'fill' : 'fit',
+        },
+      );
+    } catch (error) {
+      debugPrint('PlayerScreen: Android resize mode failed: $error');
+    }
   }
 
   Future<void> _toggleFullscreenMode() async {
@@ -5764,6 +6712,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
+  // ignore: unused_element
   Future<void> _showPlayerSettingsDialog() async {
     if (!_canOpenPlayerDialog) {
       return;
@@ -7474,32 +8423,23 @@ class _YoutubeWebControlsState extends State<_YoutubeWebControls> {
 class _AndroidExoVideoSurface extends StatelessWidget {
   const _AndroidExoVideoSurface({
     required this.controller,
-    required this.fit,
     required this.subtitlesEnabled,
+    required this.subtitleFontScale,
   });
 
   final vp.VideoPlayerController controller;
-  final BoxFit fit;
   final bool subtitlesEnabled;
+  final double subtitleFontScale;
 
   @override
   Widget build(BuildContext context) {
     final value = controller.value;
-    final width = value.size.width > 0 ? value.size.width : 16.0;
-    final height = value.size.height > 0 ? value.size.height : 9.0;
     final caption = subtitlesEnabled ? value.caption.text.trim() : '';
     return Stack(
       fit: StackFit.expand,
       children: [
-        ClipRect(
-          child: FittedBox(
-            fit: fit,
-            child: SizedBox(
-              width: width,
-              height: height,
-              child: vp.VideoPlayer(controller),
-            ),
-          ),
+        SizedBox.expand(
+          child: vp.VideoPlayer(controller),
         ),
         if (caption.isNotEmpty)
           Positioned(
@@ -7511,13 +8451,12 @@ class _AndroidExoVideoSurface extends StatelessWidget {
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: Colors.white,
-                fontSize: 18,
                 fontWeight: FontWeight.w700,
                 shadows: [
                   Shadow(color: Colors.black, blurRadius: 4),
                   Shadow(color: Colors.black, offset: Offset(1, 1)),
                 ],
-              ),
+              ).copyWith(fontSize: 18 * subtitleFontScale),
             ),
           ),
       ],
@@ -8946,24 +9885,36 @@ class _PlayerTopBar extends StatelessWidget {
     required this.onBack,
     required this.onPrevious,
     required this.onNext,
-    required this.onSettings,
+    required this.onToggleFit,
+    required this.onSources,
+    required this.onSubtitles,
+    required this.onQuality,
     required this.onEpisodes,
     required this.onToggleVolume,
     required this.onVolumeHoverChanged,
     required this.onVolumeChanged,
+    required this.onAudioTracks,
     required this.onFullscreen,
     required this.onControlFocusChanged,
     required this.showVolumeControl,
     required this.showVolumeSlider,
     required this.volume,
+    required this.showSubtitleControl,
+    required this.showAudioTrackControl,
+    required this.showQualityControl,
     required this.showFullscreenControl,
+    required this.videoScaleMode,
     required this.controlScale,
     this.backButtonFocusNode,
     this.previousButtonFocusNode,
     this.nextButtonFocusNode,
-    this.settingsButtonFocusNode,
+    this.fitButtonFocusNode,
+    this.sourcesButtonFocusNode,
     this.episodesButtonFocusNode,
     this.volumeButtonFocusNode,
+    this.subtitlesButtonFocusNode,
+    this.audioTracksButtonFocusNode,
+    this.qualityButtonFocusNode,
     this.fullscreenButtonFocusNode,
   });
 
@@ -8971,9 +9922,13 @@ class _PlayerTopBar extends StatelessWidget {
   final FocusNode? backButtonFocusNode;
   final FocusNode? previousButtonFocusNode;
   final FocusNode? nextButtonFocusNode;
-  final FocusNode? settingsButtonFocusNode;
+  final FocusNode? fitButtonFocusNode;
+  final FocusNode? sourcesButtonFocusNode;
   final FocusNode? episodesButtonFocusNode;
   final FocusNode? volumeButtonFocusNode;
+  final FocusNode? subtitlesButtonFocusNode;
+  final FocusNode? audioTracksButtonFocusNode;
+  final FocusNode? qualityButtonFocusNode;
   final FocusNode? fullscreenButtonFocusNode;
   final String status;
   final IconData statusIcon;
@@ -8981,17 +9936,25 @@ class _PlayerTopBar extends StatelessWidget {
   final VoidCallback onBack;
   final VoidCallback onPrevious;
   final VoidCallback onNext;
-  final VoidCallback onSettings;
+  final VoidCallback onToggleFit;
+  final VoidCallback onSources;
+  final VoidCallback onSubtitles;
+  final VoidCallback onQuality;
   final VoidCallback onEpisodes;
   final VoidCallback onToggleVolume;
   final ValueChanged<bool> onVolumeHoverChanged;
   final ValueChanged<double> onVolumeChanged;
+  final VoidCallback onAudioTracks;
   final VoidCallback onFullscreen;
   final ValueChanged<bool> onControlFocusChanged;
   final bool showVolumeControl;
   final bool showVolumeSlider;
   final double volume;
+  final bool showSubtitleControl;
+  final bool showAudioTrackControl;
+  final bool showQualityControl;
   final bool showFullscreenControl;
+  final VideoScaleMode videoScaleMode;
   final double controlScale;
 
   @override
@@ -9099,18 +10062,36 @@ class _PlayerTopBar extends StatelessWidget {
             FocusTraversalOrder(
               order: const NumericFocusOrder(5),
               child: _PlayerIconButton(
-                icon: Icons.settings,
-                tooltip: 'Ajustes',
-                focusNode: settingsButtonFocusNode,
-                onPressed: onSettings,
+                icon: videoScaleMode == VideoScaleMode.fit
+                    ? Icons.fit_screen
+                    : Icons.aspect_ratio,
+                tooltip: videoScaleMode == VideoScaleMode.fit
+                    ? 'Cambiar a stretch'
+                    : 'Cambiar a fit',
+                focusNode: fitButtonFocusNode,
+                onPressed: onToggleFit,
                 onFocusChanged: onControlFocusChanged,
                 controlScale: scale,
               ),
             ),
-            if (showVolumeControl) ...[
+            if (episode.isRemote) ...[
               SizedBox(width: 10 * scale),
               FocusTraversalOrder(
                 order: const NumericFocusOrder(6),
+                child: _PlayerIconButton(
+                  icon: Icons.cloud_queue,
+                  tooltip: 'Fuentes',
+                  focusNode: sourcesButtonFocusNode,
+                  onPressed: onSources,
+                  onFocusChanged: onControlFocusChanged,
+                  controlScale: scale,
+                ),
+              ),
+            ],
+            if (showVolumeControl) ...[
+              SizedBox(width: 10 * scale),
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(7),
                 child: MouseRegion(
                   onEnter: (_) => onVolumeHoverChanged(true),
                   onExit: (_) => onVolumeHoverChanged(false),
@@ -9169,10 +10150,52 @@ class _PlayerTopBar extends StatelessWidget {
                 ),
               ),
             ],
+            if (showSubtitleControl) ...[
+              SizedBox(width: 10 * scale),
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(8),
+                child: _PlayerIconButton(
+                  icon: Icons.subtitles,
+                  tooltip: 'Subtitulos',
+                  focusNode: subtitlesButtonFocusNode,
+                  onPressed: onSubtitles,
+                  onFocusChanged: onControlFocusChanged,
+                  controlScale: scale,
+                ),
+              ),
+            ],
+            if (showAudioTrackControl) ...[
+              SizedBox(width: 10 * scale),
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(9),
+                child: _PlayerIconButton(
+                  icon: Icons.spatial_audio,
+                  tooltip: 'Pistas de audio',
+                  focusNode: audioTracksButtonFocusNode,
+                  onPressed: onAudioTracks,
+                  onFocusChanged: onControlFocusChanged,
+                  controlScale: scale,
+                ),
+              ),
+            ],
+            if (showQualityControl) ...[
+              SizedBox(width: 10 * scale),
+              FocusTraversalOrder(
+                order: const NumericFocusOrder(10),
+                child: _PlayerIconButton(
+                  icon: Icons.high_quality,
+                  tooltip: 'Calidad',
+                  focusNode: qualityButtonFocusNode,
+                  onPressed: onQuality,
+                  onFocusChanged: onControlFocusChanged,
+                  controlScale: scale,
+                ),
+              ),
+            ],
             if (showFullscreenControl) ...[
               SizedBox(width: 10 * scale),
               FocusTraversalOrder(
-                order: const NumericFocusOrder(7),
+                order: const NumericFocusOrder(11),
                 child: _PlayerIconButton(
                   icon: Icons.fullscreen,
                   tooltip: 'Pantalla completa',

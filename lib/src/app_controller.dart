@@ -438,6 +438,10 @@ class AppController extends ChangeNotifier {
     );
   }
 
+  double get subtitleFontScale {
+    return _state.profile.subtitleFontScale.clamp(0.6, 2.4).toDouble();
+  }
+
   RemoteProvider? playbackProviderForEpisode(EpisodeItem episode) {
     for (final provider in [
       playbackPreferenceForEpisode(episode).provider,
@@ -3294,6 +3298,18 @@ class AppController extends ChangeNotifier {
       (current) => current.copyWith(videoScaleMode: mode.id),
       'Vista de video: ${mode.dialogLabel}.',
     );
+  }
+
+  Future<void> setSubtitleFontScale(double scale) async {
+    final normalized = scale.clamp(0.6, 2.4).toDouble();
+    if (_state.profile.subtitleFontScale == normalized) {
+      return;
+    }
+    _state = _state.copyWith(
+      profile: _state.profile.copyWith(subtitleFontScale: normalized),
+    );
+    await _save();
+    notifyListeners();
   }
 
   Future<void> setPlaybackProviderForEpisode(
