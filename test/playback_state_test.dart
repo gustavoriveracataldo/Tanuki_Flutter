@@ -1106,6 +1106,34 @@ void main() {
     expect(store.state.profile.episodePlayback, isNotEmpty);
   });
 
+  test('persists subtitle timing offset with episode playback', () async {
+    final store = _MemoryAppStore(AppState.initial());
+    final controller = AppController(store: store);
+    await controller.initialize();
+    final episode = _episode();
+
+    await controller.setSubtitleTimingOffsetForEpisode(episode, 2.34);
+
+    expect(controller.subtitleTimingOffsetForEpisode(episode), 2.3);
+    expect(controller.resumePositionForEpisode(episode), isNull);
+
+    await controller.saveEpisodePlayback(
+      episode,
+      position: const Duration(minutes: 8),
+      duration: const Duration(minutes: 24),
+    );
+
+    expect(controller.subtitleTimingOffsetForEpisode(episode), 2.3);
+    expect(
+      controller.playbackForEpisode(episode)?.subtitleTimingOffsetSeconds,
+      2.3,
+    );
+    expect(
+      controller.resumePositionForEpisode(episode),
+      const Duration(minutes: 8),
+    );
+  });
+
   test('clears current entry when manually completing through an episode',
       () async {
     const firstEpisode = EpisodeItem(

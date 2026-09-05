@@ -594,7 +594,7 @@ Solo en la oscuridad, la luz.
         subtitlesEnabled: true,
         captionText: '',
       ),
-      isFalse,
+      isTrue,
     );
     expect(
       shouldRebuildAndroidExoProgress(

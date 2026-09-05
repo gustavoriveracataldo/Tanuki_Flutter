@@ -14,6 +14,7 @@ import 'services/app_store.dart';
 import 'services/filler_metadata_service.dart';
 import 'services/local_library_scanner.dart';
 import 'services/my_anime_list_service.dart';
+import 'services/open_subtitles_service.dart';
 import 'services/playlist_engine.dart';
 import 'services/remote_catalog_service.dart';
 import 'services/simkl_service.dart';
@@ -287,6 +288,7 @@ class AppController extends ChangeNotifier {
     MyAnimeListService? myAnimeListService,
     SimklService? simklService,
     AniSkipService? aniSkipService,
+    OpenSubtitlesService? openSubtitlesService,
   })  : _store = store ?? AppStore(),
         _scanner = scanner ?? const LocalLibraryScanner(),
         _playlistEngine = playlistEngine ?? const PlaylistEngine(),
@@ -294,7 +296,8 @@ class AppController extends ChangeNotifier {
         _fillerMetadata = fillerMetadata ?? FillerMetadataService(),
         _myAnimeListService = myAnimeListService ?? MyAnimeListService(),
         _simklService = simklService ?? SimklService(),
-        _aniSkipService = aniSkipService ?? AniSkipService() {
+        _aniSkipService = aniSkipService ?? AniSkipService(),
+        _openSubtitlesService = openSubtitlesService ?? OpenSubtitlesService() {
     _registerNativeDeepLinkHandler();
   }
 
@@ -306,6 +309,7 @@ class AppController extends ChangeNotifier {
   final MyAnimeListService _myAnimeListService;
   final SimklService _simklService;
   final AniSkipService _aniSkipService;
+  final OpenSubtitlesService _openSubtitlesService;
 
   AppState _state = AppState.initial();
   List<SeriesItem> _localLibrary = const [];
@@ -440,6 +444,10 @@ class AppController extends ChangeNotifier {
 
   double get subtitleFontScale {
     return _state.profile.subtitleFontScale.clamp(0.6, 2.4).toDouble();
+  }
+
+  double subtitleTimingOffsetForEpisode(EpisodeItem episode) {
+    return playbackForEpisode(episode)?.subtitleTimingOffsetSeconds ?? 0;
   }
 
   RemoteProvider? playbackProviderForEpisode(EpisodeItem episode) {
@@ -1341,6 +1349,7 @@ class AppController extends ChangeNotifier {
     _myAnimeListService.close();
     _simklService.close();
     _aniSkipService.close();
+    _openSubtitlesService.close();
     super.dispose();
   }
 
@@ -3362,8 +3371,7 @@ class AppController extends ChangeNotifier {
     } else if (provider == RemoteProvider.aniPm) {
       next = next.copyWith(
         aniPmMode: mode,
-        aniPmServer:
-            current.aniPmServer.trim().isEmpty ? current.aniPmServer : server,
+        aniPmServer: server.isEmpty ? current.aniPmServer : server,
       );
     }
     if (next.toJson().toString() == current.toJson().toString()) return;
@@ -3590,6 +3598,8 @@ class AppController extends ChangeNotifier {
         positionMs: positionMs,
         durationMs: durationMs,
         completed: true,
+        remoteProgressPercent: existing?.remoteProgressPercent ?? 0,
+        subtitleTimingOffsetSeconds: existing?.subtitleTimingOffsetSeconds ?? 0,
       );
       for (final key in aliases) {
         nextPlayback[key] = record;
@@ -3691,6 +3701,7 @@ class AppController extends ChangeNotifier {
       completed: completed || keepExistingCompletion,
       remoteProgressPercent:
           positionMs > 0 ? 0 : existing?.remoteProgressPercent ?? 0,
+      subtitleTimingOffsetSeconds: existing?.subtitleTimingOffsetSeconds ?? 0,
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
     );
     final nextPlayback = Map<String, EpisodePlaybackRecord>.from(
@@ -3722,6 +3733,46 @@ class AppController extends ChangeNotifier {
     }
     if (shouldSyncSeriesState) {
       unawaited(_syncEpisodeSeriesStateExternal(episode));
+    }
+  }
+
+  Future<void> setSubtitleTimingOffsetForEpisode(
+    EpisodeItem episode,
+    double offsetSeconds, {
+    bool notify = false,
+  }) async {
+    final aliases = _expandedEpisodePlaybackAliases(episode);
+    if (aliases.isEmpty) {
+      return;
+    }
+    final existing = _firstPlaybackRecord(aliases);
+    final normalizedOffset = offsetSeconds.isFinite
+        ? (offsetSeconds * 10).roundToDouble() / 10
+        : 0.0;
+    if (existing != null &&
+        existing.subtitleTimingOffsetSeconds == normalizedOffset) {
+      return;
+    }
+    final record = EpisodePlaybackRecord.normalized(
+      positionMs: existing?.positionMs ?? 0,
+      durationMs: existing?.durationMs ?? 0,
+      completed: existing?.completed ?? false,
+      remoteProgressPercent: existing?.remoteProgressPercent ?? 0,
+      subtitleTimingOffsetSeconds: normalizedOffset,
+      updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    final nextPlayback = Map<String, EpisodePlaybackRecord>.from(
+      _state.profile.episodePlayback,
+    );
+    for (final key in aliases) {
+      nextPlayback[key] = record;
+    }
+    _state = _state.copyWith(
+      profile: _state.profile.copyWith(episodePlayback: nextPlayback),
+    );
+    await _save(notify: notify);
+    if (notify) {
+      notifyListeners();
     }
   }
 
@@ -4801,6 +4852,7 @@ class AppController extends ChangeNotifier {
         durationMs: durationMs,
         completed: completed,
         remoteProgressPercent: progressPercent,
+        subtitleTimingOffsetSeconds: existing?.subtitleTimingOffsetSeconds ?? 0,
         updatedAtMs: entry.updatedAtMs,
       );
       for (final alias in aliases) {
@@ -5285,6 +5337,140 @@ class AppController extends ChangeNotifier {
       }
     }
     return null;
+  }
+
+  bool get isOpenSubtitlesConfigured => _openSubtitlesService.isConfigured;
+
+  Future<List<RemoteSubtitleTrack>> searchOpenSubtitlesForEpisode(
+    EpisodeItem episode, {
+    List<String> languages = const ['es', 'en'],
+  }) async {
+    final series = findSeriesForEpisode(episode);
+    final mediaType = _openSubtitlesMediaType(series, episode);
+    final query = _openSubtitlesQuery(series, episode, mediaType);
+    final tmdbId = _openSubtitlesTmdbId(series, episode);
+    final imdbId = _openSubtitlesImdbId(series, episode);
+    if (query.isEmpty && tmdbId <= 0 && imdbId.isEmpty) {
+      return const [];
+    }
+    final seasonNumber = mediaType == 'tv' ? 1 : 0;
+    final episodeNumber =
+        mediaType == 'tv' ? _firstPositiveInt([episode.episodeNumber]) : 0;
+    final year = _firstPositiveInt([
+      episode.releaseYear,
+      series?.releaseYear ?? 0,
+    ]);
+    debugPrint(
+      'AppControllerOpenSubtitles: search query="$query" media=$mediaType '
+      'tmdb=$tmdbId imdb=$imdbId season=$seasonNumber '
+      'episode=$episodeNumber year=$year',
+    );
+    return _openSubtitlesService.searchSubtitleTracks(
+      OpenSubtitlesSearchRequest(
+        query: query,
+        languages: languages,
+        mediaType: mediaType,
+        tmdbId: tmdbId,
+        imdbId: imdbId,
+        seasonNumber: seasonNumber,
+        episodeNumber: episodeNumber,
+        year: year,
+      ),
+    );
+  }
+
+  String _openSubtitlesQuery(
+    SeriesItem? series,
+    EpisodeItem episode,
+    String mediaType,
+  ) {
+    final values = <String>[
+      if (series != null) series.name,
+      if (series != null) series.japaneseTitle,
+      if (series != null) ...series.aliases,
+      episode.seriesName,
+      if (mediaType != 'tv') episode.displayName,
+      episode.slug,
+    ];
+    for (final value in values) {
+      final cleaned = _stripProviderSuffix(value).trim();
+      if (cleaned.isNotEmpty) {
+        return cleaned;
+      }
+    }
+    return '';
+  }
+
+  String _openSubtitlesMediaType(SeriesItem? series, EpisodeItem episode) {
+    final text = [
+      series?.format ?? '',
+      series?.slug ?? '',
+      series?.watchUrl ?? '',
+      episode.relativePath,
+      episode.slug,
+      episode.watchUrl,
+      episode.filePath,
+    ].join(' ').toLowerCase();
+    if (text.contains('tv') ||
+        text.contains('/tv/') ||
+        text.contains('tmdb-tv') ||
+        text.contains('/serie/')) {
+      return 'tv';
+    }
+    if (text.contains('movie') ||
+        text.contains('pelicula') ||
+        text.contains('/movie/') ||
+        text.contains('tmdb-movie') ||
+        text.contains('/pelicula/')) {
+      return 'movie';
+    }
+    final episodeCount = series?.episodeCount ?? 0;
+    return episodeCount <= 1 && episode.episodeNumber <= 1 ? 'movie' : 'tv';
+  }
+
+  int _openSubtitlesTmdbId(SeriesItem? series, EpisodeItem episode) {
+    final text = [
+      series?.seriesStateKey ?? '',
+      series?.slug ?? '',
+      series?.watchUrl ?? '',
+      episode.seriesStateKey,
+      episode.slug,
+      episode.watchUrl,
+      episode.filePath,
+    ].join(' ');
+    final match = RegExp(
+      r'(?:tmdb[:\-_](?:movie|tv)?[:\-_]?|themoviedb\.org/(?:movie|tv)/|'
+      r'(?:tmdb|cinesrc|vidking|cineby|shuttletv|lamovieorg|lamoviela|'
+      r'pelispedia|cuevana8)-(?:movie|tv)-)(\d+)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    final parsed = int.tryParse(match?.group(1) ?? '') ?? 0;
+    return parsed > 0 ? parsed : 0;
+  }
+
+  String _openSubtitlesImdbId(SeriesItem? series, EpisodeItem episode) {
+    final text = [
+      series?.seriesStateKey ?? '',
+      series?.slug ?? '',
+      series?.watchUrl ?? '',
+      episode.seriesStateKey,
+      episode.slug,
+      episode.watchUrl,
+      episode.filePath,
+    ].join(' ');
+    final match =
+        RegExp(r'\btt(\d{4,})\b', caseSensitive: false).firstMatch(text);
+    final digits = match?.group(1) ?? '';
+    return digits.isEmpty ? '' : 'tt${digits.padLeft(7, '0')}';
+  }
+
+  int _firstPositiveInt(List<int> values) {
+    for (final value in values) {
+      if (value > 0) {
+        return value;
+      }
+    }
+    return 0;
   }
 
   bool _shouldIncludeEpisode(EpisodeItem episode) {

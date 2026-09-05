@@ -1204,6 +1204,7 @@ class EpisodePlaybackRecord {
     this.durationMs = 0,
     this.completed = false,
     this.remoteProgressPercent = 0,
+    this.subtitleTimingOffsetSeconds = 0,
     this.updatedAtMs = 0,
   });
 
@@ -1211,6 +1212,7 @@ class EpisodePlaybackRecord {
   final int durationMs;
   final bool completed;
   final double remoteProgressPercent;
+  final double subtitleTimingOffsetSeconds;
   final int updatedAtMs;
 
   factory EpisodePlaybackRecord.normalized({
@@ -1218,10 +1220,14 @@ class EpisodePlaybackRecord {
     int durationMs = 0,
     bool completed = false,
     double remoteProgressPercent = 0,
+    double subtitleTimingOffsetSeconds = 0,
     int updatedAtMs = 0,
   }) {
     final normalizedDuration = durationMs < 0 ? 0 : durationMs;
     final rawPosition = positionMs < 0 ? 0 : positionMs;
+    final normalizedSubtitleTimingOffset = subtitleTimingOffsetSeconds.isFinite
+        ? (subtitleTimingOffsetSeconds * 10).roundToDouble() / 10
+        : 0.0;
     final isCompleted = completed ||
         (normalizedDuration > 0 &&
             rawPosition * 100 >=
@@ -1233,6 +1239,7 @@ class EpisodePlaybackRecord {
       durationMs: normalizedDuration,
       completed: isCompleted,
       remoteProgressPercent: remoteProgressPercent.clamp(0, 100).toDouble(),
+      subtitleTimingOffsetSeconds: normalizedSubtitleTimingOffset,
       updatedAtMs: updatedAtMs < 0 ? 0 : updatedAtMs,
     );
   }
@@ -1244,6 +1251,9 @@ class EpisodePlaybackRecord {
       completed: _readBool(json['completed']),
       remoteProgressPercent:
           double.tryParse('${json['remoteProgressPercent'] ?? 0}') ?? 0,
+      subtitleTimingOffsetSeconds: _readDouble(
+        json['subtitleTimingOffsetSeconds'],
+      ),
       updatedAtMs: _readInt(json['updatedAtMs']),
     );
   }
@@ -1254,6 +1264,7 @@ class EpisodePlaybackRecord {
       'durationMs': durationMs,
       'completed': completed,
       'remoteProgressPercent': remoteProgressPercent,
+      'subtitleTimingOffsetSeconds': subtitleTimingOffsetSeconds,
       'updatedAtMs': updatedAtMs,
     };
   }

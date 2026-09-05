@@ -195,6 +195,9 @@ class _PlayerScreenState extends State<PlayerScreen>
   RemoteDirectStream? _currentResolvedStream;
   RemoteProvider? _automaticResolvingProvider;
   String _selectedRemoteSubtitleTrackKey = '';
+  List<RemoteSubtitleTrack> _externalSubtitleTracks =
+      const <RemoteSubtitleTrack>[];
+  bool _openSubtitlesLoading = false;
   final Map<RemoteProvider, Set<String>> _remoteServerOptionCache =
       <RemoteProvider, Set<String>>{};
   final Set<RemoteProvider> _failedRemoteProviders = <RemoteProvider>{};
@@ -299,6 +302,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     _videoScaleMode =
         widget.controller.videoScaleModeForEpisode(widget.episode);
     _subtitleFontScale = widget.controller.subtitleFontScale;
+    _subtitleTimingOffsetSeconds =
+        widget.controller.subtitleTimingOffsetForEpisode(widget.episode);
     _loadAndroidUiCapabilities();
     if (!_usesAndroidExoPlayer &&
         !_usesDesktopVlcPlayer &&
@@ -598,6 +603,26 @@ class _PlayerScreenState extends State<PlayerScreen>
     final previousPosition = _lastAndroidExoHeartbeatPosition;
     _lastAndroidExoHeartbeatAt = now;
     _lastAndroidExoHeartbeatPosition = value.position;
+    final previous = _lastPosition;
+    _lastPosition = value.position;
+    _lastDuration = value.duration;
+    _maybeScheduleUpcomingCards(value.position);
+    _maybeUpdateAnimeSkipPrompt(value.position);
+    if (value.position != previous) {
+      _lastPositionChangeAt = now;
+      _remotePlaybackAccepted = true;
+    }
+    if (mounted &&
+        (_playerOverlaysVisible ||
+            _playerControlsFocused ||
+            _playerDialogOpen ||
+            _subtitlesEnabled ||
+            value.caption.text.trim().isNotEmpty) &&
+        now.difference(_lastAndroidExoRebuild) >=
+            _playerProgressUiRebuildInterval) {
+      _lastAndroidExoRebuild = now;
+      setState(() {});
+    }
     if (previousAt == null || previousPosition == null) {
       return;
     }
@@ -763,6 +788,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     await _disposeYoutubeWebPlayer();
     var path = widget.episode.filePath.trim();
     _currentResolvedStream = null;
+    _externalSubtitleTracks = const <RemoteSubtitleTrack>[];
+    _openSubtitlesLoading = false;
     _remoteSubtitleLoadTicket += 1;
     _desktopVlcSubtitleCues = const [];
     _remoteSubtitleCues = const [];
@@ -2549,9 +2576,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
       return;
     }
-    _reconcileRemoteSubtitleSelection(_currentResolvedStream);
+    _reconcileRemoteSubtitleSelection(_currentSubtitleStream);
     final track = selectRemoteSubtitleTrack(
-      _currentResolvedStream,
+      _currentSubtitleStream,
       selectedKey: _selectedRemoteSubtitleTrackKey,
     );
     if (track == null) {
@@ -5267,7 +5294,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final loadTicket = ++_remoteSubtitleLoadTicket;
     _debugPlayerEvent(
       '$source load requested enabled=$_subtitlesEnabled '
-      'tracks=${_currentResolvedStream?.subtitleTracks.length ?? 0} '
+      'tracks=${_currentSubtitleStream?.subtitleTracks.length ?? 0} '
       'selected=${_selectedRemoteSubtitleTrackKey.isEmpty ? "default" : _selectedRemoteSubtitleTrackKey}',
     );
     if (!_subtitlesEnabled) {
@@ -5279,9 +5306,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
       return;
     }
-    _reconcileRemoteSubtitleSelection(_currentResolvedStream);
+    _reconcileRemoteSubtitleSelection(_currentSubtitleStream);
     final track = selectRemoteSubtitleTrack(
-      _currentResolvedStream,
+      _currentSubtitleStream,
       selectedKey: _selectedRemoteSubtitleTrackKey,
     );
     if (track == null) {
@@ -5302,18 +5329,12 @@ class _PlayerScreenState extends State<PlayerScreen>
         'url=${_debugMediaLabel(track.url)} '
         'headers=${_debugHeadersLabel(_remoteMediaHeaders(track.url) ?? const {})}',
       );
-      final response = await http.get(
-        Uri.parse(track.url),
-        headers: _remoteMediaHeaders(track.url),
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException('Subtitle HTTP ${response.statusCode}');
-      }
-      final body = utf8.decode(response.bodyBytes, allowMalformed: true);
+      final bodyBytes = await _readSubtitleTrackBytes(track.url);
+      final body = _decodeSubtitleTrackBytes(bodyBytes, track.url);
       final cues = parseRemoteCaptionCues(body);
       _debugPlayerEvent(
-        '$source download HTTP ${response.statusCode} '
-        'bytes=${response.bodyBytes.length} cues=${cues.length} '
+        '$source download complete '
+        'bytes=${bodyBytes.length} cues=${cues.length} '
         'first=${cues.isEmpty ? "none" : _formatPlaybackTime(cues.first.start)} '
         'last=${cues.isEmpty ? "none" : _formatPlaybackTime(cues.last.end)}',
       );
@@ -5412,9 +5433,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         }
         return;
       }
-      _reconcileRemoteSubtitleSelection(_currentResolvedStream);
+      _reconcileRemoteSubtitleSelection(_currentSubtitleStream);
       final track = selectRemoteSubtitleTrack(
-        _currentResolvedStream,
+        _currentSubtitleStream,
         selectedKey: _selectedRemoteSubtitleTrackKey,
       );
       if (track == null) {
@@ -5446,6 +5467,66 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
 
+  RemoteDirectStream? get _currentSubtitleStream {
+    final tracks = _currentSubtitleTracks;
+    final stream = _currentResolvedStream;
+    if (stream != null) {
+      return stream.copyWith(subtitleTracks: tracks);
+    }
+    if (tracks.isEmpty) {
+      return null;
+    }
+    return RemoteDirectStream(
+      playbackUrl: _currentPlaybackPath.trim(),
+      playbackKind: 'external-subtitles',
+      pageUrl: widget.episode.watchUrl.trim().isNotEmpty
+          ? widget.episode.watchUrl.trim()
+          : widget.episode.filePath.trim(),
+      provider: widget.episode.provider,
+      subtitleTracks: tracks,
+    );
+  }
+
+  List<RemoteSubtitleTrack> get _currentSubtitleTracks {
+    final merged = <RemoteSubtitleTrack>[];
+    final seen = <String>{};
+    void addAll(Iterable<RemoteSubtitleTrack> tracks) {
+      for (final track in tracks) {
+        final key = remoteSubtitleTrackKey(track);
+        if (key.trim().isEmpty || !seen.add(key)) continue;
+        merged.add(track);
+      }
+    }
+
+    addAll(_currentResolvedStream?.subtitleTracks ?? const []);
+    addAll(_externalSubtitleTracks);
+    return merged;
+  }
+
+  Future<List<int>> _readSubtitleTrackBytes(String url) async {
+    final uri = Uri.tryParse(url.trim());
+    if (uri != null && uri.scheme == 'file') {
+      return File(uri.toFilePath()).readAsBytes();
+    }
+    if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+      final response = await http.get(uri, headers: _remoteMediaHeaders(url));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException('Subtitle HTTP ${response.statusCode}');
+      }
+      return response.bodyBytes;
+    }
+    return File(url).readAsBytes();
+  }
+
+  String _decodeSubtitleTrackBytes(List<int> bytes, String url) {
+    var decodedBytes = bytes;
+    if ((bytes.length >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) ||
+        url.toLowerCase().endsWith('.gz')) {
+      decodedBytes = gzip.decode(bytes);
+    }
+    return utf8.decode(decodedBytes, allowMalformed: true);
+  }
+
   void _reconcileRemoteSubtitleSelection(RemoteDirectStream? stream) {
     final tracks = stream?.subtitleTracks ?? const <RemoteSubtitleTrack>[];
     if (tracks.isEmpty) {
@@ -5472,72 +5553,116 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Future<void> _showSubtitleTrackDialog() async {
-    final tracks = preferredRemoteSubtitleTracks(
-      _currentResolvedStream?.subtitleTracks ?? const <RemoteSubtitleTrack>[],
-    );
     _showPlayerOverlays();
     final selected = await showDialog<String>(
       context: context,
       barrierColor: const Color(0xAA000000),
-      builder: (context) => SimpleDialog(
-        backgroundColor: TanukiColors.panelSolid,
-        title: const Text('Subtitulos disponibles'),
-        children: [
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, '__off__'),
-            child: Row(
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            final tracks =
+                preferredRemoteSubtitleTracks(_currentSubtitleTracks);
+            void refreshDialog() {
+              if (dialogContext.mounted) {
+                setDialogState(() {});
+              }
+            }
+
+            return SimpleDialog(
+              backgroundColor: TanukiColors.panelSolid,
+              title: const Text('Subtitulos disponibles'),
               children: [
-                Icon(
-                  !_subtitlesEnabled
-                      ? Icons.radio_button_checked
-                      : Icons.radio_button_off,
-                  color: TanukiColors.orange,
-                ),
-                const SizedBox(width: 10),
-                const Text('Desactivados'),
-              ],
-            ),
-          ),
-          for (final track in tracks)
-            SimpleDialogOption(
-              onPressed: () =>
-                  Navigator.pop(context, remoteSubtitleTrackKey(track)),
-              child: Row(
-                children: [
-                  Icon(
-                    _subtitlesEnabled &&
-                            _selectedRemoteSubtitleTrackKey ==
-                                remoteSubtitleTrackKey(track)
-                        ? Icons.radio_button_checked
-                        : Icons.radio_button_off,
-                    color: TanukiColors.orange,
+                SimpleDialogOption(
+                  onPressed: () => Navigator.pop(dialogContext, '__off__'),
+                  child: Row(
+                    children: [
+                      Icon(
+                        !_subtitlesEnabled
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_off,
+                        color: TanukiColors.orange,
+                      ),
+                      const SizedBox(width: 10),
+                      const Text('Desactivados'),
+                    ],
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(child: Text(remoteSubtitleTrackLabel(track))),
-                ],
-              ),
-            ),
-          if (tracks.isEmpty)
-            const Padding(
-              padding: EdgeInsets.fromLTRB(24, 8, 24, 10),
-              child: Text(
-                'Esta fuente no ofrece pistas de subtitulos.',
-                style: TextStyle(color: TanukiColors.muted),
-              ),
-            ),
-          const Divider(color: Color(0x22FFFFFF)),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, '__adjust__'),
-            child: const Row(
-              children: [
-                Icon(Icons.tune, color: TanukiColors.orange),
-                SizedBox(width: 10),
-                Text('Ajustes'),
+                ),
+                for (final track in tracks)
+                  SimpleDialogOption(
+                    onPressed: () => Navigator.pop(
+                      dialogContext,
+                      remoteSubtitleTrackKey(track),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _subtitlesEnabled &&
+                                  _selectedRemoteSubtitleTrackKey ==
+                                      remoteSubtitleTrackKey(track)
+                              ? Icons.radio_button_checked
+                              : Icons.radio_button_off,
+                          color: TanukiColors.orange,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(child: Text(remoteSubtitleTrackLabel(track))),
+                      ],
+                    ),
+                  ),
+                if (tracks.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 10),
+                    child: Text(
+                      _openSubtitlesLoading
+                          ? 'Buscando subtitulos disponibles...'
+                          : 'Esta fuente no ofrece pistas de subtitulos.',
+                      style: const TextStyle(color: TanukiColors.muted),
+                    ),
+                  ),
+                const Divider(color: Color(0x22FFFFFF)),
+                SimpleDialogOption(
+                  onPressed: _openSubtitlesLoading ||
+                          !widget.controller.isOpenSubtitlesConfigured
+                      ? null
+                      : () => unawaited(() async {
+                            await _loadOpenSubtitlesTracks(
+                              onStateChanged: refreshDialog,
+                            );
+                            refreshDialog();
+                          }()),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _openSubtitlesLoading
+                            ? Icons.hourglass_top
+                            : Icons.search,
+                        color: TanukiColors.orange,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          _openSubtitlesLoading
+                              ? 'Buscando subtitulos...'
+                              : 'Buscar subtitulos ES/EN',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                SimpleDialogOption(
+                  onPressed: () => Navigator.pop(dialogContext, '__adjust__'),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.tune, color: TanukiColors.orange),
+                      SizedBox(width: 10),
+                      Text('Ajustes'),
+                    ],
+                  ),
+                ),
               ],
-            ),
-          ),
-        ],
-      ),
+            );
+          },
+        );
+      },
     );
     if (selected == null || !mounted) return;
     if (selected == '__adjust__') {
@@ -5547,6 +5672,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       );
       return;
     }
+    final tracks = preferredRemoteSubtitleTracks(_currentSubtitleTracks);
     _debugPlayerEvent(
         'subtitle dialog selected key=$selected tracks=${tracks.length}');
     setState(() {
@@ -5564,6 +5690,65 @@ class _PlayerScreenState extends State<PlayerScreen>
           : 'Subtitulos desactivados';
     });
     await _applyRemoteSubtitleTrackIfReady();
+  }
+
+  Future<void> _loadOpenSubtitlesTracks({
+    VoidCallback? onStateChanged,
+  }) async {
+    if (_openSubtitlesLoading) {
+      return;
+    }
+    setState(() {
+      _openSubtitlesLoading = true;
+      _status = 'Buscando subtitulos ES/EN...';
+    });
+    onStateChanged?.call();
+    try {
+      final tracks = await widget.controller.searchOpenSubtitlesForEpisode(
+        widget.episode,
+      );
+      if (!mounted) return;
+      final beforeKeys =
+          _currentSubtitleTracks.map(remoteSubtitleTrackKey).toSet();
+      final newTracks = tracks
+          .where((track) => !beforeKeys.contains(remoteSubtitleTrackKey(track)))
+          .toList(growable: false);
+      final merged = <RemoteSubtitleTrack>[
+        ..._externalSubtitleTracks,
+        ...newTracks,
+      ];
+      final preferred = preferredRemoteSubtitleTracks([
+        ...(_currentResolvedStream?.subtitleTracks ??
+            const <RemoteSubtitleTrack>[]),
+        ...merged,
+      ]);
+      final selectedTrack = preferred.isEmpty ? null : preferred.first;
+      setState(() {
+        _externalSubtitleTracks = merged;
+        _openSubtitlesLoading = false;
+        if (selectedTrack != null) {
+          _subtitlesEnabled = true;
+          _selectedRemoteSubtitleTrackKey =
+              remoteSubtitleTrackKey(selectedTrack);
+        }
+        _status = tracks.isEmpty
+            ? 'No se encontraron subtitulos ES/EN'
+            : 'Subtitulos encontrados: ${tracks.length}';
+      });
+      onStateChanged?.call();
+      if (selectedTrack != null) {
+        await _applyRemoteSubtitleTrackIfReady();
+        onStateChanged?.call();
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _openSubtitlesLoading = false;
+        _status = 'No se pudo buscar subtitulos';
+      });
+      onStateChanged?.call();
+      _debugPlayerEvent('OpenSubtitles search failed: $error');
+    }
   }
 
   Future<void> _showSubtitleAdjustDialog() async {
@@ -5584,6 +5769,12 @@ class _PlayerScreenState extends State<PlayerScreen>
                   _subtitleTimingOffsetSeconds = next;
                   _lastDesktopSubtitleCueIndex = -2;
                 });
+                unawaited(
+                  widget.controller.setSubtitleTimingOffsetForEpisode(
+                    widget.episode,
+                    next,
+                  ),
+                );
                 setDialogState(() {});
               }
 
@@ -5743,7 +5934,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       return 'Seleccionado: desactivados';
     }
     final track = selectRemoteSubtitleTrack(
-      _currentResolvedStream,
+      _currentSubtitleStream,
       selectedKey: _selectedRemoteSubtitleTrackKey,
     );
     if (track == null) {
@@ -10624,7 +10815,8 @@ bool shouldRebuildPlayerProgressUi({
   return overlaysVisible ||
       controlsFocused ||
       dialogOpen ||
-      (subtitlesEnabled && captionText.trim().isNotEmpty);
+      subtitlesEnabled ||
+      captionText.trim().isNotEmpty;
 }
 
 bool isPlayerProgressSeekKey(LogicalKeyboardKey key) {
@@ -11253,18 +11445,109 @@ String remoteSubtitleTrackKey(RemoteSubtitleTrack track) {
 }
 
 String remoteSubtitleTrackLabel(RemoteSubtitleTrack track) {
-  final label = track.label.trim().isEmpty ? 'Subtitulos' : track.label.trim();
+  final label = _remoteSubtitleDisplayName(track);
   final language = track.language.trim();
-  return language.isEmpty ? label : '$label [${language.toUpperCase()}]';
+  if (language.isEmpty ||
+      _subtitleLabelMatchesLanguage(label, language) ||
+      _isGenericSubtitleLabel(label)) {
+    return label;
+  }
+  return '$label [${language.toUpperCase()}]';
 }
 
 String remoteSubtitleTrackCompactLabel(RemoteSubtitleTrack track) {
-  final label = track.label.trim().isEmpty ? 'Subtitulos' : track.label.trim();
+  final label = _remoteSubtitleDisplayName(track);
   if (track.language.trim().isEmpty ||
-      track.language.trim().toLowerCase() == label.toLowerCase()) {
+      _subtitleLabelMatchesLanguage(label, track.language)) {
     return label;
   }
   return remoteSubtitleTrackLabel(track);
+}
+
+String _remoteSubtitleDisplayName(RemoteSubtitleTrack track) {
+  final label = track.label.trim();
+  final languageLabel = _friendlySubtitleLanguageName(
+    track.language,
+    fallbackText: '$label ${track.url}',
+  );
+  if (label.isNotEmpty && !_isGenericSubtitleLabel(label)) {
+    return _friendlySubtitleLabel(label);
+  }
+  if (languageLabel.isNotEmpty) {
+    return languageLabel;
+  }
+  final fileLabel = _subtitleNameFromUrl(track.url);
+  return fileLabel.isEmpty ? 'Subtitulos' : fileLabel;
+}
+
+String _friendlySubtitleLabel(String label) {
+  final normalized = _normalizeSubtitleLanguageText(label);
+  if (normalized.contains('forced') || normalized.contains('forzado')) {
+    final language = _friendlySubtitleLanguageName(label);
+    return language.isEmpty ? 'Forzados' : '$language forzados';
+  }
+  final language = _friendlySubtitleLanguageName(label);
+  return language.isEmpty ? label.trim() : language;
+}
+
+String _friendlySubtitleLanguageName(
+  String value, {
+  String fallbackText = '',
+}) {
+  final text = _normalizeSubtitleLanguageText('$value $fallbackText');
+  if (_looksLikeLatinAmericanSpanish(text)) {
+    return 'Español Latino';
+  }
+  if (_looksLikeSpanish(text) ||
+      RegExp(r'(^|[^a-z])spa($|[^a-z])').hasMatch(text)) {
+    return 'Español';
+  }
+  if (_looksLikeEnglish(text) ||
+      RegExp(r'(^|[^a-z])eng($|[^a-z])').hasMatch(text)) {
+    return 'Ingles';
+  }
+  return '';
+}
+
+String _subtitleNameFromUrl(String url) {
+  final uri = Uri.tryParse(url.trim());
+  final segment = uri == null || uri.pathSegments.isEmpty
+      ? url.trim()
+      : Uri.decodeComponent(uri.pathSegments.last);
+  final withoutExtension = segment
+      .replaceFirst(
+        RegExp(r'\.(?:vtt|srt|ass|ssa|ttml|dfxp|48)$', caseSensitive: false),
+        '',
+      )
+      .replaceAll(RegExp(r'[_\-.]+'), ' ')
+      .trim();
+  final language = _friendlySubtitleLanguageName(withoutExtension);
+  if (language.isNotEmpty) {
+    return language;
+  }
+  final cleaned = withoutExtension
+      .replaceAll(RegExp(r'^[a-z0-9]{8,}\s*', caseSensitive: false), '')
+      .trim();
+  return cleaned.isEmpty ? '' : cleaned;
+}
+
+bool _isGenericSubtitleLabel(String label) {
+  final normalized = _normalizeSubtitleLanguageText(label).trim();
+  return normalized.isEmpty ||
+      normalized == 'subtitulo' ||
+      normalized == 'subtitulos' ||
+      normalized == 'subtitle' ||
+      normalized == 'subtitles' ||
+      normalized == 'captions' ||
+      normalized == 'upload captions' ||
+      RegExp(r'^pista\s*\d+$').hasMatch(normalized) ||
+      RegExp(r'^track\s*\d+$').hasMatch(normalized);
+}
+
+bool _subtitleLabelMatchesLanguage(String label, String language) {
+  final labelLanguage = _friendlySubtitleLanguageName(label);
+  final languageName = _friendlySubtitleLanguageName(language);
+  return labelLanguage.isNotEmpty && labelLanguage == languageName;
 }
 
 int compareAniPmServerMenuOrder(String left, String right) {
